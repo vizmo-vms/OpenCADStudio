@@ -28,7 +28,8 @@ pub use trust_dialog::DialogKey;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Dismiss,
-    CancelLoad,
+    /// Cancel the import running in this tab.
+    CancelLoad(u64),
     /// Close a bound tab: open Apply first, discard the work, or keep a
     /// recovery copy (DSK-03).
     CloseApply(u64),
@@ -190,7 +191,7 @@ pub enum Dialog {
     /// Text and buttons: notices and questions.
     Choice { title: String, form: Form, lines: Vec<String> },
     /// Work with a Cancel (import).
-    Progress { title: String, text: String, started: std::time::Instant, form: Form },
+    Progress { tab_id: u64, title: String, text: String, started: std::time::Instant, form: Form },
     Align(Box<align_dialog::AlignDialog>),
     Apply(Box<apply_dialog::ApplyDialog>),
 }
@@ -205,12 +206,13 @@ impl Dialog {
         Self::choice(title, lines, vec![("OK".to_string(), Action::Dismiss)])
     }
 
-    pub fn progress(title: &str, text: &str) -> Self {
+    pub fn progress(tab_id: u64, title: &str, text: &str) -> Self {
         Dialog::Progress {
+            tab_id,
             title: title.to_string(),
             text: text.to_string(),
             started: std::time::Instant::now(),
-            form: Form::new(Vec::new(), vec![("Cancel".to_string(), Action::CancelLoad)], Action::CancelLoad),
+            form: Form::new(Vec::new(), vec![("Cancel".to_string(), Action::CancelLoad(tab_id))], Action::CancelLoad(tab_id)),
         }
     }
 
@@ -341,7 +343,7 @@ pub fn view<'a>(base: Element<'a, Message>, dialog: &'a Dialog) -> Element<'a, M
             }
             (title.as_str(), content.push(form_view(form)).push(text(KEYS).size(12)).into())
         }
-        Dialog::Progress { title, text: what, started, form } => {
+        Dialog::Progress { title, text: what, started, form, .. } => {
             let seconds = started.elapsed().as_secs();
             let content = column![
                 text(format!("{what} ({seconds} s)")).size(13),

@@ -638,6 +638,9 @@ pub struct Snapshot {
     pub loaded: Option<super::session::Drawing>,
     pub modified: bool,
     pub pending_original: Option<super::session::Drawing>,
+    /// Corrupt entities the reader dropped from the loaded drawing: writing
+    /// the drawing would lose them (PUB-04 known loss).
+    pub lost_entities: usize,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -684,6 +687,15 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
                 Some(loaded) => (loaded.format, loaded.version(), loaded.name.expose().clone()),
                 None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
             };
+            if snapshot.lost_entities > 0 {
+                return Err(ApplyError::new(
+                    ErrorCode::KnownLoss,
+                    format!(
+                        "{} damaged entit(ies) of the drawing could not be read, so writing the edited drawing would lose them. Repair the drawing in its source application, then import it again.",
+                        snapshot.lost_entities
+                    ),
+                ));
+            }
             let is_dxf = format == Format::Dxf;
             let dropped = crate::io::dropped_on_save_count(&snapshot.document, version, is_dxf);
             if dropped > 0 {

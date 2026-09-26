@@ -102,10 +102,16 @@ pub struct State {
     /// Whether the read-only design overlay is drawn (OVL-01).
     pub overlay_visible: bool,
     pub next_job: u64,
-    /// The load or import whose result is awaited; others are dropped.
-    pub load_job: Option<u64>,
+    /// Per bound tab, the load or import whose result is awaited; any other
+    /// result for that tab is dropped.
+    pub load_jobs: std::collections::HashMap<u64, u64>,
+    /// Unit tests can hold worker jobs to interleave their completions.
+    #[cfg(test)]
+    pub held_jobs: Option<HeldJobs>,
     /// A notice for the command line once the editor runs (expired recovery copies).
     pub notice: Option<String>,
+    /// The main window is closing and SecurePlan drawings are being decided.
+    pub quitting: bool,
 }
 
 impl Default for State {
@@ -128,8 +134,11 @@ impl Default for State {
             recovery: Default::default(),
             overlay_visible: true,
             next_job: 0,
-            load_job: None,
+            load_jobs: Default::default(),
+            #[cfg(test)]
+            held_jobs: None,
             notice: None,
+            quitting: false,
         };
         // Recovery copies older than 30 days go, with a notice (DSK-03).
         // Unit tests never touch the user's folder.
@@ -144,6 +153,28 @@ impl Default for State {
             }
         }
         state
+    }
+}
+
+/// Worker jobs a unit test holds, to run them later in a chosen order.
+#[cfg(test)]
+#[derive(Default)]
+pub struct HeldJobs(pub Vec<Box<dyn FnOnce() -> Msg + Send>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for HeldJobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldJobs({})", self.0.len())
+    }
+}
+
+#[cfg(test)]
+impl OpenCADStudio {
+    /// Run held job `index` and deliver its result.
+    pub(crate) fn secureplan_release_job(&mut self, index: usize) -> Task<Message> {
+        let job = self.secureplan.held_jobs.as_mut().expect("jobs are held").0.remove(index);
+        let message = job();
+        self.secureplan_update(message)
     }
 }
 
@@ -357,7 +388,36 @@ impl OpenCADStudio {
 
     /// The prompt-only window's close button declines, like Escape.
     pub(crate) fn secureplan_window_close_requested(&mut self, id: iced::window::Id) -> Option<Task<Message>> {
-        (self.secureplan.prompt_window == Some(id)).then(|| self.secureplan_answer_trust(false))
+        if self.secureplan.prompt_window == Some(id) {
+            return Some(self.secureplan_answer_trust(false));
+        }
+        if self.main_window != Some(id) {
+            return None;
+        }
+        // Quitting: each SecurePlan drawing with unapplied work is decided
+        // first (Apply, Discard or Keep, DSK-03); then the upstream prompt
+        // handles any other unsaved drawing.
+        match (0..self.tabs.len()).find(|&index| self.secureplan_has_unapplied(index)) {
+            Some(index) => {
+                self.secureplan.quitting = true;
+                self.active_tab = index;
+                let tab_id = self.tabs[index].id;
+                self.secureplan_open_close_dialog(tab_id);
+                Some(Task::none())
+            }
+            None => {
+                self.secureplan.quitting = false;
+                None
+            }
+        }
+    }
+
+    /// After a bound tab closed during a quit, go on quitting.
+    fn secureplan_continue_quit(&mut self, closed: Task<Message>) -> Task<Message> {
+        match (self.secureplan.quitting, self.main_window) {
+            (true, Some(id)) => Task::batch([closed, Task::done(Message::WindowCloseRequested(id))]),
+            _ => closed,
+        }
     }
 
     /// The view of a SecurePlan-owned window, if `id` is one.
@@ -539,18 +599,26 @@ impl OpenCADStudio {
     where
         F: FnOnce() -> Msg + Send + 'static,
     {
-        if cfg!(test) {
+        #[cfg(test)]
+        {
+            if let Some(held) = self.secureplan.held_jobs.as_mut() {
+                held.0.push(Box::new(work));
+                return Task::none();
+            }
             let message = work();
-            return self.secureplan_update(message);
+            self.secureplan_update(message)
         }
-        let (sender, receiver) = iced::futures::channel::oneshot::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(work());
-        });
-        Task::perform(async move { receiver.await.ok() }, |message| match message {
-            Some(message) => Message::SecurePlan(message),
-            None => Message::Noop,
-        })
+        #[cfg(not(test))]
+        {
+            let (sender, receiver) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(work());
+            });
+            Task::perform(async move { receiver.await.ok() }, |message| match message {
+                Some(message) => Message::SecurePlan(message),
+                None => Message::Noop,
+            })
+        }
     }
 
     /// Keep a form dialog's derived state in step with its fields.
@@ -567,10 +635,14 @@ impl OpenCADStudio {
         if !keeps_dialog {
             self.secureplan.dialog = None;
         }
+        // Anything but Discard or Keep in the close prompt stops a quit.
+        if !matches!(action, Action::CloseDiscard(_) | Action::CloseKeep(_)) {
+            self.secureplan.quitting = false;
+        }
         match action {
             Action::Dismiss => Task::none(),
-            Action::CancelLoad => {
-                self.secureplan_cancel_load();
+            Action::CancelLoad(tab_id) => {
+                self.secureplan_cancel_load(tab_id);
                 Task::none()
             }
             Action::CloseApply(tab_id) => {
@@ -581,13 +653,23 @@ impl OpenCADStudio {
             }
             Action::CloseDiscard(tab_id) => {
                 self.secureplan_discard_recovery(tab_id);
-                self.secureplan_close_tab(tab_id)
+                let closed = self.secureplan_close_tab(tab_id);
+                self.secureplan_continue_quit(closed)
             }
             Action::CloseKeep(tab_id) => {
-                let kept = self.secureplan_tab_index(tab_id).is_some_and(|index| self.secureplan_keep_recovery(index));
+                let kept = self
+                    .secureplan_tab_index(tab_id)
+                    .is_some_and(|index| self.secureplan_keep_recovery(index) != super::session::Preserve::Failed);
                 if kept {
-                    self.secureplan_close_tab(tab_id)
+                    let closed = self.secureplan_close_tab(tab_id);
+                    self.secureplan_continue_quit(closed)
                 } else {
+                    // Nothing closes without its copy.
+                    self.secureplan.quitting = false;
+                    self.secureplan.dialog = Some(Dialog::notice(
+                        "Not closed",
+                        vec!["The recovery copy could not be saved, so the drawing stays open with your edits.".into()],
+                    ));
                     Task::none()
                 }
             }

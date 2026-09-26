@@ -170,20 +170,33 @@ pub fn check_placement(placement: &Placement) -> Result<(), PlacementBlock> {
     }
 }
 
-/// Trim `window_cad` so its page starts inside the canvas (world x, y ≥ 0)
-/// under `mapping`, when it would otherwise cross the canvas origin. Quarter
-/// turns keep the window axis-aligned, so the trimmed world box maps back to
-/// a CAD window. A window wholly outside the canvas is left as it is.
-pub fn clip_to_canvas(window_cad: [f64; 4], mapping: &Mapping) -> [f64; 4] {
-    let [x0, y0, x1, y1] = window_cad;
-    let corners = [[x0, y0], [x1, y1]].map(|c| mapping.cad_to_world(c));
-    let (wx0, wx1) = (corners[0][0].min(corners[1][0]), corners[0][0].max(corners[1][0]));
-    let (wy0, wy1) = (corners[0][1].min(corners[1][1]), corners[0][1].max(corners[1][1]));
-    if wx1 <= 0.0 || wy1 <= 0.0 || (wx0 >= 0.0 && wy0 >= 0.0) {
+/// The world box `[x0, y0, x1, y1]` of a CAD window under `mapping`.
+fn world_box([x0, y0, x1, y1]: [f64; 4], mapping: &Mapping) -> [f64; 4] {
+    let a = mapping.cad_to_world([x0, y0]);
+    let b = mapping.cad_to_world([x1, y1]);
+    [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])]
+}
+
+/// Trim only the margin of `window_cad` (the visible `extents` plus a margin)
+/// where it would start the page before the canvas (world x or y < 0) while
+/// the drawn content itself does not. Content outside the canvas is never
+/// trimmed away: that window stays as it is, and the placement check then
+/// refuses it (PUB-02). Quarter turns keep the window axis-aligned, so the
+/// trimmed world box maps back to a CAD window.
+pub fn trim_margin_to_canvas(window_cad: [f64; 4], extents: [f64; 4], mapping: &Mapping) -> [f64; 4] {
+    let window = world_box(window_cad, mapping);
+    let content = world_box(extents, mapping);
+    let mut trimmed = window;
+    for axis in 0..2 {
+        if content[axis] >= -1e-3 && trimmed[axis] < 0.0 {
+            trimmed[axis] = 0.0;
+        }
+    }
+    if trimmed == window {
         return window_cad;
     }
-    let a = world_to_cad(mapping, [wx0.max(0.0), wy0.max(0.0)]);
-    let b = world_to_cad(mapping, [wx1, wy1]);
+    let a = world_to_cad(mapping, [trimmed[0], trimmed[1]]);
+    let b = world_to_cad(mapping, [trimmed[2], trimmed[3]]);
     [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])]
 }
 
@@ -247,19 +260,28 @@ mod tests {
     }
 
     #[test]
-    fn a_default_window_crossing_the_canvas_origin_is_trimmed() {
+    fn only_the_margin_is_trimmed_to_the_canvas() {
         // The stored plan starts at the drawing's top-left corner; a 2% margin
-        // around it would start the page before the canvas.
+        // around it would start the page before the canvas: that margin goes.
         let mapping = Mapping { cad_origin: [0.0, 18000.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
-        let trimmed = clip_to_canvas([-600.0, -360.0, 30600.0, 18360.0], &mapping);
+        let extents = [0.0, 0.0, 30000.0, 18000.0];
+        let trimmed = trim_margin_to_canvas([-600.0, -360.0, 30600.0, 18360.0], extents, &mapping);
         assert_eq!(trimmed, [0.0, -360.0, 30600.0, 18000.0]);
-        let placement = place_page(trimmed, &mapping, 5.0).unwrap();
-        assert!(check_placement(&placement).is_ok());
-        // Turned a quarter, the trimmed sides differ, and inside stays as is.
+        assert!(check_placement(&place_page(trimmed, &mapping, 5.0).unwrap()).is_ok());
+        // Content at x = −100 (world): nothing is trimmed, so it is not
+        // silently dropped, and the placement check refuses the window.
+        let extents = [-100.0, 0.0, 30000.0, 18000.0];
+        let window = [-700.0, -360.0, 30600.0, 18360.0];
+        let kept = trim_margin_to_canvas(window, extents, &mapping);
+        assert_eq!(kept[0], -700.0, "the content's side is not trimmed");
+        assert_eq!(check_placement(&place_page(kept, &mapping, 5.0).unwrap()), Err(PlacementBlock::OutsideCanvas));
+        // Turned a quarter, the margin is trimmed on the sides that map to
+        // world minimum x and y, and a window inside the canvas stays as is.
         let turned = Mapping { cad_origin: [0.0, 0.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 1 };
-        let trimmed = clip_to_canvas([-10.0, -10.0, 100.0, 50.0], &turned);
+        let trimmed = trim_margin_to_canvas([-10.0, -10.0, 100.0, 50.0], [0.0, 0.0, 90.0, 40.0], &turned);
+        assert_eq!(trimmed, [0.0, 0.0, 100.0, 50.0]);
         assert!(check_placement(&place_page(trimmed, &turned, 1.0).unwrap()).is_ok(), "{trimmed:?}");
-        assert_eq!(clip_to_canvas([10.0, 10.0, 20.0, 20.0], &turned), [10.0, 10.0, 20.0, 20.0]);
+        assert_eq!(trim_margin_to_canvas([10.0, 10.0, 20.0, 20.0], [11.0, 11.0, 19.0, 19.0], &turned), [10.0, 10.0, 20.0, 20.0]);
     }
 
     #[test]

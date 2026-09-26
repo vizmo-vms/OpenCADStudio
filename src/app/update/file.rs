@@ -1892,6 +1892,11 @@ impl OpenCADStudio {
         block_name: String,
         path: std::path::PathBuf,
     ) -> Task<Message> {
+        // A SecurePlan drawing's content is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(self.active_tab) {
+            return Task::none();
+        }
         let i = self.active_tab;
         let document = self.tabs[i].scene.document.clone();
         let handles: Vec<_> = self.tabs[i].scene.selected.iter().copied().collect();
@@ -1912,6 +1917,11 @@ impl OpenCADStudio {
     }
 
     pub(super) fn on_stl_export_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        // A SecurePlan drawing's content is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(self.active_tab) {
+            return Task::none();
+        }
         // Re-build STL bytes (we can't easily pass them through the message).
         let i = self.active_tab;
         // STL gets the highest-resolution LOD (slot 0) so the
@@ -1936,6 +1946,11 @@ impl OpenCADStudio {
     }
 
     pub(super) fn on_step_export_path_some(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        // A SecurePlan drawing's content is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(self.active_tab) {
+            return Task::none();
+        }
         let i = self.active_tab;
         // Export uses LOD 0 (full resolution); see StlExportPath above.
         let meshes: Vec<crate::scene::model::mesh_model::MeshModel> = self.tabs[i]
@@ -3785,6 +3800,11 @@ impl OpenCADStudio {
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
+        // Printing every layout would print SecurePlan drawings too.
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_any_bound() {
+            return Task::none();
+        }
         if background {
             background_task(work, Message::PrintAllFinished)
         } else {
@@ -3796,6 +3816,11 @@ impl OpenCADStudio {
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
+        // A SecurePlan drawing's content is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(self.active_tab) {
+            return Task::none();
+        }
         if background {
             background_task(work, move |result| {
                 Message::BackgroundIoFinished(result, reopen_plot)
@@ -3996,6 +4021,11 @@ impl OpenCADStudio {
     }
 
     pub(super) fn on_print_to_printer(&mut self) -> Task<Message> {
+        // A SecurePlan drawing's content is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(self.active_tab) {
+            return Task::none();
+        }
         let Some(page) = self.direct_plot_page()
         else {
             self.command_line.push_error(

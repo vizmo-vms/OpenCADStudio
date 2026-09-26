@@ -201,7 +201,8 @@
         },
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
-        "overlayTransferId": 4
+        "overlayTransferId": 4,
+        "surveyEmpty": false
       }
     },
     {
@@ -217,7 +218,8 @@
         "placement": null,
         "baseIdentity": "none",
         "drawingTransferId": null,
-        "overlayTransferId": 4
+        "overlayTransferId": 4,
+        "surveyEmpty": true
       }
     },
     {
@@ -594,7 +596,18 @@
       "message": {
         "type": "overlayUpdate",
         "requestId": "ovl-1",
-        "overlayTransferId": 21
+        "overlayTransferId": 21,
+        "surveyEmpty": false
+      }
+    },
+    {
+      "name": "overlayUpdate-now-empty",
+      "direction": "webToDesktop",
+      "message": {
+        "type": "overlayUpdate",
+        "requestId": "ovl-2",
+        "overlayTransferId": 22,
+        "surveyEmpty": true
       }
     },
     {

@@ -31,7 +31,7 @@ const CALIBRATE: &str = "Calibrate from a known length";
 pub struct AlignDialog {
     pub tab_id: u64,
     pub form: Form,
-    /// The survey has no design yet: the page is placed at the origin.
+    /// The survey has no design and no comments yet: the page is placed at the origin.
     pub empty_survey: bool,
     /// The drawing's visible extents, for the default translation.
     pub extents: [f64; 4],
@@ -146,7 +146,7 @@ fn describe(alignment: &Alignment) -> String {
 pub fn view(dialog: &AlignDialog) -> Element<'_, Message> {
     let mut content = column![].spacing(10).padding(8);
     let intro = if dialog.empty_survey {
-        "The survey has no design yet, so the plan's top-left corner goes to the survey origin (0, 0). Choose the units and rotation."
+        "The survey has no design and no comments yet, so the plan's top-left corner goes to the survey origin (0, 0). Choose the units and rotation."
     } else {
         "Choose the units and rotation, and which drawing point lands where in the survey. The SecurePlan design overlay moves as you change them."
     };

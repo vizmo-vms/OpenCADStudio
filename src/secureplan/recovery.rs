@@ -2,10 +2,13 @@
 //!
 //! A bound document is never autosaved beside a file (it has none). Its
 //! unapplied work is kept instead in `<config>/SecurePlanCAD/recovery/<key>/`,
-//! where `<key>` is derived from the origin and survey id: the drawing, any
-//! pending original (PUB-01) and `meta.json` with the base identity it was
-//! made from. The folder is readable by the current user only (0700 and 0600
-//! on Unix; the per-user app-data folder on Windows and macOS). A copy is
+//! where `<key>` is derived from the origin and survey id, as one file
+//! (`entry`) holding the metadata (with the base identity the work was made
+//! from), the drawing and any pending original (PUB-01). Each save replaces
+//! that file atomically (a temporary file, then a rename), so a crash leaves
+//! either the previous copy or the new one, never a mix of the two. The
+//! folder is readable by the current user only (0700 and 0600 on Unix; the
+//! per-user app-data folder on Windows and macOS). A copy is
 //! offered only when the same origin and survey pair again; one made from a
 //! different plan than the survey's current one can be applied only through
 //! the explicit "Replace current plan with recovered drawing". Copies are
@@ -19,6 +22,32 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::session::{Drawing, Format};
+
+/// The one file of a recovery copy, and its signature.
+const ENTRY: &str = "entry";
+const MAGIC: &[u8; 8] = b"SPRECOV1";
+
+/// Split an `entry` file: `MAGIC`, `u32le` metadata length, metadata JSON,
+/// `u64le` drawing length, the drawing, `u64le` original length (`u64::MAX`
+/// for none), the original, and nothing after. Anything malformed or cut
+/// short is `None`.
+fn parse_entry(bytes: &[u8]) -> Option<(Meta, Vec<u8>, Option<Vec<u8>>)> {
+    let rest = bytes.strip_prefix(MAGIC.as_slice())?;
+    let meta_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let meta: Meta = serde_json::from_slice(rest.get(4..4 + meta_len)?).ok()?;
+    let rest = &rest[4 + meta_len..];
+    let drawing_len = usize::try_from(u64::from_le_bytes(rest.get(..8)?.try_into().ok()?)).ok()?;
+    let drawing = rest.get(8..8usize.checked_add(drawing_len)?)?.to_vec();
+    let rest = &rest[8 + drawing_len..];
+    let original_len = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+    let tail = &rest[8..];
+    let original = match (&meta.original, original_len) {
+        (None, u64::MAX) if tail.is_empty() => None,
+        (Some(_), len) if usize::try_from(len).ok() == Some(tail.len()) => Some(tail.to_vec()),
+        _ => return None,
+    };
+    Some((meta, drawing, original))
+}
 
 /// How long a recovery copy is kept.
 pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -132,20 +161,13 @@ impl Store {
         Some(self.root.as_ref()?.join(key(origin, survey)))
     }
 
-    /// Save (replace) the copy for `entry.origin` and `entry.survey`.
+    /// Save (replace) the copy for `entry.origin` and `entry.survey`, as one
+    /// generation: every part or none.
     pub fn save(&self, entry: &Entry) -> std::io::Result<()> {
         let root = self.root.as_ref().ok_or_else(|| std::io::Error::other("no configuration directory"))?;
         let dir = self.dir(&entry.origin, &entry.survey).unwrap_or_default();
         private_dir(root)?;
         private_dir(&dir)?;
-        write_private(&dir.join("drawing"), &entry.drawing.bytes)?;
-        match &entry.original {
-            Some(original) => write_private(&dir.join("original"), &original.bytes)?,
-            None => match std::fs::remove_file(dir.join("original")) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            },
-        }
         let meta = Meta {
             origin: entry.origin.clone(),
             survey: entry.survey.clone(),
@@ -155,21 +177,35 @@ impl Store {
             drawing: FileMeta::of(&entry.drawing),
             original: entry.original.as_ref().map(FileMeta::of),
         };
-        // The metadata goes last: a copy without it is incomplete and ignored.
-        write_private(&dir.join("meta.json"), &serde_json::to_vec(&meta).map_err(std::io::Error::other)?)
+        let meta = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
+        let mut bytes = Vec::with_capacity(MAGIC.len() + 12 + meta.len() + entry.drawing.bytes.len());
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&(entry.drawing.bytes.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&entry.drawing.bytes);
+        match &entry.original {
+            Some(original) => {
+                bytes.extend_from_slice(&(original.bytes.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(&original.bytes);
+            }
+            None => bytes.extend_from_slice(&u64::MAX.to_le_bytes()),
+        }
+        write_private(&dir.join(ENTRY), &bytes)
     }
 
-    /// The copy for this origin and survey, if one is complete.
+    /// The copy for this origin and survey, if one is whole.
     pub fn load(&self, origin: &str, survey: &str) -> Option<Entry> {
         let dir = self.dir(origin, survey)?;
-        let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+        let (meta, drawing, original) = parse_entry(&std::fs::read(dir.join(ENTRY)).ok()?)?;
         if meta.origin != origin || meta.survey != survey {
             return None;
         }
-        let drawing = meta.drawing.drawing(std::fs::read(dir.join("drawing")).ok()?)?;
-        let original = match &meta.original {
-            Some(file) => Some(file.drawing(std::fs::read(dir.join("original")).ok()?)?),
-            None => None,
+        let drawing = meta.drawing.drawing(drawing)?;
+        let original = match (&meta.original, original) {
+            (Some(file), Some(bytes)) => Some(file.drawing(bytes)?),
+            (None, None) => None,
+            _ => return None,
         };
         Some(Entry {
             origin: meta.origin,
@@ -195,10 +231,10 @@ impl Store {
         let mut deleted = 0;
         for entry in entries.flatten() {
             let dir = entry.path();
-            let saved = std::fs::read(dir.join("meta.json"))
+            let saved = std::fs::read(dir.join(ENTRY))
                 .ok()
-                .and_then(|bytes| serde_json::from_slice::<Meta>(&bytes).ok())
-                .map(|meta| UNIX_EPOCH + Duration::from_secs(meta.saved_unix));
+                .and_then(|bytes| parse_entry(&bytes))
+                .map(|(meta, ..)| UNIX_EPOCH + Duration::from_secs(meta.saved_unix));
             let expired = match saved {
                 Some(saved) => now.duration_since(saved).is_ok_and(|age| age > RETENTION),
                 // Incomplete: a crash while saving. Old enough to be abandoned?
@@ -248,25 +284,29 @@ impl crate::app::OpenCADStudio {
     }
 
     /// Keep tab `index`'s unapplied work as a recovery copy under its current
-    /// base identity. Returns whether a copy was written.
-    pub(crate) fn secureplan_keep_recovery(&mut self, index: usize) -> bool {
+    /// base identity (the plan it was made from).
+    pub(crate) fn secureplan_keep_recovery(&mut self, index: usize) -> super::session::Preserve {
+        use super::session::Preserve;
         if !self.secureplan_has_unapplied(index) {
-            return false;
+            return Preserve::Nothing;
         }
         let Some(base) = self.secureplan.sessions.by_tab(self.tabs[index].id).map(|b| b.base_identity.clone()) else {
-            return false;
+            return Preserve::Nothing;
         };
         let saved = self.secureplan_recovery_entry(index, &base).is_some_and(|entry| self.secureplan.recovery.save(&entry).is_ok());
-        if !saved {
+        if saved {
+            Preserve::Saved
+        } else {
             self.command_line.push_error("SecurePlan: the recovery copy could not be saved.");
+            Preserve::Failed
         }
-        saved
     }
 
-    /// Autosave for bound tabs: a recovery copy instead of a `.sv$` file.
+    /// Autosave for bound tabs: a recovery copy of any unapplied work (an
+    /// edit, an import, a restored copy) instead of a `.sv$` file.
     pub(crate) fn secureplan_autosave(&mut self) {
         for index in 0..self.tabs.len() {
-            if self.secureplan_is_bound(index) && self.tabs[index].dirty {
+            if self.secureplan_is_bound(index) {
                 self.secureplan_keep_recovery(index);
             }
         }
@@ -323,17 +363,18 @@ impl crate::app::OpenCADStudio {
         let Some(entry) = self.secureplan.recovery.load(&bound.origin, bound.survey.expose()) else { return };
         let Some(index) = self.secureplan_tab_index(tab_id) else { return };
         let bytes = entry.drawing.bytes.as_ref().clone();
-        let document = match super::import::load_drawing(entry.drawing.name.expose(), bytes) {
-            Ok((document, _)) => document,
+        let (document, report) = match super::import::load_drawing(entry.drawing.name.expose(), bytes) {
+            Ok(loaded) => loaded,
             Err(error) => {
                 self.command_line.push_error(&format!("SecurePlan: the recovery copy could not be read: {error}"));
                 return;
             }
         };
-        self.secureplan_install(index, document, None);
-        // Nothing of it is in SecurePlan yet: it is an edit of the survey.
-        self.tabs[index].dirty = true;
+        // The recovered drawing is the loaded source, in its own format and
+        // version; nothing of it is in SecurePlan yet (`recovered_base`).
+        self.secureplan_install(index, document, Some(entry.drawing.clone()));
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            bound.lost_entities = report.lost_entities;
             bound.replace_confirmed = entry.base_identity != bound.base_identity;
             bound.recovered_base = Some(entry.base_identity);
             bound.pending_original = entry.original;
@@ -396,15 +437,45 @@ pub(crate) mod tests {
             let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(store.root.as_ref().unwrap()), 0o700);
             assert_eq!(mode(&dir), 0o700);
-            for file in ["drawing", "original", "meta.json"] {
-                assert_eq!(mode(&dir.join(file)), 0o600, "{file}");
-            }
+            assert_eq!(mode(&dir.join(ENTRY)), 0o600);
         }
         // The folder name reveals neither the origin nor the survey.
         let name = store.dir(&a.origin, &a.survey).unwrap().file_name().unwrap().to_string_lossy().into_owned();
         assert!(!name.contains("example") && !name.contains("1111"));
         store.delete(&a.origin, &a.survey);
         assert!(store.load(&a.origin, &a.survey).is_none());
+        std::fs::remove_dir_all(store.root.unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_save_interrupted_part_way_leaves_the_previous_copy_whole() {
+        let store = temp_store("atomic");
+        let first = entry("https://a.example", "11111111-1111-4111-8111-111111111111", "none");
+        store.save(&first).unwrap();
+        let dir = store.dir(&first.origin, &first.survey).unwrap();
+        // A second save that died after writing part of its new generation:
+        // its temporary file holds a newer drawing and no original yet.
+        let mut second = entry(&first.origin, &first.survey, "0".repeat(64).as_str());
+        second.drawing = drawing(b"0\nSECTION\nnewer\n");
+        second.original = None;
+        let mut partial = Vec::new();
+        partial.extend_from_slice(MAGIC);
+        partial.extend_from_slice(&[0xff, 0, 0]);
+        std::fs::write(dir.join("entry.tmp"), &partial).unwrap();
+        let loaded = store.load(&first.origin, &first.survey).expect("the previous copy");
+        assert_eq!(loaded.base_identity, "none");
+        assert_eq!(loaded.drawing.bytes, first.drawing.bytes);
+        assert_eq!(loaded.original.unwrap().bytes.as_slice(), b"original bytes", "one generation, not a mix");
+        // A cut-short entry is never read as a mix of parts either.
+        let whole = std::fs::read(dir.join(ENTRY)).unwrap();
+        for cut in [whole.len() - 1, whole.len() - 20, 20] {
+            std::fs::write(dir.join(ENTRY), &whole[..cut]).unwrap();
+            assert!(store.load(&first.origin, &first.survey).is_none(), "cut at {cut}");
+        }
+        // The next save replaces it whole.
+        store.save(&second).unwrap();
+        let loaded = store.load(&first.origin, &first.survey).unwrap();
+        assert_eq!((loaded.base_identity.len(), loaded.original.is_none()), (64, true));
         std::fs::remove_dir_all(store.root.unwrap().parent().unwrap()).ok();
     }
 

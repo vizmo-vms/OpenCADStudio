@@ -24,11 +24,25 @@ pub enum Material {
     Opening,
 }
 
+/// What a device is, which decides its symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Camera,
+    Equipment,
+    Asset,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
+    pub kind: DeviceKind,
+    /// The catalog's built-in symbol key (kept for export; the overlay draws
+    /// one symbol per kind).
+    pub symbol_key: String,
     pub name: String,
     pub color: Color,
     pub position: [f64; 2],
+    /// World rotation in degrees (world y points down, as on the web canvas).
+    pub rotation_deg: f64,
 }
 
 /// The overlay payload, in world millimetres.
@@ -84,6 +98,13 @@ pub fn parse(bytes: &[u8]) -> Result<Overlay, String> {
         devices: list("devices")
             .iter()
             .map(|d| Device {
+                kind: match d["kind"].as_str().unwrap_or_default() {
+                    "camera" => DeviceKind::Camera,
+                    "equipment" => DeviceKind::Equipment,
+                    _ => DeviceKind::Asset,
+                },
+                symbol_key: d["symbolKey"].as_str().unwrap_or_default().to_string(),
+                rotation_deg: d["rotationDeg"].as_f64().unwrap_or_default(),
                 name: d["name"].as_str().unwrap_or_default().to_string(),
                 color: color(d["color"].as_str().unwrap_or("#808080")),
                 position: point(&d["position"]),
@@ -100,7 +121,10 @@ pub fn parse(bytes: &[u8]) -> Result<Overlay, String> {
 #[derive(Debug, Clone, PartialEq)]
 enum Shape {
     Line { points: Vec<Point>, color: Color, width: f32, dashed: bool, closed: bool },
-    Marker { at: Point, color: Color, label: String },
+    /// A device: a circle for a camera (with a view-direction wedge), a
+    /// square for equipment, a diamond for an asset. `facing` is the screen
+    /// direction of the device's rotation.
+    Marker { at: Point, kind: DeviceKind, facing: iced::Vector, color: Color, label: String },
 }
 
 const WALL: Color = Color { r: 0.10, g: 0.55, b: 0.95, a: 0.95 };
@@ -138,9 +162,16 @@ fn shapes(overlay: &Overlay, mapping: &Mapping, before: bool, project: &dyn Fn([
         }
     }
     for device in &overlay.devices {
-        if let Some(at) = to_screen(device.position) {
+        // The rotation is measured in the world; its screen direction comes
+        // from mapping a point one metre ahead, whatever the alignment turn.
+        let angle = device.rotation_deg.to_radians();
+        let ahead = [device.position[0] + 1000.0 * angle.cos(), device.position[1] + 1000.0 * angle.sin()];
+        if let (Some(at), Some(tip)) = (to_screen(device.position), to_screen(ahead)) {
+            let (dx, dy) = (tip.x - at.x, tip.y - at.y);
+            let length = dx.hypot(dy);
+            let facing = if length > 0.0 { iced::Vector::new(dx / length, dy / length) } else { iced::Vector::new(1.0, 0.0) };
             let label = if before { String::new() } else { device.name.chars().take(40).collect() };
-            out.push(Shape::Marker { at, color: pick(device.color), label });
+            out.push(Shape::Marker { at, kind: device.kind, facing, color: pick(device.color), label });
         }
     }
     out
@@ -173,8 +204,29 @@ impl canvas::Program<Message> for OverlayCanvas {
                     }
                     frame.stroke(&path, stroke);
                 }
-                Shape::Marker { at, color, label } => {
-                    frame.stroke(&canvas::Path::circle(*at, 5.0), canvas::Stroke::default().with_color(*color).with_width(2.0));
+                Shape::Marker { at, kind, facing, color, label } => {
+                    let stroke = canvas::Stroke::default().with_color(*color).with_width(2.0);
+                    let (fx, fy) = (facing.x, facing.y);
+                    // Rotate the symbol's local (forward, side) axes to `facing`.
+                    let local = |forward: f32, side: f32| Point::new(at.x + forward * fx - side * fy, at.y + forward * fy + side * fx);
+                    let polygon = |corners: &[(f32, f32)]| {
+                        canvas::Path::new(|builder| {
+                            builder.move_to(local(corners[0].0, corners[0].1));
+                            for (forward, side) in &corners[1..] {
+                                builder.line_to(local(*forward, *side));
+                            }
+                            builder.close();
+                        })
+                    };
+                    match kind {
+                        DeviceKind::Camera => {
+                            frame.stroke(&canvas::Path::circle(*at, 5.0), stroke);
+                            // The field-of-view wedge points where the camera looks.
+                            frame.stroke(&polygon(&[(0.0, 0.0), (22.0, -11.0), (22.0, 11.0)]), stroke);
+                        }
+                        DeviceKind::Equipment => frame.stroke(&polygon(&[(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)]), stroke),
+                        DeviceKind::Asset => frame.stroke(&polygon(&[(-6.0, 0.0), (0.0, -6.0), (6.0, 0.0), (0.0, 6.0)]), stroke),
+                    }
                     if !label.is_empty() {
                         frame.fill_text(canvas::Text {
                             content: label.clone(),
@@ -195,7 +247,7 @@ pub const LABEL: &str = "SecurePlan design (read-only)";
 
 impl OpenCADStudio {
     /// Replace the overlay of the session's document (OVL-02).
-    pub(crate) fn secureplan_overlay_update(&mut self, session: super::bridge::SessionId, transfer_id: u32) {
+    pub(crate) fn secureplan_overlay_update(&mut self, session: super::bridge::SessionId, transfer_id: u32, survey_empty: bool) {
         let parsed = self
             .secureplan
             .sessions
@@ -207,6 +259,7 @@ impl OpenCADStudio {
             Some(Ok(overlay)) => {
                 if let Some(bound) = self.secureplan.sessions.by_session_mut(session) {
                     bound.overlay = Some(overlay);
+                    bound.survey_empty = survey_empty;
                 }
             }
             _ => self.secureplan_protocol_error(session),
@@ -297,6 +350,42 @@ pub(crate) mod tests {
         }
         assert!(parse(b"not json").is_err());
         assert!(parse(br#"{"schemaVersion":1,"walls":[],"doors":[],"routes":[],"devices":[],"coverage":[],"extra":1}"#).is_err());
+    }
+
+    fn device_bytes(devices: &[(&str, f64)]) -> Vec<u8> {
+        let devices: Vec<_> = devices
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, rotation))| {
+                serde_json::json!({ "id": format!("d{i}"), "kind": kind, "symbolKey": "generic", "name": format!("Device {i}"), "color": "#336699", "position": [1000.0, 1000.0], "rotationDeg": rotation })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "schemaVersion": 1, "walls": [], "doors": [], "routes": [], "devices": devices, "coverage": [] })).unwrap()
+    }
+
+    fn markers(drawn: &[Shape]) -> Vec<(DeviceKind, iced::Vector)> {
+        drawn.iter().filter_map(|s| if let Shape::Marker { kind, facing, .. } = s { Some((*kind, *facing)) } else { None }).collect()
+    }
+
+    #[test]
+    fn devices_keep_their_kind_and_a_camera_faces_its_rotation() {
+        let overlay = parse(&device_bytes(&[("camera", 0.0), ("equipment", 0.0), ("asset", 0.0), ("camera", 90.0)])).unwrap();
+        assert_eq!(overlay.devices[3].rotation_deg, 90.0);
+        assert_eq!(overlay.devices[0].symbol_key, "generic");
+        // Millimetres, no turn: screen = CAD with y flipped (y up in CAD).
+        let mapping = Mapping { cad_origin: [0.0, 0.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
+        let project = |cad: [f64; 2]| Some(Point::new(cad[0] as f32, -cad[1] as f32));
+        let drawn = markers(&shapes(&overlay, &mapping, false, &project));
+        let kinds: Vec<DeviceKind> = drawn.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [DeviceKind::Camera, DeviceKind::Equipment, DeviceKind::Asset, DeviceKind::Camera], "distinct symbols");
+        let close = |v: iced::Vector, x: f32, y: f32| (v.x - x).abs() < 1e-4 && (v.y - y).abs() < 1e-4;
+        // World +x and world +y (down on the web canvas) are screen right and down.
+        assert!(close(drawn[0].1, 1.0, 0.0), "{:?}", drawn[0].1);
+        assert!(close(drawn[3].1, 0.0, 1.0), "{:?}", drawn[3].1);
+        // A quarter-turn alignment turns the view direction with the plan.
+        let turned = Mapping { quarter_turns: 1, ..mapping };
+        let drawn = markers(&shapes(&overlay, &turned, false, &project));
+        assert!(close(drawn[0].1, 0.0, 1.0) || close(drawn[0].1, 0.0, -1.0), "{:?}", drawn[0].1);
     }
 
     #[test]

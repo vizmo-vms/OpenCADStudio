@@ -1338,6 +1338,10 @@ impl OpenCADStudio {
             }
 
             Message::DataExtractionSaveResult(csv, Some(path)) => {
+                #[cfg(feature = "secureplan")]
+                if self.secureplan_refuse_save(self.active_tab) {
+                    return Task::none();
+                }
                 match std::fs::write(&path, csv.as_bytes()) {
                     Ok(()) => {
                         let rows = csv.lines().count().saturating_sub(1);

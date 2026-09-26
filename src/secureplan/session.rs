@@ -33,7 +33,8 @@ pub const REFUSED_COMMANDS: &[&str] = &[
     "EXPORTPDF", "EXPORTDWF", "EXPORTDWFX", "EXPORTLAYOUT", "EXPORT", "WBLOCK", "DXFOUT", "STLOUT", "STLEXPORT",
     "STEPOUT", "STEPEXPORT", "OBJEXPORT", "JPGOUT", "PNGOUT", "BMPOUT", "TIFOUT", "WMFOUT", "PSOUT", "SVGOUT",
     "ACISOUT", "DATAEXTRACTION", "ETRANSMIT", "ARCHIVE", "XATTACH", "XREF", "XOPEN", "XRELOAD", "XBIND",
-    "IMAGEATTACH", "ATTACH", "PDFATTACH", "DWFATTACH", "DGNATTACH", "EXTERNALREFERENCES",
+    "IMAGEATTACH", "ATTACH", "PDFATTACH", "DWFATTACH", "DGNATTACH", "EXTERNALREFERENCES", "EATTEXT", "ATTEXT",
+    "DATALINKUPDATE",
 ];
 
 /// The mode the web grants (BRG-08). Only `Edit` may Apply.
@@ -219,7 +220,40 @@ pub struct ApplyInFlight {
     pub drawing: Drawing,
 }
 
+/// The survey's plan as `openSession` or `planUpdate` describe it. It is
+/// adopted only together with a drawing that opened (PUB-06).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanMeta {
+    pub base_identity: String,
+    pub plan_version: Option<u64>,
+    pub has_plan: bool,
+    pub alignment: Option<Alignment>,
+}
+
+impl PlanMeta {
+    fn of(plan: &Value, base_identity: &Value) -> Self {
+        Self {
+            base_identity: base_identity.as_str().unwrap_or("none").to_string(),
+            plan_version: plan["version"]["number"].as_u64(),
+            has_plan: plan.is_object(),
+            alignment: Alignment::from_cad_plan(plan),
+        }
+    }
+}
+
+/// What happened to a document's unapplied work before it was replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preserve {
+    /// There was none.
+    Nothing,
+    /// It is in a recovery copy.
+    Saved,
+    /// It could not be saved: the replacement must not go ahead.
+    Failed,
+}
+
 /// A document bound to a SecurePlan survey.
+#[derive(Clone)]
 pub struct Bound {
     /// The live session, or `None` once the web page went away.
     pub session: Option<SessionId>,
@@ -247,6 +281,9 @@ pub struct Bound {
     /// The user chose "Replace current plan with recovered drawing".
     pub replace_confirmed: bool,
     pub overlay: Option<Overlay>,
+    /// The web's word that the survey has no design elements and no
+    /// comments (`surveyEmpty`); the overlay alone cannot tell (CON-03).
+    pub survey_empty: bool,
     /// The mapping the next Apply uses (stored or newly aligned).
     pub alignment: Option<Alignment>,
     /// The user re-aligned a plan that already had a stored mapping.
@@ -256,9 +293,63 @@ pub struct Bound {
     pub apply: Option<ApplyInFlight>,
     /// The last `sessionState` body sent (without its request id).
     pub last_state: Option<Value>,
+    /// Changes whenever the document, its plan or its session is replaced:
+    /// work started before (an Apply build, a load) is stale after.
+    pub generation: u64,
+    /// A new plan waiting for its drawing to open (PUB-06).
+    pub staged: Option<PlanMeta>,
+    /// The survey's plan changed but its drawing could not be opened (or the
+    /// local work kept first): Apply is blocked until the survey is reopened.
+    pub unresolved: bool,
+    /// Entities of the loaded drawing that could not be read (corrupt records
+    /// the reader dropped). Writing the drawing would lose them.
+    pub lost_entities: usize,
 }
 
 impl Bound {
+    fn new(tab_id: u64, pending: &PendingSession, mode: Mode) -> Self {
+        Self {
+            session: None,
+            tab_id,
+            origin: pending.origin.clone(),
+            survey: pending.survey.clone(),
+            label: String::new().into(),
+            intent: pending.intent,
+            mode,
+            base_identity: "none".into(),
+            plan_version: None,
+            has_plan: false,
+            loaded: None,
+            clean_revision: 0,
+            pending_original: None,
+            recovered_base: None,
+            replace_confirmed: false,
+            overlay: None,
+            survey_empty: false,
+            alignment: None,
+            realigned: false,
+            busy: None,
+            error: None,
+            apply: None,
+            last_state: None,
+            generation: 0,
+            staged: None,
+            unresolved: false,
+            lost_entities: 0,
+        }
+    }
+
+    /// Adopt a plan (its drawing is in place).
+    pub(crate) fn adopt(&mut self, meta: PlanMeta) {
+        self.base_identity = meta.base_identity;
+        self.plan_version = meta.plan_version;
+        self.has_plan = meta.has_plan;
+        self.alignment = meta.alignment;
+        self.realigned = false;
+        self.staged = None;
+        self.unresolved = false;
+    }
+
     /// Whether the document holds work SecurePlan does not have yet.
     pub fn unapplied(&self) -> bool {
         self.pending_original.is_some() || self.recovered_base.is_some()
@@ -284,7 +375,9 @@ pub struct Sessions {
     pub pending: HashMap<SessionId, PendingSession>,
     /// Completed transfers waiting for the message that references them.
     pub transfers: HashMap<(SessionId, u32), Arc<Completed>>,
-    /// Messages that referenced transfers not yet complete.
+    /// Messages waiting, in arrival order, for a transfer an earlier message
+    /// of their session names (BRG-07: a session's messages are handled in
+    /// order).
     pub deferred: Vec<(SessionId, String, String, Value)>,
     next_request: u64,
 }
@@ -320,8 +413,10 @@ impl Sessions {
     }
 }
 
-/// Completed transfers, or messages waiting for theirs, a session may hold.
-const MAX_WAITING: usize = 4;
+/// Completed transfers a session may hold before the messages that name them.
+const MAX_WAITING_TRANSFERS: usize = 16;
+/// Messages a session may have queued behind one waiting for a transfer.
+const MAX_WAITING_MESSAGES: usize = 64;
 
 /// Transfer ids a message references, which must complete before it is handled.
 fn referenced_transfers(kind: &str, body: &Value) -> Vec<u32> {
@@ -425,6 +520,7 @@ impl OpenCADStudio {
         let bound = !self.secureplan.sessions.bound.is_empty();
         set_external_resource_refused(ExternalResource::Xref, bound);
         set_external_resource_refused(ExternalResource::Image, bound);
+        set_external_resource_refused(ExternalResource::DataLink, bound);
     }
 
     /// Hook for `update`: file-writing messages (Save, Save As, plotting,
@@ -451,6 +547,16 @@ impl OpenCADStudio {
             self.command_line.push_error("This is not available for a SecurePlan drawing. Use Apply to send it to SecurePlan.");
         }
         refused
+    }
+
+    /// For writes that cover every tab (print all): refuse while any bound
+    /// document is open.
+    pub(crate) fn secureplan_refuse_any_bound(&mut self) -> bool {
+        if self.secureplan.sessions.bound.is_empty() {
+            return false;
+        }
+        self.command_line.push_error("This is not available while a SecurePlan drawing is open.");
+        true
     }
 
     /// For file-writing paths in `update/file.rs`: refuse a bound tab.
@@ -485,16 +591,24 @@ impl OpenCADStudio {
         // A message references at most two transfers; more waiting means the
         // page is not following the protocol.
         let waiting = self.secureplan.sessions.transfers.keys().filter(|(s, _)| *s == session).count();
-        if waiting >= MAX_WAITING {
+        if waiting >= MAX_WAITING_TRANSFERS {
             self.secureplan_protocol_error(session);
             return Task::none();
         }
         self.secureplan.sessions.transfers.insert((session, transfer.transfer_id), transfer);
-        // Handle, in order, any message that was waiting for this transfer.
-        let deferred = std::mem::take(&mut self.secureplan.sessions.deferred);
+        // Handle this session's queued messages, in order, up to the first
+        // that still waits for a transfer.
         let mut tasks = Vec::new();
-        for (s, kind, request_id, body) in deferred {
-            tasks.push(self.secureplan_message(s, kind, request_id, body));
+        while let Some(position) = self.secureplan.sessions.deferred.iter().position(|(s, ..)| *s == session) {
+            let (_, kind, _, body) = &self.secureplan.sessions.deferred[position];
+            let ready = referenced_transfers(kind, body)
+                .into_iter()
+                .all(|id| self.secureplan.sessions.transfers.contains_key(&(session, id)));
+            if !ready {
+                break;
+            }
+            let (s, kind, request_id, body) = self.secureplan.sessions.deferred.remove(position);
+            tasks.push(self.secureplan_handle(s, kind, request_id, body));
         }
         Task::batch(tasks)
     }
@@ -511,18 +625,26 @@ impl OpenCADStudio {
     }
 
     pub(crate) fn secureplan_message(&mut self, session: SessionId, kind: String, request_id: String, body: Value) -> Task<Message> {
-        // A message is handled only once every transfer it names is complete.
-        let waiting = referenced_transfers(&kind, &body)
-            .into_iter()
-            .any(|id| !self.secureplan.sessions.transfers.contains_key(&(session, id)));
+        // A message is handled only once every transfer it names is complete,
+        // and after every earlier message of its session.
+        let queued_ahead = self.secureplan.sessions.deferred.iter().any(|(s, ..)| *s == session);
+        let waiting = queued_ahead
+            || referenced_transfers(&kind, &body)
+                .into_iter()
+                .any(|id| !self.secureplan.sessions.transfers.contains_key(&(session, id)));
         if waiting {
-            if self.secureplan.sessions.deferred.iter().filter(|(s, ..)| *s == session).count() >= MAX_WAITING {
+            if self.secureplan.sessions.deferred.iter().filter(|(s, ..)| *s == session).count() >= MAX_WAITING_MESSAGES {
                 self.secureplan_protocol_error(session);
                 return Task::none();
             }
             self.secureplan.sessions.deferred.push((session, kind, request_id, body));
             return Task::none();
         }
+        self.secureplan_handle(session, kind, request_id, body)
+    }
+
+    /// Handle a message whose transfers are complete.
+    fn secureplan_handle(&mut self, session: SessionId, kind: String, request_id: String, body: Value) -> Task<Message> {
         let task = match kind.as_str() {
             "openSession" => self.secureplan_open_session(session, &body),
             "sessionMode" => {
@@ -539,7 +661,7 @@ impl OpenCADStudio {
             }
             "overlayUpdate" => {
                 let id = body["overlayTransferId"].as_u64().unwrap_or_default() as u32;
-                self.secureplan_overlay_update(session, id);
+                self.secureplan_overlay_update(session, id, body["surveyEmpty"].as_bool().unwrap_or(false));
                 Task::none()
             }
             "applyProgress" => {
@@ -596,9 +718,7 @@ impl OpenCADStudio {
         };
         let mode = Mode::parse(&body["mode"]).unwrap_or(Mode::View);
         let label: String = body["surveyLabel"].as_str().unwrap_or("SecurePlan survey").to_string();
-        let base_identity = body["baseIdentity"].as_str().unwrap_or("none").to_string();
-        let plan = &body["cadPlan"];
-        let alignment = Alignment::from_cad_plan(plan);
+        let meta = PlanMeta::of(&body["cadPlan"], &body["baseIdentity"]);
 
         // Re-pairing to a document that is already open (BRG-05): reuse its tab.
         let existing = self
@@ -624,54 +744,33 @@ impl OpenCADStudio {
                 self.active_tab = index;
                 self.apply_display_defaults(index);
                 self.tabs[index].is_start = false;
-                self.secureplan.sessions.bound.push(Bound {
-                    session: None,
-                    tab_id: id,
-                    origin: pending.origin.clone(),
-                    survey: pending.survey.clone(),
-                    label: String::new().into(),
-                    intent: pending.intent,
-                    mode,
-                    base_identity: base_identity.clone(),
-                    plan_version: None,
-                    has_plan: false,
-                    loaded: None,
-                    clean_revision: 0,
-                    pending_original: None,
-                    recovered_base: None,
-                    replace_confirmed: false,
-                    overlay: None,
-                    alignment: None,
-                    realigned: false,
-                    busy: None,
-                    error: None,
-                    apply: None,
-                    last_state: None,
-                });
+                self.secureplan.sessions.bound.push(Bound::new(id, &pending, mode));
                 id
             }
         };
         let index = self.secureplan_tab_index(tab_id).unwrap_or(self.active_tab);
-        let keep_local = existing.is_some() && {
-            let bound = &self.secureplan.sessions.bound[existing.unwrap_or_default()];
-            bound.base_identity == base_identity && self.secureplan_has_unapplied(index)
-        };
+        let unapplied = existing.is_some() && self.secureplan_has_unapplied(index);
+        // The same plan as before: the local edits stay as they are.
+        let keep_local = unapplied && self.secureplan.sessions.by_tab(tab_id).is_some_and(|b| b.base_identity == meta.base_identity);
+        // A changed plan replaces the document: keep the local work first,
+        // under the plan it was made from, and replace nothing if that fails.
+        let preserved = if unapplied && !keep_local { self.secureplan_keep_recovery(index) } else { Preserve::Nothing };
         {
             let bound = self.secureplan.sessions.by_tab_mut(tab_id).expect("bound above");
             bound.session = Some(session);
+            bound.generation += 1;
             bound.intent = pending.intent;
             bound.mode = mode;
             bound.label = label.clone().into();
-            bound.base_identity = base_identity;
-            bound.plan_version = plan["version"]["number"].as_u64();
-            bound.has_plan = plan.is_object();
             bound.overlay = Some(overlay);
+            bound.survey_empty = body["surveyEmpty"].as_bool().unwrap_or(false);
             bound.busy = None;
             bound.error = None;
             bound.last_state = None;
-            if !keep_local {
-                bound.alignment = alignment;
-                bound.realigned = false;
+            bound.apply = None;
+            if keep_local {
+                bound.plan_version = meta.plan_version;
+                bound.has_plan = meta.has_plan;
             }
         }
         self.tabs[index].tab_title = label;
@@ -685,19 +784,80 @@ impl OpenCADStudio {
         super::testdriver_event("opened", if mode == Mode::Edit { "edit" } else { "view" });
 
         if keep_local {
-            // The re-paired survey is unchanged: keep the local edits.
             return Task::none();
         }
+        if preserved == Preserve::Failed {
+            self.secureplan_block_replacement(tab_id);
+            return Task::none();
+        }
+        if preserved == Preserve::Saved {
+            self.secureplan.dialog = Some(super::ui::Dialog::notice(
+                "The plan changed",
+                vec![
+                    "The survey's plan changed in SecurePlan while this drawing was disconnected. Its current drawing is loaded.".into(),
+                    "Your unapplied edits were kept as a recovery copy; SecurePlan CAD offers it the next time you open this survey.".into(),
+                ],
+            ));
+        }
+        self.secureplan_replace_plan(tab_id, meta, drawing, super::import::LoadPurpose::Open)
+    }
+
+    /// Replace the bound document's plan with `meta` and its drawing. The
+    /// plan is adopted only once the drawing has opened; until then, and for
+    /// good if it cannot open, Apply is blocked (PUB-06).
+    fn secureplan_replace_plan(
+        &mut self,
+        tab_id: u64,
+        meta: PlanMeta,
+        drawing: Option<(Arc<Completed>, Format)>,
+        purpose: super::import::LoadPurpose,
+    ) -> Task<Message> {
+        let Some(index) = self.secureplan_tab_index(tab_id) else { return Task::none() };
         match drawing {
             Some((transfer, format)) => {
+                if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+                    bound.staged = Some(meta);
+                    bound.apply = None;
+                }
                 let bytes = Arc::new(transfer.bytes.expose().clone());
-                self.secureplan_load(tab_id, bytes, transfer.name.expose().clone(), format, super::import::LoadPurpose::Open)
+                self.secureplan_load(tab_id, bytes, transfer.name.expose().clone(), format, purpose)
             }
+            // No CAD drawing (a new survey, or the CAD link was removed).
             None => {
                 self.secureplan_install(index, acadrust::CadDocument::new(), None);
-                self.secureplan_after_open(tab_id)
+                if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+                    bound.adopt(meta);
+                    bound.pending_original = None;
+                    bound.recovered_base = None;
+                    bound.replace_confirmed = false;
+                    bound.lost_entities = 0;
+                    bound.apply = None;
+                }
+                if purpose == super::import::LoadPurpose::Open {
+                    self.secureplan_after_open(tab_id)
+                } else {
+                    Task::none()
+                }
             }
         }
+    }
+
+    /// The plan changed but the local work could not be kept: nothing is
+    /// replaced and Apply stays blocked until the survey is reopened.
+    fn secureplan_block_replacement(&mut self, tab_id: u64) {
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            bound.unresolved = true;
+            bound.staged = None;
+            bound.apply = None;
+        }
+        self.secureplan.dialog = Some(super::ui::Dialog::notice(
+            "The plan changed",
+            vec![
+                "The survey's plan changed in SecurePlan, but your unapplied edits could not be saved as a recovery copy.".into(),
+                "Nothing was replaced, so your edits are still here. Apply is blocked: free some disk space, then open the survey from SecurePlan again.".into(),
+            ],
+        ));
+        super::testdriver_event("replace-blocked", "");
     }
 
     /// After the survey's drawing is in place: offer a recovery copy, or
@@ -749,6 +909,10 @@ impl OpenCADStudio {
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
             bound.loaded = loaded;
             bound.clean_revision = revision;
+            bound.lost_entities = 0;
+            // Work started on the previous document is stale now.
+            bound.generation += 1;
+            bound.apply = None;
         }
         if index == self.active_tab {
             self.refresh_layer_panel();
@@ -808,17 +972,23 @@ impl OpenCADStudio {
     }
 }
 
-/// Whether the survey has no design yet, as far as the desktop can tell: no
-/// CAD plan and nothing in the overlay. Its first page goes to the origin,
-/// which is also valid for a survey that holds only comments (CON-03).
+/// Whether the survey is empty for the first Apply (CON-03): no CAD plan yet,
+/// and the web says it has no design elements and no comments. Its page then
+/// goes to the survey origin.
 pub fn survey_is_empty(bound: &Bound) -> bool {
-    !bound.has_plan && bound.overlay.as_ref().is_none_or(Overlay::is_empty)
+    !bound.has_plan && bound.survey_empty
 }
 
 /// Whether the bound document may Apply now: a recovered drawing made from
 /// another plan needs the explicit "Replace current plan with recovered
 /// drawing" (DSK-03).
 pub fn apply_allowed(bound: &Bound) -> Result<(), String> {
+    if bound.unresolved {
+        return Err("The survey's plan changed and this drawing is not up to date. Open the survey from SecurePlan again.".into());
+    }
+    if bound.staged.is_some() {
+        return Err("The survey's new drawing is still loading.".into());
+    }
     match &bound.recovered_base {
         Some(base) if *base != bound.base_identity && !bound.replace_confirmed => Err(
             "These edits were recovered from another version of the plan. Choose \"Replace current plan with recovered drawing\" to apply them."
@@ -828,10 +998,20 @@ pub fn apply_allowed(bound: &Bound) -> Result<(), String> {
     }
 }
 
+/// What an Apply snapshot was taken under: its outputs may be sent only if
+/// the session, plan and document are still the same (PUB-06).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApplyOrigin {
+    pub session: Option<SessionId>,
+    pub base_identity: String,
+    pub generation: u64,
+}
+
 /// A finished Apply build, carried back to the UI thread.
 #[derive(Debug, Clone)]
 pub struct ApplyBuilt {
     pub tab_id: u64,
+    pub origin: ApplyOrigin,
     pub snapshot_revision: u64,
     pub plan: super::publish::ApplyPlan,
     pub alignment: Alignment,
@@ -879,17 +1059,46 @@ impl OpenCADStudio {
             loaded: bound.loaded.clone(),
             modified: self.secureplan_modified(index),
             pending_original: bound.pending_original.clone(),
+            lost_entities: bound.lost_entities,
         };
-        Some(super::ui::apply_dialog::ApplyDialog::new(
+        let mut dialog = super::ui::apply_dialog::ApplyDialog::new(
             tab.id,
             Arc::new(snapshot),
             tab.edit_revision,
-            super::publish::default_window(extents),
+            extents,
             alignment,
             survey_is_empty(bound),
             bound.realigned,
             bound.plan_version,
-        ))
+        );
+        dialog.origin = ApplyOrigin { session: bound.session, base_identity: bound.base_identity.clone(), generation: bound.generation };
+        Some(dialog)
+    }
+
+    /// Whether an Apply begun under `origin` still matches the document.
+    fn secureplan_apply_current(&self, tab_id: u64, origin: &ApplyOrigin) -> bool {
+        self.secureplan.sessions.by_tab(tab_id).is_some_and(|b| {
+            b.session == origin.session && b.base_identity == origin.base_identity && b.generation == origin.generation && apply_allowed(b).is_ok()
+        })
+    }
+
+    /// An Apply begun on an earlier state of the survey: nothing is sent.
+    fn secureplan_apply_stale(&mut self, tab_id: u64) -> Task<Message> {
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            if bound.busy.is_some_and(|b| b.operation == "apply") {
+                bound.busy = None;
+            }
+        }
+        self.secureplan.dialog = Some(super::ui::Dialog::notice(
+            "Apply stopped",
+            vec![
+                "The survey changed in SecurePlan (or reconnected) while this Apply was being prepared.".into(),
+                "Nothing was sent. Check the drawing, then Apply again.".into(),
+            ],
+        ));
+        super::testdriver_event("apply-failed", "STALE");
+        self.secureplan_report_states();
+        Task::none()
     }
 
     /// Confirm the Apply dialog: build every output from its snapshot.
@@ -903,6 +1112,9 @@ impl OpenCADStudio {
             }
         };
         let Some(super::ui::Dialog::Apply(dialog)) = self.secureplan.dialog.take() else { return Task::none() };
+        if !self.secureplan_apply_current(dialog.tab_id, &dialog.origin) {
+            return self.secureplan_apply_stale(dialog.tab_id);
+        }
         self.secureplan_build_apply(*dialog, plan)
     }
 
@@ -915,17 +1127,22 @@ impl OpenCADStudio {
         let realigned = dialog.realigned;
         let snapshot = dialog.snapshot;
         let snapshot_revision = dialog.snapshot_revision;
+        let origin = dialog.origin;
         self.secureplan_report_states();
         self.command_line.push_info("SecurePlan: preparing the drawing, PDF and snap file…");
         self.secureplan_run_job(move || {
             let result = super::publish::build_outputs(&snapshot, &plan);
-            super::Msg::ApplyBuilt(ApplyBuilt { tab_id, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
+            super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
         })
     }
 
     /// The outputs are ready: send them and `applyRequest`, or report why not.
     pub(crate) fn secureplan_apply_built(&mut self, built: ApplyBuilt) -> Task<Message> {
         let Some(result) = built.result.take() else { return Task::none() };
+        // Built from a snapshot of an earlier plan, session or document: stale.
+        if !self.secureplan_apply_current(built.tab_id, &built.origin) {
+            return self.secureplan_apply_stale(built.tab_id);
+        }
         let fail = |app: &mut Self, code: Option<ErrorCode>, message: String| {
             if let Some(bound) = app.secureplan.sessions.by_tab_mut(built.tab_id) {
                 bound.busy = None;
@@ -940,9 +1157,7 @@ impl OpenCADStudio {
             Ok(outputs) => outputs,
             Err(error) => return fail(self, Some(error.code), error.message),
         };
-        let Some((session, base_identity)) = self.secureplan.sessions.by_tab(built.tab_id).map(|b| (b.session, b.base_identity.clone())) else {
-            return Task::none();
-        };
+        let (session, base_identity) = (built.origin.session, built.origin.base_identity.clone());
         let (Some(session), Some(bridge)) = (session, self.secureplan_bridge()) else {
             return fail(self, None, "SecurePlan is no longer connected. Open the survey from SecurePlan again, then Apply.".into());
         };
@@ -1076,22 +1291,26 @@ impl OpenCADStudio {
     }
 
     /// The survey's plan changed (PUB-06): keep unapplied work as a recovery
-    /// copy under the old base identity, then load the new drawing.
+    /// copy under the old base identity, then load the new drawing. If the
+    /// work cannot be kept, nothing is replaced; if the new drawing cannot be
+    /// opened, the old one stays under its old plan and Apply is blocked.
     fn secureplan_plan_update(&mut self, session: SessionId, body: &Value) -> Task<Message> {
         let Some(tab_id) = self.secureplan.sessions.by_session_mut(session).map(|b| b.tab_id) else { return Task::none() };
         let Some(index) = self.secureplan_tab_index(tab_id) else { return Task::none() };
-        let kept = self.secureplan_keep_recovery(index);
         let drawing = body["drawingTransferId"].as_u64().and_then(|id| self.secureplan_take_transfer(session, id as u32));
-        let plan = &body["cadPlan"];
+        let drawing = drawing.and_then(|t| Format::from_media_type(&t.media_type).map(|format| (t, format)));
+        if body["drawingTransferId"].is_u64() && drawing.is_none() {
+            self.secureplan_protocol_error(session);
+            return Task::none();
+        }
+        let preserved = self.secureplan_keep_recovery(index);
+        if preserved == Preserve::Failed {
+            self.secureplan_block_replacement(tab_id);
+            return Task::none();
+        }
+        let meta = PlanMeta::of(&body["cadPlan"], &body["baseIdentity"]);
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
-            bound.base_identity = body["baseIdentity"].as_str().unwrap_or("none").to_string();
-            bound.plan_version = plan["version"]["number"].as_u64();
-            bound.has_plan = plan.is_object();
-            bound.alignment = Alignment::from_cad_plan(plan);
-            bound.realigned = false;
-            bound.pending_original = None;
-            bound.recovered_base = None;
-            bound.replace_confirmed = false;
+            // An Apply in flight belongs to the old plan.
             bound.apply = None;
             bound.busy = None;
         }
@@ -1102,21 +1321,12 @@ impl OpenCADStudio {
             "removed" => "the CAD link was removed",
             _ => "a change",
         };
-        let mut lines = vec![format!("The survey's plan changed in SecurePlan ({reason}). The current drawing is loaded.")];
-        if kept {
+        let mut lines = vec![format!("The survey's plan changed in SecurePlan ({reason}). Its current drawing is being loaded.")];
+        if preserved == Preserve::Saved {
             lines.push("Your unapplied edits were kept as a recovery copy; SecurePlan CAD offers it the next time you open this survey.".into());
         }
         self.secureplan.dialog = Some(super::ui::Dialog::notice("The plan changed", lines));
-        match drawing.and_then(|t| Format::from_media_type(&t.media_type).map(|format| (t, format))) {
-            Some((transfer, format)) => {
-                let bytes = Arc::new(transfer.bytes.expose().clone());
-                self.secureplan_load(tab_id, bytes, transfer.name.expose().clone(), format, super::import::LoadPurpose::PlanUpdate)
-            }
-            None => {
-                self.secureplan_install(index, acadrust::CadDocument::new(), None);
-                Task::none()
-            }
-        }
+        self.secureplan_replace_plan(tab_id, meta, drawing, super::import::LoadPurpose::PlanUpdate)
     }
 
     // ── Dialog helpers ──────────────────────────────────────────────────────
@@ -1168,7 +1378,11 @@ pub(crate) mod tests {
         pub web: Web,
         pub session: SessionId,
         next_transfer: u32,
-        _bridge: Arc<Bridge>,
+        pub bridge: Arc<Bridge>,
+        /// `surveyEmpty` for the next `openSession`.
+        pub survey_empty: bool,
+        /// Earlier web connections, kept open.
+        old_webs: Vec<Web>,
         dir: std::path::PathBuf,
     }
 
@@ -1196,7 +1410,7 @@ pub(crate) mod tests {
             let BridgeEvent::Opened { session, .. } = &opened else { panic!("expected Opened") };
             let session = *session;
             let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
-            Self { app, events, web, session, next_transfer: 1, _bridge: bridge, dir }
+            Self { app, events, web, session, next_transfer: 1, bridge, survey_empty: true, old_webs: Vec::new(), dir }
         }
 
         pub(crate) fn dir(&self) -> &std::path::Path {
@@ -1233,6 +1447,22 @@ pub(crate) mod tests {
             id
         }
 
+        /// Send a transfer with a chosen id.
+        pub(crate) fn transfer_numbered(&mut self, id: u32, name: &str, media_type: &str, bytes: &[u8]) -> u32 {
+            let next = self.next_transfer;
+            self.next_transfer = id;
+            let sent = self.transfer(name, media_type, bytes);
+            self.next_transfer = next.max(id + 1);
+            sent
+        }
+
+        /// Make the desktop send a `sessionState`, as a marker in the stream.
+        pub(crate) fn send_state_probe(&mut self) {
+            let index = self.app.active_tab;
+            self.app.tabs[index].dirty = !self.app.tabs[index].dirty;
+            self.app.secureplan_report_states();
+        }
+
         /// `openSession` with an overlay and, optionally, the current drawing.
         pub(crate) fn open(&mut self, drawing: Option<(&str, Format, Vec<u8>)>, overlay: Vec<u8>, mode: &str, cad_plan: Value, base: &str, intent: &str) {
             let overlay_id = self.transfer("overlay.json", "application/vnd.secureplan.overlay+json", &overlay);
@@ -1242,6 +1472,7 @@ pub(crate) mod tests {
                 "type": "openSession", "requestId": "open-1", "intent": intent, "mode": mode,
                 "surveyLabel": "Synthetic survey", "cadPlan": cad_plan, "placement": placement,
                 "baseIdentity": base, "drawingTransferId": drawing_id, "overlayTransferId": overlay_id,
+                "surveyEmpty": self.survey_empty,
             }));
         }
 
@@ -1289,6 +1520,82 @@ pub(crate) mod tests {
                 if wanted(&state) {
                     return state;
                 }
+            }
+        }
+
+        /// Hold worker jobs (loads, Apply builds) until released.
+        pub(crate) fn hold_jobs(&mut self) {
+            self.app.secureplan.held_jobs = Some(Default::default());
+        }
+
+        pub(crate) fn held(&self) -> usize {
+            self.app.secureplan.held_jobs.as_ref().map_or(0, |h| h.0.len())
+        }
+
+        pub(crate) fn release(&mut self, index: usize) {
+            let _ = self.app.secureplan_release_job(index);
+        }
+
+        /// Pair again from the web: `survey` another survey, or `None` for a
+        /// re-pair of the open one (confirmed in the desktop). The harness
+        /// then talks over the new session.
+        pub(crate) fn pair_again(&mut self, pairing: u8, survey: Option<&str>) {
+            let mut request = launch(ORIGIN, pairing);
+            if let Some(survey) = survey {
+                request.survey = survey.to_string().into();
+            }
+            // A re-pair supersedes the open document's live session, if any.
+            let superseded = if survey.is_none() { self.app.secureplan.sessions.by_tab(self.tab_id()).and_then(|b| b.session) } else { None };
+            self.bridge.add_pending(request.clone());
+            let web = connect_web(self.bridge.port(), &request).expect("pair again");
+            self.old_webs.push(std::mem::replace(&mut self.web, web));
+            loop {
+                let event = next_event(&self.events);
+                let opened = match &event {
+                    BridgeEvent::Opened { session, needs_confirmation, .. } => Some((*session, *needs_confirmation)),
+                    _ => None,
+                };
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+                if let Some((session, needs_confirmation)) = opened {
+                    self.session = session;
+                    if needs_confirmation {
+                        let _ = self.app.update(Message::SecurePlan(Msg::Action(Action::Repair(session, true))));
+                    }
+                    if let Some(old) = superseded {
+                        self.pump_until_closed(old);
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// Deliver bridge events until the app has seen `session` close.
+        pub(crate) fn pump_until_closed(&mut self, session: SessionId) {
+            loop {
+                let event = next_event(&self.events);
+                let done = matches!(&event, BridgeEvent::Closed { session: s, .. } if *s == session);
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+                if done {
+                    return;
+                }
+            }
+        }
+
+        /// Make the recovery store unwritable (a file where its folder goes).
+        pub(crate) fn break_recovery_store(&mut self) {
+            let blocker = self.dir().join("blocker");
+            std::fs::write(&blocker, b"not a folder").unwrap();
+            self.app.secureplan.recovery = recovery::Store::at(blocker.join("recovery"));
+        }
+
+        pub(crate) fn entity_count(&self) -> usize {
+            self.app.tabs[self.app.active_tab].scene.document.entities().count()
+        }
+
+        pub(crate) fn dialog_title(&self) -> Option<String> {
+            match &self.app.secureplan.dialog {
+                Some(Dialog::Choice { title, .. }) => Some(title.clone()),
+                _ => None,
             }
         }
 
@@ -1352,7 +1659,7 @@ pub(crate) mod tests {
         h.send(json!({
             "type": "openSession", "requestId": "open-1", "intent": "edit", "mode": "edit",
             "surveyLabel": "Synthetic survey", "cadPlan": null, "placement": null,
-            "baseIdentity": "none", "drawingTransferId": 2, "overlayTransferId": 1,
+            "baseIdentity": "none", "drawingTransferId": 2, "overlayTransferId": 1, "surveyEmpty": true,
         }));
         assert!(h.app.secureplan.sessions.bound.is_empty(), "handled before its transfers");
         h.transfer("overlay.json", "application/vnd.secureplan.overlay+json", &overlay::tests::overlay_bytes(&[]));
@@ -1395,6 +1702,75 @@ pub(crate) mod tests {
         host.block_records.add(record).unwrap();
         let (infos, _) = crate::io::xref::resolve_xrefs(&mut host, h.dir());
         assert!(infos.iter().all(|info| matches!(info.status, crate::io::xref::XrefStatus::NotFound)));
+    }
+
+    #[test]
+    fn data_links_of_a_bound_document_are_never_read_or_written() {
+        use acadrust::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
+        let mut h = Harness::new("datalink");
+        h.open_dxf();
+        let csv = h.dir().join("linked.csv");
+        std::fs::write(&csv, "a,b\nc,d\n").unwrap();
+        let before = std::fs::read(&csv).unwrap();
+        let index = h.app.active_tab;
+        // A table linked to a local file, and one to another computer.
+        for target in [csv.to_string_lossy().into_owned(), format!("//qa-host/share/{}", "linked.csv")] {
+            let doc = &mut h.app.tabs[index].scene.document;
+            let handle = doc.allocate_handle();
+            let link = DataLink { connection_string: target, option: 1, path_option: 1, ..Default::default() };
+            let mut object = ClassObject::new(ClassObjectData::DataLink(link));
+            object.handle = handle;
+            doc.objects.insert(handle, ObjectType::ClassObject(object));
+            let mut table = acadrust::entities::Table::new(acadrust::types::Vector3::ZERO, 1, 1);
+            table.rows[0].cells[0].data_link_handle = Some(handle);
+            doc.add_entity(acadrust::EntityType::Table(table)).unwrap();
+            assert!(crate::app::annotation_data::read_data_link(doc, handle).is_err(), "the link was read");
+        }
+        for command in ["DATALINKUPDATE", "DATALINKUPDATE WRITE"] {
+            h.app.command_line.last_error = None;
+            let _ = h.app.dispatch_command(command);
+            assert!(!last_error(&h.app).is_empty(), "{command} was not refused");
+        }
+        // Even run past the command guard, the write finds no path.
+        h.app.secureplan.command_guard.unbind_tab(h.tab_id());
+        let _ = h.app.dispatch_command("DATALINKUPDATE WRITE");
+        assert_eq!(std::fs::read(&csv).unwrap(), before, "the linked file was written");
+    }
+
+    #[test]
+    fn extraction_and_layer_translation_never_write_a_bound_drawing_to_files() {
+        let mut h = Harness::new("writes");
+        h.open_dxf();
+        let index = h.app.active_tab;
+        let out = h.dir().join("extracted.csv");
+        let settings = h.dir().join("extraction.dxex");
+        // The wizard opened through an alias the command guard does not
+        // list, finished with a file output and a settings file.
+        h.app.open_data_extraction();
+        h.app.data_extraction.output_file = true;
+        h.app.data_extraction.output_path = out.to_string_lossy().into_owned();
+        h.app.data_extraction.settings_path = settings.to_string_lossy().into_owned();
+        h.app.data_extraction.properties =
+            vec![crate::ui::window::annotation_data::ExtractionProperty { key: "Layer".into(), name: "Layer".into(), category: "General".into(), checked: true }];
+        let _ = h.app.update(Message::DataExtractionFinish);
+        assert!(!out.exists() && !settings.exists(), "the wizard wrote a file");
+        let _ = h.app.update(Message::DataExtractionSaveResult("a,b\n".into(), Some(out.clone())));
+        assert!(!out.exists());
+        // LAYTRANS: its mappings file and its log (named after the survey).
+        let mappings = h.dir().join("mappings.txt");
+        h.app.layer_translator = Some(crate::ui::window::layer_translator::State { write_log: true, ..Default::default() });
+        let _ = h.app.update(Message::LayerTranslatorMappingsPath(mappings.clone(), true));
+        assert!(!mappings.exists(), "the mappings were written");
+        let log = std::path::PathBuf::from(&h.app.tabs[index].tab_title).with_extension("laytrans.log");
+        let _ = h.app.update(Message::LayerTranslatorTranslate);
+        let written = log.exists();
+        std::fs::remove_file(&log).ok();
+        assert!(!written, "the translation log was written");
+        // Plotting and printing paths, whichever dialog reached them.
+        for message in [Message::PlotExportPath(Some(h.dir().join("plot.pdf"))), Message::PrintAllPdfPath(Some(h.dir().join("all.pdf")))] {
+            let _ = h.app.update(message);
+        }
+        assert!(!h.dir().join("plot.pdf").exists() && !h.dir().join("all.pdf").exists());
     }
 
     #[test]
@@ -1505,42 +1881,15 @@ pub(crate) mod tests {
         assert_eq!(form.buttons[0].0, "Replace current plan with recovered drawing");
         assert!(lines.iter().any(|l| l.contains("no plan") && l.contains("plan version 1")), "both versions shown: {lines:?}");
         // Without the explicit choice Apply is refused.
-        let mut refused = Bound { recovered_base: Some("none".into()), replace_confirmed: false, ..clone_bound(h.bound()) };
+        let mut refused = Bound { recovered_base: Some("none".into()), replace_confirmed: false, ..h.bound().clone() };
         assert!(apply_allowed(&refused).is_err());
         refused.replace_confirmed = true;
         assert!(apply_allowed(&refused).is_ok());
         let tab_id = h.tab_id();
         let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::RecoveryRestore(tab_id))));
-        assert!(h.app.tabs[h.app.active_tab].dirty);
+        assert!(h.app.secureplan_has_unapplied(h.app.active_tab));
         assert!(h.bound().replace_confirmed && h.bound().pending_original.is_some());
         assert!(apply_allowed(h.bound()).is_ok());
-    }
-
-    fn clone_bound(bound: &Bound) -> Bound {
-        Bound {
-            session: bound.session,
-            tab_id: bound.tab_id,
-            origin: bound.origin.clone(),
-            survey: bound.survey.clone(),
-            label: bound.label.clone(),
-            intent: bound.intent,
-            mode: bound.mode,
-            base_identity: bound.base_identity.clone(),
-            plan_version: bound.plan_version,
-            has_plan: bound.has_plan,
-            loaded: bound.loaded.clone(),
-            clean_revision: bound.clean_revision,
-            pending_original: bound.pending_original.clone(),
-            recovered_base: bound.recovered_base.clone(),
-            replace_confirmed: bound.replace_confirmed,
-            overlay: bound.overlay.clone(),
-            alignment: bound.alignment,
-            realigned: bound.realigned,
-            busy: bound.busy,
-            error: bound.error,
-            apply: bound.apply.clone(),
-            last_state: bound.last_state.clone(),
-        }
     }
 
     // ── F4b ─────────────────────────────────────────────────────────────────
@@ -1608,7 +1957,7 @@ pub(crate) mod tests {
         assert_eq!(h.bound().overlay.as_ref().unwrap().walls.len(), 2);
         let second = overlay::tests::overlay_bytes(&[([5.0, 5.0], [6.0, 6.0])]);
         let id = h.transfer("overlay.json", "application/vnd.secureplan.overlay+json", &second);
-        h.send(json!({ "type": "overlayUpdate", "requestId": "o1", "overlayTransferId": id }));
+        h.send(json!({ "type": "overlayUpdate", "requestId": "o1", "overlayTransferId": id, "surveyEmpty": false }));
         let walls = &h.bound().overlay.as_ref().unwrap().walls;
         assert_eq!(walls.len(), 1, "replaced, not merged");
         assert_eq!(walls[0].1, [5.0, 5.0]);
@@ -1743,7 +2092,7 @@ pub(crate) mod tests {
     fn outputs_repeat_exactly_and_known_loss_or_size_stop_apply() {
         let scene = publish::tests::synthetic_dxf_scene();
         let loaded = Drawing { bytes: Arc::new(testutil::synthetic_dxf()), name: "synthetic.dxf".to_string().into(), format: Format::Dxf, format_version: "AC1032".into() };
-        let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: Some(loaded.clone()), modified: true, pending_original: None };
+        let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: Some(loaded.clone()), modified: true, pending_original: None, lost_entities: 0 };
         let window = [0.0, 0.0, 30000.0, 18000.0];
         let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
         let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: publish::choose_mm_per_pt(window, &mapping).unwrap() };
@@ -1788,7 +2137,7 @@ pub(crate) mod tests {
             return;
         }
         let scene = publish::tests::synthetic_dxf_scene();
-        let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: None, modified: true, pending_original: None };
+        let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: None, modified: true, pending_original: None, lost_entities: 0 };
         let window = [0.0, 0.0, 30000.0, 18000.0];
         let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
         let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: 3.0 };
@@ -1834,5 +2183,318 @@ pub(crate) mod tests {
         assert_eq!(h.bound().loaded.as_ref().unwrap().format, Format::Dwg);
         assert_eq!(h.bound().alignment, crate::app::secureplan::align::Alignment::from_cad_plan(&update["cadPlan"]));
         assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Choice { title, .. }) if title == "The plan changed"));
+    }
+
+    const SURVEY: &str = "7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f";
+
+    fn plan_update(h: &mut Harness, drawing: Option<(&str, &str, Vec<u8>)>, base: &str) {
+        let mut update = sample("planUpdate-applied");
+        update["drawingTransferId"] = match drawing {
+            Some((name, media, bytes)) => json!(h.transfer(name, media, &bytes)),
+            None => Value::Null,
+        };
+        update["baseIdentity"] = json!(base);
+        h.send(update);
+    }
+
+    // ── Fix round 1 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_apply_built_before_a_plan_change_or_reconnect_is_not_sent() {
+        for change in ["planUpdate", "reconnect"] {
+            let mut h = Harness::new(&format!("stale_{change}"));
+            h.open_dxf();
+            align_and_open_apply(&mut h);
+            h.hold_jobs();
+            h.key(DialogKey::Activate);
+            assert_eq!(h.held(), 1, "the build is running");
+            if change == "planUpdate" {
+                plan_update(&mut h, Some(("new.dxf", "image/vnd.dxf", testutil::synthetic_dxf())), BASE);
+                h.release(1); // the new drawing loads first
+            } else {
+                h.pair_again(9, None);
+                h.open(Some(("synthetic.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+                h.release(1);
+            }
+            // Now the build finishes: its outputs belong to the old state.
+            h.release(0);
+            assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"), "{change}");
+            assert!(h.bound().apply.is_none(), "{change}: an applyRequest was sent");
+            assert!(h.bound().busy.is_none());
+            // Nothing reached the page: the next message it sees is ours.
+            h.send_state_probe();
+            let (state, transfers) = h.receive("sessionState");
+            assert!(transfers.is_empty(), "{change}: outputs were sent");
+            assert!(state.is_object());
+        }
+    }
+
+    #[test]
+    fn a_plan_update_whose_drawing_does_not_open_changes_nothing_and_blocks_apply() {
+        let deep = {
+            use acadrust::entities::Insert;
+            use acadrust::types::Vector3;
+            let mut doc = testutil::synthetic_document();
+            for level in (1..=33).rev() {
+                let mut members = vec![];
+                if level < 33 {
+                    members.push(acadrust::EntityType::Insert(Insert::new(format!("B{}", level + 1), Vector3::ZERO)));
+                } else {
+                    members.push(acadrust::EntityType::Line(acadrust::entities::Line::from_points(Vector3::ZERO, Vector3::new(1.0, 1.0, 0.0))));
+                }
+                crate::app::secureplan::snap::tests::block(&mut doc, &format!("B{level}"), members);
+            }
+            doc.add_entity(acadrust::EntityType::Insert(Insert::new("B1", Vector3::ZERO))).unwrap();
+            crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap()
+        };
+        for (case, bytes) in [("malformed", b"AC1032 not a drawing".to_vec()), ("over the limit", deep)] {
+            let mut h = Harness::new(&format!("badupdate_{}", case.len()));
+            h.open_dxf();
+            let entities = h.entity_count();
+            let media = if case == "malformed" { "image/vnd.dwg" } else { "image/vnd.dxf" };
+            plan_update(&mut h, Some(("new", media, bytes)), BASE);
+            assert_eq!(h.bound().base_identity, "none", "{case}: the new plan was adopted without its drawing");
+            assert!(h.bound().loaded.as_ref().is_some_and(|l| l.format == Format::Dxf), "{case}");
+            assert_eq!(h.entity_count(), entities, "{case}: the drawing changed");
+            assert!(h.bound().unresolved && h.bound().staged.is_none(), "{case}");
+            assert_eq!(h.dialog_title().as_deref(), Some("The drawing could not be opened"));
+            h.app.secureplan.dialog = None;
+            h.app.command_line.last_error = None;
+            let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+            assert!(last_error(&h.app).contains("not up to date"), "{case}: {}", last_error(&h.app));
+            assert!(h.app.secureplan.dialog.is_none());
+        }
+    }
+
+    #[test]
+    fn a_plan_change_while_disconnected_keeps_the_edits_before_replacing_them() {
+        let mut h = Harness::new("reconnect");
+        h.open_dxf();
+        let first = h.session;
+        h.web.send(&json!({ "type": "close", "requestId": "x1", "reason": "pageClosed" }));
+        h.pump_until_closed(first);
+        assert!(!h.bound().connected());
+        h.edit((100.0, 100.0), (900.0, 900.0));
+        let edited = h.entity_count();
+        // The page comes back; meanwhile the plan changed in SecurePlan.
+        h.pair_again(21, None);
+        h.open(Some(("new.dwg", Format::Dwg, testutil::synthetic_dwg())), overlay::tests::overlay_bytes(&[]), "edit", sample("openSession-edit")["cadPlan"].clone(), BASE, "edit");
+        let entry = h.app.secureplan.recovery.load(ORIGIN, SURVEY).expect("the edits were kept first");
+        assert_eq!(entry.base_identity, "none", "under the plan they were made from");
+        let (kept, _) = crate::app::secureplan::import::load_drawing("x", entry.drawing.bytes.as_ref().clone()).unwrap();
+        assert_eq!(kept.entities().count(), edited);
+        assert_eq!(h.bound().base_identity, BASE);
+        assert_eq!(h.bound().loaded.as_ref().unwrap().format, Format::Dwg);
+    }
+
+    #[test]
+    fn a_replacement_stops_when_the_edits_cannot_be_kept() {
+        for path in ["planUpdate", "reconnect", "import"] {
+            let mut h = Harness::new(&format!("nokeep_{path}"));
+            h.open_dxf();
+            h.edit((100.0, 100.0), (900.0, 900.0));
+            let edited = h.entity_count();
+            h.break_recovery_store();
+            match path {
+                "planUpdate" => plan_update(&mut h, Some(("new.dwg", "image/vnd.dwg", testutil::synthetic_dwg())), BASE),
+                "reconnect" => {
+                    let first = h.session;
+                    h.web.send(&json!({ "type": "close", "requestId": "x1", "reason": "pageClosed" }));
+                    h.pump_until_closed(first);
+                    h.pair_again(22, None);
+                    h.open(Some(("new.dwg", Format::Dwg, testutil::synthetic_dwg())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, BASE, "edit");
+                }
+                _ => {
+                    let file = h.dir().join("other.dxf");
+                    std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+                    let tab_id = h.tab_id();
+                    let _ = h.app.secureplan_import_path(tab_id, &file);
+                    assert_eq!(h.dialog_title().as_deref(), Some("Import stopped"));
+                    assert!(h.bound().pending_original.is_none(), "the import went ahead");
+                }
+            }
+            assert_eq!(h.entity_count(), edited, "{path}: the edits were replaced");
+            assert!(h.app.tabs[h.app.active_tab].dirty, "{path}");
+            assert_eq!(h.bound().base_identity, "none", "{path}");
+            if path != "import" {
+                assert!(h.bound().unresolved, "{path}: Apply must wait for a reopen");
+                assert_eq!(h.dialog_title().as_deref(), Some("The plan changed"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_partly_damaged_drawing_imports_with_a_warning_and_applies_only_unedited() {
+        use acadrust::types::Vector2;
+        let mut doc = testutil::synthetic_document();
+        let mut damaged = acadrust::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);
+        damaged.elevation = 1.0e11;
+        doc.add_entity(acadrust::EntityType::LwPolyline(damaged)).unwrap();
+        let bytes = crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let mut h = Harness::new("damaged");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+        let file = h.dir().join("damaged.dxf");
+        std::fs::write(&file, &bytes).unwrap();
+        let tab_id = h.tab_id();
+        let _ = h.app.secureplan_import_path(tab_id, &file);
+        let Some(Dialog::Choice { lines, .. }) = &h.app.secureplan.dialog else { panic!("no report") };
+        assert!(lines.iter().any(|l| l.contains("1 damaged entit")), "{lines:?}");
+        assert_eq!(h.bound().lost_entities, 1);
+        h.key(DialogKey::Activate);
+        // Edited, the drawing would be written without the damaged entity.
+        h.edit((1.0, 1.0), (2.0, 2.0));
+        align_and_open_apply(&mut h);
+        h.key(DialogKey::Activate);
+        assert_eq!(h.bound().error, Some(ErrorCode::KnownLoss));
+        assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"));
+    }
+
+    #[test]
+    fn a_restored_copy_applies_in_its_own_format_and_version() {
+        for (bytes, format, version) in [
+            (testutil::synthetic_dwg(), Format::Dwg, "AC1032"),
+            (crate::io::save_to_bytes(&testutil::synthetic_document(), "dxf", acadrust::DxfVersion::AC1015).unwrap(), Format::Dxf, "AC1015"),
+        ] {
+            let mut h = Harness::new(&format!("restore_{version}_{}", format.ext()));
+            let drawing = Drawing { bytes: Arc::new(bytes.clone()), name: format!("kept.{}", format.ext()).into(), format, format_version: version.into() };
+            let entry = recovery::Entry { origin: ORIGIN.into(), survey: SURVEY.into(), base_identity: "none".into(), plan_version: None, saved: std::time::SystemTime::now(), drawing, original: None };
+            h.app.secureplan.recovery.save(&entry).unwrap();
+            h.open_dxf();
+            let tab_id = h.tab_id();
+            let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::RecoveryRestore(tab_id))));
+            assert!(h.app.secureplan_has_unapplied(h.app.active_tab));
+            align_and_open_apply(&mut h);
+            h.key(DialogKey::Activate);
+            let (request, transfers) = h.receive("applyRequest");
+            let sent = &transfers[&request["drawing"]["transferId"].as_u64().unwrap()];
+            assert_eq!(sent.0["mediaType"], format.media_type(), "{version}");
+            assert_eq!(request["drawing"]["formatVersion"], version);
+            assert_eq!(sent.1, bytes, "{version}: the recovered drawing itself");
+        }
+    }
+
+    #[test]
+    fn autosave_keeps_an_import_that_has_no_edit_yet() {
+        let mut h = Harness::new("autosave_import");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+        let file = h.dir().join("synthetic.dwg");
+        std::fs::write(&file, testutil::synthetic_dwg()).unwrap();
+        let tab_id = h.tab_id();
+        let _ = h.app.secureplan_import_path(tab_id, &file);
+        assert!(!h.app.tabs[h.app.active_tab].dirty);
+        let _ = h.app.update(Message::AutoSave);
+        let entry = h.app.secureplan.recovery.load(ORIGIN, SURVEY).expect("the import was kept");
+        assert_eq!(entry.original.unwrap().bytes.as_slice(), testutil::synthetic_dwg().as_slice());
+    }
+
+    #[test]
+    fn quitting_decides_each_secureplan_drawing_first() {
+        for choice in ["keep", "discard", "keep-fails", "cancel"] {
+            let mut h = Harness::new(&format!("quit_{choice}"));
+            let main = iced::window::Id::unique();
+            h.app.main_window = Some(main);
+            h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+            let file = h.dir().join("synthetic.dxf");
+            std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+            let tab_id = h.tab_id();
+            let _ = h.app.secureplan_import_path(tab_id, &file);
+            h.app.secureplan.dialog = None;
+            // An imported, unedited drawing still asks.
+            let _ = h.app.update(Message::WindowCloseRequested(main));
+            let Some(Dialog::Choice { title, .. }) = &h.app.secureplan.dialog else { panic!("{choice}: no prompt") };
+            assert_eq!(title, "Unapplied edits");
+            assert!(h.app.pending_close.is_none(), "the upstream Save prompt showed");
+            if choice == "keep-fails" {
+                h.break_recovery_store();
+            }
+            let action = match choice {
+                "keep" | "keep-fails" => Action::CloseKeep(tab_id),
+                "discard" => Action::CloseDiscard(tab_id),
+                _ => Action::Dismiss,
+            };
+            h.app.secureplan.recovery.save(&h.app.secureplan_recovery_entry(h.app.active_tab, "none").unwrap()).ok();
+            let _ = h.app.update(Message::SecurePlan(Msg::Action(action)));
+            let open = h.app.secureplan_tab_index(tab_id).is_some();
+            let copy = h.app.secureplan.recovery.load(ORIGIN, SURVEY).is_some();
+            match choice {
+                "keep" => assert!(!open && copy && h.app.secureplan.quitting, "keep"),
+                "discard" => assert!(!open && !copy && h.app.secureplan.quitting, "discard deletes the copy"),
+                "keep-fails" => {
+                    assert!(open && !h.app.secureplan.quitting, "closed without its copy");
+                    assert_eq!(h.dialog_title().as_deref(), Some("Not closed"));
+                }
+                _ => assert!(open && !h.app.secureplan.quitting),
+            }
+            if !open {
+                // The quit goes on: nothing is left to decide, so the app exits.
+                assert!(h.app.secureplan_window_close_requested(main).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn two_surveys_load_at_once_and_each_gets_its_own_drawing() {
+        let mut h = Harness::new("two");
+        h.hold_jobs();
+        h.open(Some(("a.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let a = h.tab_id();
+        h.pair_again(23, Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"));
+        h.open(Some(("b.dwg", Format::Dwg, testutil::synthetic_dwg())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let b = h.tab_id();
+        assert_eq!(h.app.secureplan.sessions.bound.len(), 2);
+        assert_ne!(a, b);
+        assert_eq!(h.held(), 2);
+        // B finishes first, then A: neither is dropped.
+        h.release(1);
+        h.release(0);
+        let format = |tab: u64| h.app.secureplan.sessions.by_tab(tab).and_then(|b| b.loaded.as_ref().map(|l| l.format));
+        assert_eq!(format(a), Some(Format::Dxf));
+        assert_eq!(format(b), Some(Format::Dwg));
+        assert!(h.app.secureplan.load_jobs.is_empty());
+    }
+
+    #[test]
+    fn messages_after_a_waiting_open_session_are_handled_in_order() {
+        let mut h = Harness::new("ordered");
+        // openSession names transfers the page has not sent yet; a mode
+        // change and an overlay update follow it.
+        h.web.send(&json!({
+            "type": "openSession", "requestId": "open-1", "intent": "edit", "mode": "edit",
+            "surveyLabel": "Synthetic survey", "cadPlan": null, "placement": null,
+            "baseIdentity": "none", "drawingTransferId": 2, "overlayTransferId": 1, "surveyEmpty": true,
+        }));
+        h.pump();
+        h.web.send(&json!({ "type": "sessionMode", "requestId": "m1", "mode": "view", "reason": "leaseLost" }));
+        h.pump();
+        h.transfer("overlay.json", "application/vnd.secureplan.overlay+json", &overlay::tests::overlay_bytes(&[]));
+        // Transfer 3 (the update's) completes before the open's drawing.
+        let _ = h.transfer_numbered(3, "overlay.json", "application/vnd.secureplan.overlay+json", &overlay::tests::overlay_bytes(&[([7.0, 7.0], [8.0, 8.0])]));
+        h.web.send(&json!({ "type": "overlayUpdate", "requestId": "o1", "overlayTransferId": 3, "surveyEmpty": false }));
+        h.pump();
+        assert!(h.app.secureplan.sessions.bound.is_empty(), "handled before its drawing arrived");
+        let _ = h.transfer_numbered(2, "synthetic.dxf", "image/vnd.dxf", &testutil::synthetic_dxf());
+        assert_eq!(h.bound().mode, Mode::View, "the later mode change was lost");
+        let walls = &h.bound().overlay.as_ref().unwrap().walls;
+        assert_eq!(walls.len(), 1, "the later overlay was lost");
+        assert_eq!(walls[0].1, [7.0, 7.0]);
+    }
+
+    #[test]
+    fn a_survey_with_only_comments_is_not_placed_at_the_origin() {
+        // No design elements, so the overlay is empty; but it has comments.
+        let mut h = Harness::new("comments");
+        h.survey_empty = false;
+        h.open_dxf();
+        assert!(h.bound().overlay.as_ref().unwrap().is_empty());
+        assert!(!survey_is_empty(h.bound()));
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog else { panic!("no alignment dialog") };
+        assert!(!dialog.empty_survey, "the translation must be the user's to choose");
+        assert!(dialog.form.fields.iter().any(|f| f.label == "…lands at survey X (mm)" && f.enabled));
+        h.app.secureplan.dialog = None;
+        // The web says it became empty (comments deleted): the origin rule applies.
+        let id = h.transfer("overlay.json", "application/vnd.secureplan.overlay+json", &overlay::tests::overlay_bytes(&[]));
+        h.send(json!({ "type": "overlayUpdate", "requestId": "o2", "overlayTransferId": id, "surveyEmpty": true }));
+        assert!(survey_is_empty(h.bound()));
     }
 }

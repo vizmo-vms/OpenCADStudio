@@ -133,6 +133,8 @@ pub struct Report {
     pub entities: usize,
     pub extents: Option<[f64; 4]>,
     pub warnings: Vec<String>,
+    /// Damaged entities the reader could not read and dropped.
+    pub lost_entities: usize,
 }
 
 impl Report {
@@ -201,7 +203,7 @@ pub fn load_drawing(_name: &str, bytes: Vec<u8>) -> Result<(acadrust::CadDocumen
     // nothing is resolved beside any file.
     let name = std::path::PathBuf::from(format!("drawing.{}", format.ext()));
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::io::load_bytes_finalized(&name, bytes)));
-    let (mut document, _) = match parsed {
+    let (mut document, lost_entities) = match parsed {
         Ok(Ok(loaded)) => loaded,
         Ok(Err(message)) if message.contains("SecurePlan CAD opens") => {
             return Err(ImportError::new(ErrorCode::EntityLimit, message));
@@ -224,7 +226,19 @@ pub fn load_drawing(_name: &str, bytes: Vec<u8>) -> Result<(acadrust::CadDocumen
         units: super::align::Units::declared(document.header.insertion_units),
         entities,
         extents: None,
-        warnings: warnings(&document),
+        warnings: {
+            let mut warnings = warnings(&document);
+            if lost_entities > 0 {
+                warnings.insert(
+                    0,
+                    format!(
+                        "{lost_entities} damaged entit(ies) could not be read and are not shown. The drawing can be applied only unedited (as imported); after an edit, Apply stops because writing it would lose them."
+                    ),
+                );
+            }
+            warnings
+        },
+        lost_entities,
     };
     Ok((document, report))
 }
@@ -279,7 +293,9 @@ impl OpenCADStudio {
     pub(crate) fn secureplan_load(&mut self, tab_id: u64, bytes: Arc<Vec<u8>>, name: String, format: Format, purpose: LoadPurpose) -> Task<Message> {
         self.secureplan.next_job += 1;
         let job = self.secureplan.next_job;
-        self.secureplan.load_job = Some(job);
+        // A newer load of the same tab supersedes this one; other tabs' loads
+        // go on.
+        self.secureplan.load_jobs.insert(tab_id, job);
         let operation = if purpose == LoadPurpose::Import { "import" } else { "loading" };
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
             bound.busy = Some(super::session::Busy { operation, progress: None });
@@ -294,12 +310,12 @@ impl OpenCADStudio {
     }
 
     pub(crate) fn secureplan_loaded(&mut self, done: LoadDone) -> Task<Message> {
-        // Cancelled, or superseded by a newer load.
-        if self.secureplan.load_job != Some(done.job) {
+        // Cancelled, or superseded by a newer load of the same tab.
+        if self.secureplan.load_jobs.get(&done.tab_id) != Some(&done.job) {
             return Task::none();
         }
-        self.secureplan.load_job = None;
-        if matches!(self.secureplan.dialog, Some(super::ui::Dialog::Progress { .. })) {
+        self.secureplan.load_jobs.remove(&done.tab_id);
+        if matches!(self.secureplan.dialog, Some(super::ui::Dialog::Progress { tab_id, .. }) if tab_id == done.tab_id) {
             self.secureplan.dialog = None;
         }
         let Some(result) = done.result.take() else { return Task::none() };
@@ -310,20 +326,41 @@ impl OpenCADStudio {
         let (document, mut report) = match result {
             Ok(loaded) => loaded,
             Err(error) => {
+                let replacing = done.purpose != LoadPurpose::Import;
                 if let Some(bound) = self.secureplan.sessions.by_tab_mut(done.tab_id) {
                     bound.error = Some(error.code);
+                    // The new plan's drawing did not open: the old one stays
+                    // under its old plan, and Apply waits for a reopen.
+                    if replacing {
+                        bound.staged = None;
+                        bound.unresolved = true;
+                    }
                 }
-                let title = if done.purpose == LoadPurpose::Import { "Import failed" } else { "The drawing could not be opened" };
-                self.secureplan.dialog = Some(super::ui::Dialog::notice(title, vec![error.message.clone(), "Nothing was changed.".into()]));
+                let (title, outcome) = if replacing {
+                    ("The drawing could not be opened", "The previous drawing stays. Apply is blocked until the survey is opened from SecurePlan again.")
+                } else {
+                    ("Import failed", "Nothing was changed.")
+                };
+                self.secureplan.dialog = Some(super::ui::Dialog::notice(title, vec![error.message.clone(), outcome.into()]));
                 super::testdriver_event(if done.purpose == LoadPurpose::Import { "import-failed" } else { "load-failed" }, error.code.as_str());
                 self.secureplan_report_states();
                 return Task::none();
             }
         };
         let drawing = Drawing::describe(done.drawing.bytes, done.drawing.name.expose(), report.format, &document);
-        if done.purpose == LoadPurpose::Import {
-            // Keep a copy of any unapplied work the import replaces.
-            self.secureplan_keep_recovery(index);
+        // Keep a copy of any unapplied work the import replaces; if that
+        // fails, the import changes nothing.
+        if done.purpose == LoadPurpose::Import && self.secureplan_keep_recovery(index) == super::session::Preserve::Failed {
+            self.secureplan.dialog = Some(super::ui::Dialog::notice(
+                "Import stopped",
+                vec![
+                    "Your unapplied edits could not be saved as a recovery copy, so the import did not replace them.".into(),
+                    "Nothing was changed. Free some disk space, then import again.".into(),
+                ],
+            ));
+            super::testdriver_event("import-failed", "RECOVERY");
+            self.secureplan_report_states();
+            return Task::none();
         }
         self.secureplan_install(index, document, Some(drawing.clone()));
         if let Some((min, max)) = self.tabs[index].scene.model_space_extents() {
@@ -333,6 +370,11 @@ impl OpenCADStudio {
             bound.error = None;
             bound.recovered_base = None;
             bound.replace_confirmed = false;
+            bound.lost_entities = report.lost_entities;
+            // The new plan is adopted together with its drawing (PUB-06).
+            if let Some(meta) = bound.staged.take() {
+                bound.adopt(meta);
+            }
             if done.purpose == LoadPurpose::Import {
                 // A new original: it is sent with the next Apply and must be
                 // aligned before it (PUB-01, PUB-02).
@@ -404,18 +446,22 @@ impl OpenCADStudio {
         };
         let format = Format::sniff(&bytes).unwrap_or(Format::Dxf);
         let task = self.secureplan_load(tab_id, Arc::new(bytes), name, format, LoadPurpose::Import);
-        if self.secureplan.load_job.is_some() {
-            self.secureplan.dialog = Some(super::ui::Dialog::progress("Importing drawing", "Reading the drawing…"));
+        if self.secureplan.load_jobs.contains_key(&tab_id) {
+            self.secureplan.dialog = Some(super::ui::Dialog::progress(tab_id, "Importing drawing", "Reading the drawing…"));
         }
         task
     }
 
-    /// Cancel a running import or load: its result is dropped.
-    pub(crate) fn secureplan_cancel_load(&mut self) {
-        self.secureplan.load_job = None;
-        for bound in &mut self.secureplan.sessions.bound {
+    /// Cancel the running import or load of tab `tab_id`: its result is
+    /// dropped. A cancelled replacement leaves Apply blocked.
+    pub(crate) fn secureplan_cancel_load(&mut self, tab_id: u64) {
+        self.secureplan.load_jobs.remove(&tab_id);
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
             if bound.busy.is_some_and(|b| b.operation == "import" || b.operation == "loading") {
                 bound.busy = None;
+            }
+            if bound.staged.take().is_some() {
+                bound.unresolved = true;
             }
         }
         self.secureplan_report_states();

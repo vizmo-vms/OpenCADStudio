@@ -13,7 +13,7 @@ use iced::widget::{column, text};
 use iced::{Element, Length};
 
 use super::{Action, Field, Form};
-use crate::app::secureplan::align::{check_placement, clip_to_canvas, mapping_at, Alignment};
+use crate::app::secureplan::align::{check_placement, mapping_at, trim_margin_to_canvas, Alignment};
 use crate::app::secureplan::publish::{choose_mm_per_pt, place_page, ApplyPlan, Mapping, Snapshot};
 use crate::app::Message;
 
@@ -35,6 +35,8 @@ pub struct ApplyDialog {
     pub empty_survey: bool,
     pub realigned: bool,
     pub plan_version: Option<u64>,
+    /// The session, plan and document generation the snapshot belongs to.
+    pub origin: crate::app::secureplan::session::ApplyOrigin,
 }
 
 impl ApplyDialog {
@@ -43,15 +45,17 @@ impl ApplyDialog {
         tab_id: u64,
         snapshot: Arc<Snapshot>,
         snapshot_revision: u64,
-        default_window: [f64; 4],
+        extents: [f64; 4],
         alignment: Alignment,
         empty_survey: bool,
         realigned: bool,
         plan_version: Option<u64>,
     ) -> Self {
-        // With a fixed mapping, the margin must not start the page before
-        // the canvas.
-        let default_window = if empty_survey { default_window } else { clip_to_canvas(default_window, &alignment.mapping) };
+        // The visible extents plus the margin. With a fixed mapping the margin
+        // (never the content) is trimmed where it would start the page
+        // before the canvas.
+        let default_window = crate::app::secureplan::publish::default_window(extents);
+        let default_window = if empty_survey { default_window } else { trim_margin_to_canvas(default_window, extents, &alignment.mapping) };
         let [x0, y0, x1, y1] = default_window;
         let fields = vec![
             Field::number("Window left (CAD X)", x0),
@@ -74,6 +78,7 @@ impl ApplyDialog {
             empty_survey,
             realigned,
             plan_version,
+            origin: Default::default(),
         }
     }
 
@@ -176,18 +181,19 @@ mod tests {
             loaded: None,
             modified: true,
             pending_original: None,
+            lost_entities: 0,
         });
-        let window = [0.0, 0.0, 30000.0, 18000.0];
-        let alignment = Alignment { units: Units::Mm, mapping: mapping_at(window, 1.0, 0, anchor) };
-        ApplyDialog::new(1, snapshot, 0, window, alignment, empty, false, None)
+        let extents = [0.0, 0.0, 30000.0, 18000.0];
+        let alignment = Alignment { units: Units::Mm, mapping: mapping_at(extents, 1.0, 0, anchor) };
+        ApplyDialog::new(1, snapshot, 0, extents, alignment, empty, false, None)
     }
 
     #[test]
     fn the_window_can_be_shrunk_and_reset_by_keyboard() {
         let mut dialog = dialog(true, [0.0, 0.0]);
         let full = dialog.plan().unwrap();
-        assert_eq!(full.window_cad, [0.0, 0.0, 30000.0, 18000.0]);
-        // Right edge: 30000 → 15000.
+        assert_eq!(full.window_cad, [-600.0, -360.0, 30600.0, 18360.0], "the extents plus 2%");
+        // Right edge: 30600 → 15000.
         dialog.form.focus = X1;
         for _ in 0..5 {
             dialog.form.key(DialogKey::Backspace);
@@ -196,7 +202,7 @@ mod tests {
             dialog.form.key(DialogKey::Char(c));
         }
         let shrunk = dialog.plan().unwrap();
-        assert_eq!(shrunk.window_cad, [0.0, 0.0, 15000.0, 18000.0]);
+        assert_eq!(shrunk.window_cad, [-600.0, -360.0, 15000.0, 18360.0]);
         // On an empty survey the shrunk window still starts at the origin.
         assert_eq!(shrunk.transform().unwrap().placement.page_world_min, [0.0, 0.0]);
         dialog.reset_window();
@@ -205,12 +211,19 @@ mod tests {
     }
 
     #[test]
-    fn a_page_outside_the_canvas_blocks_apply() {
+    fn the_margin_is_trimmed_to_the_canvas_but_content_outside_it_blocks_apply() {
+        // The drawing's top-left sits on the canvas origin: only the margin
+        // before it is trimmed.
+        let at_origin = dialog(false, [0.0, 0.0]);
+        assert_eq!(at_origin.plan().unwrap().window_cad, [0.0, -360.0, 30600.0, 18000.0]);
+        // Anchored at x = −100 mm, content lies outside the canvas: it is
+        // not trimmed away, and Apply is refused.
         let mut dialog = dialog(false, [-100.0, 0.0]);
-        // The default window is trimmed to the canvas; widening it back is blocked.
-        assert_eq!(dialog.plan().unwrap().window_cad, [100.0, 0.0, 30000.0, 18000.0]);
-        dialog.form.set_number(X0, 0.0);
         assert_eq!(dialog.plan().unwrap_err(), "Move the plan so it starts inside the canvas.");
         assert!(dialog.summary().iter().any(|l| l.contains("Move the plan")));
+        // Shrinking the window to the part inside the canvas is the user's choice.
+        dialog.form.set_number(X0, 100.0);
+        dialog.form.set_number(Y1, 18000.0);
+        assert!(dialog.plan().is_ok());
     }
 }
