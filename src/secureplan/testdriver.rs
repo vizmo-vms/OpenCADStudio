@@ -14,10 +14,15 @@
 //!   [origin=<x>,<y>] [anchor=<x>,<y>]`: set the alignment. `scale` (with no
 //!   `units`) is a calibration. On an empty survey the page goes to the
 //!   origin and `origin`/`anchor` are ignored.
-//! - `apply [window=<x0>,<y0>,<x1>,<y1>] [damaged=publish]`: Apply with the
-//!   default window (the visible extents plus 2%), or the given one, without
-//!   the dialog. `damaged=publish` ticks "Publish without N damaged items",
-//!   which a drawing with damaged items needs on every Apply.
+//! - `apply [window=<x0>,<y0>,<x1>,<y1>] [damaged=publish] [view=model |
+//!   view=layout:<name>]`: Apply without the dialog. Model space (the
+//!   default, or `view=model`) publishes the default window (the visible
+//!   extents plus 2%) or the given one; `view=layout:<name>` publishes that
+//!   paper layout's whole sheet through its reference viewport. It must come
+//!   last: the name is the rest of the line, spaces included, and `window`
+//!   does not apply. A layout that cannot be published gives
+//!   `apply-failed <reason>`. `damaged=publish` ticks "Publish without N
+//!   damaged items", which a drawing with damaged items needs on every Apply.
 //! - `status`: print the state of the most recently opened drawing.
 //!
 //! Outcomes arrive later as `secureplan-test: event <name> [detail]` lines:
@@ -47,7 +52,8 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub enum Command {
     Import(PathBuf),
     Align { units: Option<Units>, scale: Option<f64>, turns: u8, origin: Option<[f64; 2]>, anchor: Option<[f64; 2]> },
-    Apply { window: Option<[f64; 4]>, publish_damaged: bool },
+    /// `layout`: publish that paper layout instead of model space.
+    Apply { window: Option<[f64; 4]>, publish_damaged: bool, layout: Option<String> },
     Status,
 }
 
@@ -133,15 +139,25 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Align { units, scale, turns, origin, anchor })
         }
         "apply" => {
+            // `view=layout:<name>` comes last; the name may contain spaces.
+            let (rest, layout) = match rest.split_once("view=layout:") {
+                Some((before, name)) if !name.trim().is_empty() => (before, Some(name.trim().to_string())),
+                Some(_) => return Err("bad view".into()),
+                None => (rest, None),
+            };
             let (mut window_cad, mut publish_damaged) = (None, false);
-            for option in options() {
+            for option in rest.split_whitespace().map(|option| option.split_once('=').ok_or(format!("bad option {option}"))) {
                 match option? {
                     ("window", value) => window_cad = Some(window(value).ok_or("bad window")?),
                     ("damaged", "publish") => publish_damaged = true,
+                    ("view", "model") => {}
                     (other, _) => return Err(format!("unknown option {other}")),
                 }
             }
-            Ok(Command::Apply { window: window_cad, publish_damaged })
+            if layout.is_some() && window_cad.is_some() {
+                return Err("window applies to model space only".into());
+            }
+            Ok(Command::Apply { window: window_cad, publish_damaged, layout })
         }
         "status" if rest.is_empty() => Ok(Command::Status),
         _ => Err("unknown command".into()),
@@ -233,7 +249,7 @@ impl OpenCADStudio {
                 self.secureplan_set_alignment(tab_id, Alignment { units, mapping });
                 Task::none()
             }
-            Command::Apply { window, publish_damaged } => {
+            Command::Apply { window, publish_damaged, layout } => {
                 let allowed = self.secureplan_can_edit_survey().and_then(|()| {
                     self.secureplan.sessions.by_tab(tab_id).map_or(Ok(()), super::session::apply_allowed)
                 });
@@ -246,10 +262,12 @@ impl OpenCADStudio {
                     event("error", "align the drawing first");
                     return Task::none();
                 };
+                if !dialog.select_view(layout.as_deref()) {
+                    event("apply-failed", "the drawing has no layout by that name");
+                    return Task::none();
+                }
                 if let Some(window) = window {
-                    for (field, value) in window.into_iter().enumerate() {
-                        dialog.form.set_number(field, value);
-                    }
+                    dialog.set_window(window);
                 }
                 if publish_damaged {
                     dialog.acknowledge_damaged();
@@ -294,8 +312,42 @@ mod tests {
         assert!(h.app.secureplan.dialog.is_none(), "no dialog");
         let (request, transfers) = h.receive("applyRequest");
         assert_eq!(transfers.len(), 4, "drawing, original, PDF and snap file");
+        assert_eq!(request["view"]["kind"], "model");
         assert_eq!(request["cadUnits"], "mm");
         let _ = h.app.secureplan_driver(Command::Status);
+    }
+
+    #[test]
+    fn the_driver_applies_a_paper_layout() {
+        use crate::app::secureplan::session::tests::Harness;
+        use crate::app::secureplan::{overlay, testutil};
+        let mut h = Harness::new("driver_layout");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", serde_json::Value::Null, "none", "import");
+        let file = h.dir().join("synthetic-layout.dxf");
+        std::fs::write(&file, testutil::synthetic_layout_dxf()).unwrap();
+        let _ = h.app.secureplan_driver(parse(&format!("import {}", file.display())).unwrap());
+        let _ = h.app.secureplan_driver(parse("align units=mm").unwrap());
+        h.app.secureplan.dialog = None;
+        let _ = h.app.secureplan_driver(parse("apply view=layout:Sheet A1").unwrap());
+        assert!(h.app.secureplan.dialog.is_none(), "no dialog");
+        let (request, transfers) = h.receive("applyRequest");
+        assert_eq!(request["view"]["kind"], "layout");
+        assert_eq!(request["view"]["layoutName"], "Sheet A1");
+        assert!(request["view"]["viewportHandle"].as_str().is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())));
+        assert_eq!(request["view"].as_object().unwrap().len(), 3, "exactly kind, layoutName and viewportHandle");
+        let placement = &request["placement"];
+        assert_eq!((placement["widthPt"].as_u64(), placement["heightPt"].as_u64()), (Some(2384), Some(1684)), "the A1 sheet at its size");
+        // An empty survey: the sheet's top-left is at the origin.
+        let (width_mm, height_mm) = (placement["widthMm"].as_f64().unwrap(), placement["heightMm"].as_f64().unwrap());
+        assert!((placement["centerX"].as_f64().unwrap() - width_mm / 2.0).abs() < 1e-6);
+        assert!((placement["centerY"].as_f64().unwrap() - height_mm / 2.0).abs() < 1e-6);
+        let bytes_of = |key: &str| transfers[&request[key].as_u64().unwrap()].1.clone();
+        let snap = bytes_of("snapTransferId");
+        assert!(crate::app::secureplan::snap::tests::read(&snap, (2384, 1684)).is_ok_and(|g| !g.segments.is_empty()));
+        let pdf = lopdf::Document::load_mem(&bytes_of("pdfTransferId")).unwrap();
+        let media = crate::app::secureplan::publish::tests::page_dict(&pdf).get(b"MediaBox").unwrap().as_array().unwrap().len();
+        assert_eq!(media, 4);
+        assert_eq!(transfers[&request["drawing"]["transferId"].as_u64().unwrap()].1, testutil::synthetic_layout_dxf(), "unedited: the imported bytes");
     }
 
     #[test]
@@ -306,11 +358,25 @@ mod tests {
             Ok(Command::Align { units: Some(Units::Ft), scale: None, turns: 1, origin: None, anchor: Some([100.0, 200.0]) })
         );
         assert_eq!(parse("align scale=20"), Ok(Command::Align { units: None, scale: Some(20.0), turns: 0, origin: None, anchor: None }));
-        assert_eq!(parse("apply"), Ok(Command::Apply { window: None, publish_damaged: false }));
-        assert_eq!(parse("apply window=0,0,100,50"), Ok(Command::Apply { window: Some([0.0, 0.0, 100.0, 50.0]), publish_damaged: false }));
-        assert_eq!(parse("apply damaged=publish"), Ok(Command::Apply { window: None, publish_damaged: true }));
+        assert_eq!(parse("apply"), Ok(Command::Apply { window: None, publish_damaged: false, layout: None }));
+        assert_eq!(parse("apply window=0,0,100,50"), Ok(Command::Apply { window: Some([0.0, 0.0, 100.0, 50.0]), publish_damaged: false, layout: None }));
+        assert_eq!(parse("apply damaged=publish view=model"), Ok(Command::Apply { window: None, publish_damaged: true, layout: None }));
+        assert_eq!(
+            parse("apply damaged=publish view=layout:Sheet A1 – Ground floor"),
+            Ok(Command::Apply { window: None, publish_damaged: true, layout: Some("Sheet A1 – Ground floor".into()) })
+        );
         assert_eq!(parse("status"), Ok(Command::Status));
-        for bad in ["align", "align units=furlong", "align units=mm turns=4", "apply window=1,2,3", "import", "status now"] {
+        for bad in [
+            "align",
+            "align units=furlong",
+            "align units=mm turns=4",
+            "apply window=1,2,3",
+            "apply view=layout:",
+            "apply view=paper",
+            "apply window=0,0,1,1 view=layout:Sheet A1",
+            "import",
+            "status now",
+        ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert!(handle("align units=parsec").starts_with("invalid:"));

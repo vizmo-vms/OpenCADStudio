@@ -11,6 +11,11 @@
 //! The PDF writer emits page coordinates computed this way in f64 and rounded
 //! once to f32, so every drawn point lies within the float32 bound
 //! `r = ½·ulp32(max(W, H))·m` of its CAD source in world space.
+//!
+//! A paper layout (PUB-03) publishes its whole sheet: its reference viewport's
+//! model geometry goes through the same CAD → page transform, clipped to the
+//! viewport, and the rest of the sheet through the paper → world mapping of
+//! [`super::layout::LayoutReference`].
 
 use super::snap;
 
@@ -159,11 +164,27 @@ impl PageTransform {
 /// the SPSNAP file are both derived from this copy, so they agree with each
 /// other and never depend on the editor's zoom-level tessellation (CON-05).
 pub struct Publication {
+    /// The model-space view (for a paper layout: as its reference viewport
+    /// shows it, with the viewport's frozen layers frozen).
     pub scene: crate::scene::Scene,
     pub transform: PageTransform,
     /// The snap end points of each replaced curve (arc and chain ends), in
     /// its block's coordinates, by entity handle.
     key_points: rustc_hash::FxHashMap<u64, Vec<[f64; 3]>>,
+    /// Where on the page model geometry shows, `[x0, y0, x1, y1]` in points:
+    /// the whole page, or a paper layout's reference viewport.
+    pub clip: [f64; 4],
+    /// A paper layout: the rest of the sheet, drawn in paper coordinates.
+    pub sheet: Option<Sheet>,
+}
+
+/// The sheet of a published paper layout: its paper-space entities (the title
+/// block, viewport borders) and any other viewports, with the reference
+/// viewport's own content left to the model-space view.
+pub struct Sheet {
+    pub scene: crate::scene::Scene,
+    /// Paper coordinates → page points.
+    pub transform: PageTransform,
 }
 
 /// Walk the model-space entities drawn in `scene` — through block references
@@ -171,7 +192,15 @@ pub struct Publication {
 /// (off, frozen, invisible) — calling `leaf` for each drawn entity of a block
 /// reference or of model space itself. Content that belongs to dimensions,
 /// tables and leaders is skipped. `plot_only` also skips non-plotting layers.
-pub(crate) fn walk_model<F>(scene: &crate::scene::Scene, plot_only: bool, mut leaf: F)
+pub(crate) fn walk_model<F>(scene: &crate::scene::Scene, plot_only: bool, leaf: F)
+where
+    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+{
+    walk_block(scene, scene.current_layout_block_handle_pub(), plot_only, leaf);
+}
+
+/// [`walk_model`] for the entities of `block` (model or a paper space).
+fn walk_block<F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, plot_only: bool, mut leaf: F)
 where
     F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
 {
@@ -181,7 +210,7 @@ where
     let annotation = crate::scene::annotative::scale_handle_by_name(document, &document.header.current_annotation_scale);
     let graph = RenderSceneGraph::new(document, None, annotation, false, depths.as_ref())
         .with_annotation_scale(scene.annotation_scale);
-    let root = SceneRoot::Block(BlockRoot { record: scene.current_layout_block_handle_pub(), role: BlockRootRole::ModelSpace });
+    let root = SceneRoot::Block(BlockRoot { record: block, role: BlockRootRole::ModelSpace });
     graph.walk_root(
         root,
         |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context),
@@ -422,38 +451,100 @@ fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flatt
     Ok(Some((polyline, keys)))
 }
 
+/// Record, for every curve `block` draws, the finest local tolerance any of
+/// its instances needs: `tolerance` (in the block's space units) divided by
+/// the instance's largest stretch to the plan.
+fn curve_tolerances(scene: &crate::scene::Scene, block: acadrust::types::Handle, tolerance: f64, out: &mut rustc_hash::FxHashMap<u64, f64>) {
+    walk_block(scene, block, false, |entity, context| {
+        if needs_flattening(entity) {
+            let local = tolerance / plan_scale(&context.transform);
+            let slot = out.entry(entity.common().handle.value()).or_insert(local);
+            *slot = slot.min(local);
+        }
+    });
+}
+
+/// A copy of `source`'s drawing with each listed curve replaced by its
+/// polyline within its tolerance, and the replaced curves' snap end points.
+type FlatDocument = (acadrust::CadDocument, rustc_hash::FxHashMap<u64, Vec<[f64; 3]>>);
+
+fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMap<u64, f64>) -> Result<FlatDocument, String> {
+    use acadrust::EntityType;
+    let mut document = source.document.clone();
+    let mut key_points = rustc_hash::FxHashMap::default();
+    let mut handles: Vec<(u64, f64)> = tolerances.into_iter().collect();
+    handles.sort_by_key(|(handle, _)| *handle);
+    for (handle, tolerance) in handles {
+        let handle = acadrust::types::Handle::new(handle);
+        let Some(entity) = document.get_entity(handle) else { continue };
+        let Some((polyline, keys)) = flatten(entity, tolerance)? else { continue };
+        key_points.insert(handle.value(), keys);
+        document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::LwPolyline(polyline)));
+    }
+    Ok((document, key_points))
+}
+
+fn scene_of(document: acadrust::CadDocument, annotation_scale: f32, layout: Option<&str>) -> crate::scene::Scene {
+    let mut scene = crate::scene::Scene::new();
+    scene.document = document;
+    scene.annotation_scale = annotation_scale;
+    if let Some(layout) = layout {
+        scene.current_layout = layout.to_string();
+    }
+    scene.rebuild_derived_caches();
+    scene
+}
+
 /// Prepare the model-space view of `source` for publication.
 pub fn prepare_model(source: &crate::scene::Scene, transform: PageTransform) -> Result<Publication, String> {
-    use acadrust::EntityType;
     if source.current_layout != "Model" {
         return Err("The published view must be model space.".into());
     }
     let tolerance_cad = transform.placement.chord_tolerance_mm / transform.mapping.scale_mm_per_cad_unit;
-    // The finest tolerance each curve needs, over every instance that draws it.
-    let mut scales: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
-    walk_model(source, false, |entity, context| {
-        if needs_flattening(entity) {
-            let scale = plan_scale(&context.transform);
-            let slot = scales.entry(entity.common().handle.value()).or_insert(scale);
-            *slot = slot.max(scale);
-        }
-    });
-    let mut document = source.document.clone();
-    let mut key_points = rustc_hash::FxHashMap::default();
-    let mut handles: Vec<(u64, f64)> = scales.into_iter().collect();
-    handles.sort_by_key(|(handle, _)| *handle);
-    for (handle, scale) in handles {
-        let handle = acadrust::types::Handle::new(handle);
-        let Some(entity) = document.get_entity(handle) else { continue };
-        let Some((polyline, keys)) = flatten(entity, tolerance_cad / scale)? else { continue };
-        key_points.insert(handle.value(), keys);
-        document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::LwPolyline(polyline)));
+    let mut tolerances = rustc_hash::FxHashMap::default();
+    curve_tolerances(source, source.current_layout_block_handle_pub(), tolerance_cad, &mut tolerances);
+    let (document, key_points) = flatten_curves(source, tolerances)?;
+    let scene = scene_of(document, source.annotation_scale, None);
+    let clip = [0.0, 0.0, transform.placement.width_pt as f64, transform.placement.height_pt as f64];
+    Ok(Publication { scene, transform, key_points, clip, sheet: None })
+}
+
+/// Prepare a paper layout of `source` (a model-space scene) for publication
+/// through its reference viewport. `transform` is the model transform
+/// (CAD → page) of [`super::layout::LayoutReference::transforms`].
+pub fn prepare_layout(source: &crate::scene::Scene, reference: &super::layout::LayoutReference, transform: PageTransform) -> Result<Publication, String> {
+    if source.current_layout != "Model" {
+        return Err("The published layout must be read from model space.".into());
     }
-    let mut scene = crate::scene::Scene::new();
-    scene.document = document;
-    scene.annotation_scale = source.annotation_scale;
-    scene.rebuild_derived_caches();
-    Ok(Publication { scene, transform, key_points })
+    let paper = PageTransform { mapping: reference.paper_mapping(&transform.mapping), placement: transform.placement };
+    // Curves in model space and on the sheet, each within the chord
+    // tolerance in the world: a paper unit is `k` model units.
+    let tolerance_cad = transform.placement.chord_tolerance_mm / transform.mapping.scale_mm_per_cad_unit;
+    let mut tolerances = rustc_hash::FxHashMap::default();
+    curve_tolerances(source, source.current_layout_block_handle_pub(), tolerance_cad, &mut tolerances);
+    curve_tolerances(source, reference.paper_block, tolerance_cad / reference.model_per_paper, &mut tolerances);
+    let (document, key_points) = flatten_curves(source, tolerances)?;
+
+    // The model view as the viewport shows it: its frozen layers frozen.
+    let mut model = document.clone();
+    for layer in model.layers.iter_mut() {
+        if reference.frozen_layers.contains(&layer.handle) {
+            layer.flags.frozen = true;
+        }
+    }
+    let scene = scene_of(model, source.annotation_scale, None);
+
+    // The sheet, with the reference viewport's content left to the model view.
+    let mut sheet = document;
+    match sheet.get_entity_mut(reference.viewport) {
+        Some(acadrust::EntityType::Viewport(viewport)) => viewport.status.is_on = false,
+        _ => return Err("The layout's viewport is no longer in the drawing.".into()),
+    }
+    let sheet = scene_of(sheet, source.annotation_scale, Some(&reference.layout));
+    let page = [0.0, 0.0, transform.placement.width_pt as f64, transform.placement.height_pt as f64];
+    let [x0, y0, x1, y1] = reference.viewport_on_page(&paper);
+    let clip = [x0.max(page[0]), y0.max(page[1]), x1.min(page[2]), y1.min(page[3])];
+    Ok(Publication { scene, transform, key_points, clip, sheet: Some(Sheet { scene: sheet, transform: paper }) })
 }
 
 impl Publication {
@@ -471,10 +562,17 @@ pub struct PublishedPdf {
     pub omitted_images: usize,
 }
 
-/// The published model-space view as a one-page CON-01 PDF.
-pub fn model_pdf(publication: &Publication) -> Result<PublishedPdf, String> {
+/// One group of page content and the transform that places it.
+pub struct PageLayer {
+    pub content: crate::io::pdf_export::PlotContent,
+    pub transform: PageTransform,
+    /// Clip the group to this page rectangle `[x0, y0, x1, y1]` (points).
+    pub clip: Option<[f64; 4]>,
+}
+
+/// The model-space content of `scene` (what plots), as page content.
+fn model_content(scene: &crate::scene::Scene) -> (crate::io::pdf_export::PlotContent, usize) {
     use crate::io::pdf_export::{PlotContent, PlotGroupSplits, PlotWire};
-    let scene = &publication.scene;
     let (wires, _) = scene.plot_wire_groups(None);
     let wires: Vec<_> = wires.into_iter().filter(|wire| wire.plot_visible).collect();
     let depths = scene.plot_wire_depths(&wires);
@@ -489,7 +587,66 @@ pub fn model_pdf(publication: &Publication) -> Result<PublishedPdf, String> {
         wipeouts,
         images: Vec::new(),
     };
-    let bytes = crate::io::pdf_export::secureplan_page_pdf(content, publication.transform)?;
+    (content, omitted_images)
+}
+
+/// A layout sheet's content, as the upstream layout plot assembles it:
+/// paper-space entities (viewport borders as the plot settings say) and the
+/// content of its other viewports, and whether paper space plots last.
+fn sheet_content(scene: &crate::scene::Scene) -> (crate::io::pdf_export::PlotContent, crate::io::pdf_export::PlotContent, bool, usize) {
+    use crate::io::pdf_export::{PlotContent, PlotGroupSplits, PlotWire};
+    let settings = scene.effective_plot_settings();
+    let borders = settings.as_ref().is_none_or(|settings| settings.flags.plot_viewport_borders);
+    let paper_last = settings.as_ref().is_some_and(|settings| settings.flags.draw_viewports_first);
+    let (mut paper_wires, mut model_wires) = scene.plot_wire_groups(None);
+    paper_wires.retain(|wire| {
+        wire.plot_visible
+            && (borders
+                || !crate::scene::Scene::handle_from_wire_name(&wire.name).and_then(|handle| scene.document.get_entity(handle)).is_some_and(|entity| {
+                    matches!(entity, acadrust::EntityType::Viewport(viewport) if !crate::scene::Scene::is_sheet_viewport(&scene.document, viewport))
+                }))
+    });
+    model_wires.retain(|wire| wire.plot_visible);
+    let with_depth = |wires: Vec<crate::scene::WireModel>| {
+        let depths = scene.plot_wire_depths(&wires);
+        wires.into_iter().zip(depths).map(|(wire, draw_depth)| PlotWire { wire, draw_depth }).collect::<Vec<_>>()
+    };
+    let (mut pattern_wires, model_hatches, model_wipeouts, model_images) = scene.viewport_plot_fills();
+    pattern_wires.retain(|(wire, _)| wire.plot_visible);
+    let mut model = with_depth(model_wires);
+    model.extend(pattern_wires.into_iter().map(|(wire, draw_depth)| PlotWire { wire, draw_depth }));
+    let paper = with_depth(paper_wires);
+    let paper_hatches = scene.paper_plot_hatches().as_ref().clone();
+    let paper_wipeouts = scene.paper_plot_wipeouts().as_ref().clone();
+    let omitted_images = scene.paper_plot_images().len() + model_images.len();
+    let group = |wires: Vec<PlotWire>, hatches: Vec<crate::scene::model::hatch_model::HatchModel>, wipeouts: Vec<crate::scene::model::hatch_model::HatchModel>| PlotContent {
+        group_splits: PlotGroupSplits { wires: wires.len(), hatches: hatches.len(), wipeouts: wipeouts.len(), images: 0 },
+        wires: std::sync::Arc::new(wires),
+        hatches,
+        wipeouts,
+        images: Vec::new(),
+    };
+    (group(paper, paper_hatches, paper_wipeouts), group(model, model_hatches, model_wipeouts), paper_last, omitted_images)
+}
+
+/// The published view as a one-page CON-01 PDF: model space, or a paper
+/// layout's whole sheet with its reference viewport drawn from model space.
+pub fn page_pdf(publication: &Publication) -> Result<PublishedPdf, String> {
+    let (model, mut omitted_images) = model_content(&publication.scene);
+    let layers = match &publication.sheet {
+        None => vec![PageLayer { content: model, transform: publication.transform, clip: None }],
+        Some(sheet) => {
+            let (paper, others, paper_last, omitted) = sheet_content(&sheet.scene);
+            omitted_images += omitted;
+            let reference = PageLayer { content: model, transform: publication.transform, clip: Some(publication.clip) };
+            let paper = PageLayer { content: paper, transform: sheet.transform, clip: None };
+            let others = PageLayer { content: others, transform: sheet.transform, clip: None };
+            // The layout's own order: viewports over paper space, unless its
+            // plot settings draw paper space last.
+            if paper_last { vec![reference, others, paper] } else { vec![paper, reference, others] }
+        }
+    };
+    let bytes = crate::io::pdf_export::secureplan_page_pdf(layers)?;
     Ok(PublishedPdf { bytes, omitted_images })
 }
 
@@ -539,8 +696,8 @@ pub(crate) fn finish_pdf(mut doc: lopdf::Document, width_pt: u32, height_pt: u32
     save(&mut doc)
 }
 
-/// The SPSNAP file for the published model-space view (CON-05).
-pub fn model_snap(publication: &Publication) -> Vec<u8> {
+/// The SPSNAP file for the published view (CON-05).
+pub fn page_snap(publication: &Publication) -> Vec<u8> {
     let geometry = snap::extract(publication);
     snap::write(&geometry, publication.transform.placement.width_pt, publication.transform.placement.height_pt)
 }
@@ -614,19 +771,45 @@ pub fn choose_mm_per_pt(window_cad: [f64; 4], mapping: &Mapping) -> Result<f64, 
     Err(PlacementError::InvalidScale)
 }
 
+/// The published view the user picked (PUB-03).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PublishedView {
+    /// A model-space window `[x0, y0, x1, y1]` in CAD coordinates.
+    Model { window_cad: [f64; 4] },
+    /// A paper layout's whole sheet, through its reference viewport.
+    Layout(Box<super::layout::LayoutReference>),
+}
+
+impl PublishedView {
+    /// The `view` of CON-02.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            PublishedView::Model { window_cad } => serde_json::json!({ "kind": "model", "windowCad": window_cad }),
+            PublishedView::Layout(reference) => reference.view_json(),
+        }
+    }
+}
+
 /// What Apply publishes and how it maps: chosen in the Apply dialog.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApplyPlan {
-    pub window_cad: [f64; 4],
+    pub view: PublishedView,
     pub mapping: Mapping,
+    /// For a paper layout, the sheet's own scale ([`super::layout::LayoutReference::mm_per_pt`]).
     pub mm_per_pt: f64,
     /// The user ticked "Publish without N damaged items" for this Apply.
     pub damaged_acknowledged: bool,
 }
 
 impl ApplyPlan {
+    /// CAD model coordinates → page points.
     pub fn transform(&self) -> Result<PageTransform, PlacementError> {
-        Ok(PageTransform { mapping: self.mapping, placement: place_page(self.window_cad, &self.mapping, self.mm_per_pt)? })
+        match &self.view {
+            PublishedView::Model { window_cad } => {
+                Ok(PageTransform { mapping: self.mapping, placement: place_page(*window_cad, &self.mapping, self.mm_per_pt)? })
+            }
+            PublishedView::Layout(reference) => Ok(reference.transforms(&self.mapping)?.0),
+        }
     }
 }
 
@@ -726,9 +909,13 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
     scene.document = snapshot.document.clone();
     scene.annotation_scale = snapshot.annotation_scale;
     scene.rebuild_derived_caches();
-    let publication = prepare_model(&scene, transform).map_err(|message| ApplyError::new(ErrorCode::Internal, message))?;
-    let pdf = model_pdf(&publication).map_err(|_| ApplyError::new(ErrorCode::WriterError, "The published PDF could not be written."))?;
-    let snap = model_snap(&publication);
+    let publication = match &plan.view {
+        PublishedView::Model { .. } => prepare_model(&scene, transform),
+        PublishedView::Layout(reference) => prepare_layout(&scene, reference, transform),
+    }
+    .map_err(|message| ApplyError::new(ErrorCode::Internal, message))?;
+    let pdf = page_pdf(&publication).map_err(|_| ApplyError::new(ErrorCode::WriterError, "The published PDF could not be written."))?;
+    let snap = page_snap(&publication);
 
     let outputs = ApplyOutputs { drawing, written, original: snapshot.pending_original.clone(), pdf: pdf.bytes, snap, transform, omitted_images: pdf.omitted_images };
     let sizes = [
@@ -930,17 +1117,17 @@ pub(crate) mod tests {
 
     pub(crate) fn publish(scene: &crate::scene::Scene, transform: PageTransform) -> (PublishedPdf, Publication) {
         let publication = prepare_model(scene, transform).unwrap();
-        (model_pdf(&publication).unwrap(), publication)
+        (page_pdf(&publication).unwrap(), publication)
     }
 
-    fn page_dict(doc: &lopdf::Document) -> lopdf::Dictionary {
+    pub(crate) fn page_dict(doc: &lopdf::Document) -> lopdf::Dictionary {
         let pages = doc.get_pages();
         assert_eq!(pages.len(), 1);
         doc.get_object(*pages.values().next().unwrap()).unwrap().as_dict().unwrap().clone()
     }
 
     /// Every operation of the page content.
-    fn operations(bytes: &[u8]) -> Vec<lopdf::content::Operation> {
+    pub(crate) fn operations(bytes: &[u8]) -> Vec<lopdf::content::Operation> {
         let doc = lopdf::Document::load_mem(bytes).unwrap();
         let page = *doc.get_pages().values().next().unwrap();
         lopdf::content::Content::decode(&doc.get_page_content(page).unwrap()).unwrap().operations

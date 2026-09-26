@@ -13,7 +13,9 @@
 //! curve's own plane — inside block references too, walked with the renderer's transforms and
 //! visibility rules (invisible, off, frozen and non-plotting layers). Excluded:
 //! text, mtext, dimensions, tables, leaders, hatches, images and paper
-//! space. Everything is clipped to the page.
+//! space. Everything is clipped to the page; on a paper layout, to its
+//! reference viewport (`Publication::clip`), so only model geometry the
+//! viewport shows contributes, and paper-space entities never do.
 
 use std::io::Write;
 
@@ -37,8 +39,8 @@ pub struct SnapGeometry {
 
 struct Collector<'a> {
     page: &'a PageTransform,
-    width: f64,
-    height: f64,
+    /// `[x0, y0, x1, y1]` in page points.
+    clip: [f64; 4],
     out: SnapGeometry,
 }
 
@@ -50,16 +52,18 @@ impl Collector<'_> {
 
     fn point(&mut self, transform: &Transform, p: [f64; 3]) {
         let (px, py) = self.to_page(transform, p);
-        if (0.0..=self.width).contains(&px) && (0.0..=self.height).contains(&py) {
+        let [x0, y0, x1, y1] = self.clip;
+        if (x0..=x1).contains(&px) && (y0..=y1).contains(&py) {
             self.out.points.push([px as f32, py as f32]);
         }
     }
 
-    /// Add a segment in page points, clipped to the page (Liang–Barsky).
+    /// Add a segment in page points, clipped to the clip rectangle (Liang–Barsky).
     fn page_segment(&mut self, (x0, y0): (f64, f64), (x1, y1): (f64, f64)) {
         let (dx, dy) = (x1 - x0, y1 - y0);
         let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
-        for (p, q) in [(-dx, x0), (dx, self.width - x0), (-dy, y0), (dy, self.height - y0)] {
+        let [cx0, cy0, cx1, cy1] = self.clip;
+        for (p, q) in [(-dx, x0 - cx0), (dx, cx1 - x0), (-dy, y0 - cy0), (dy, cy1 - y0)] {
             if p == 0.0 {
                 if q < 0.0 {
                     return;
@@ -138,12 +142,7 @@ impl Collector<'_> {
 /// Snap geometry for a prepared publication.
 pub fn extract(publication: &Publication) -> SnapGeometry {
     let page = &publication.transform;
-    let mut collector = Collector {
-        page,
-        width: page.placement.width_pt as f64,
-        height: page.placement.height_pt as f64,
-        out: SnapGeometry::default(),
-    };
+    let mut collector = Collector { page, clip: publication.clip, out: SnapGeometry::default() };
     super::publish::walk_model(&publication.scene, true, |entity, context| {
         collector.entity(publication, entity, &context.transform);
     });
@@ -279,8 +278,8 @@ pub(crate) mod tests {
         let scene = synthetic_dxf_scene();
         let transform = empty_survey_transform();
         let publication = crate::app::secureplan::publish::prepare_model(&scene, transform).unwrap();
-        let bytes = crate::app::secureplan::publish::model_snap(&publication);
-        assert_eq!(bytes, crate::app::secureplan::publish::model_snap(&publication), "deterministic");
+        let bytes = crate::app::secureplan::publish::page_snap(&publication);
+        assert_eq!(bytes, crate::app::secureplan::publish::page_snap(&publication), "deterministic");
         assert_eq!(&bytes[36 + 4..36 + 8], &[0, 0, 0, 0], "gzip MTIME is 0");
         let geometry = read(&bytes, (10_000, 6_000)).expect("the reader accepts the writer's output");
         let at = |x: f64, y: f64| transform.apply(x, y);
