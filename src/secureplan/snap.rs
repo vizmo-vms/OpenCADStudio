@@ -1,7 +1,7 @@
 //! SPSNAP v1 (CON-05): the binary snap sidecar for a published page.
 //!
 //! Layout (little-endian): magic `SPSNAP01`, `u32 version = 1`, `u32 flags`
-//! (bit 0: the body is gzip, written with MTIME 0), `u32 pageWidthPt`,
+//! (bit 0: the body is exactly one gzip member, written with MTIME 0), `u32 pageWidthPt`,
 //! `u32 pageHeightPt`, `u32 pointCount`, `u32 segmentCount`,
 //! `u32 uncompressedBodyBytes`; then `f32[2·pointCount]` endpoints and vertices
 //! and `f32[4·segmentCount]` segments, in CON-01 page points.
@@ -210,11 +210,17 @@ pub(crate) mod tests {
             return Err("counts");
         }
         let body = if flags & FLAG_GZIP != 0 {
+            // Exactly one gzip member: a second member or any trailing byte
+            // left after the member's trailer is a `counts` rejection.
             let mut body = Vec::new();
-            flate2::read::GzDecoder::new(&bytes[HEADER_LEN..])
+            let mut decoder = flate2::bufread::GzDecoder::new(&bytes[HEADER_LEN..]);
+            (&mut decoder)
                 .take(MAX_BODY_BYTES + 1)
                 .read_to_end(&mut body)
                 .map_err(|_| "counts")?;
+            if !decoder.into_inner().is_empty() {
+                return Err("counts");
+            }
             body
         } else {
             bytes[HEADER_LEN..].to_vec()

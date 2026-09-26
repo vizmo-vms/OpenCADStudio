@@ -505,7 +505,7 @@ fn save(doc: &mut lopdf::Document) -> Result<Vec<u8>, String> {
 }
 
 /// Finish the SecurePlan page: MediaBox exactly `[0 0 W H]`, `/Rotate 0`, no
-/// CropBox or TrimBox, no dates or other varying metadata, compressed
+/// CropBox, TrimBox or UserUnit (CON-01: one unit is one point), no dates or other varying metadata, compressed
 /// streams, and a document ID derived from the content.
 pub(crate) fn finish_pdf(mut doc: lopdf::Document, width_pt: u32, height_pt: u32) -> Result<Vec<u8>, String> {
     use lopdf::{Object, StringFormat};
@@ -519,6 +519,7 @@ pub(crate) fn finish_pdf(mut doc: lopdf::Document, width_pt: u32, height_pt: u32
         page.set("Rotate", 0);
         page.remove(b"CropBox");
         page.remove(b"TrimBox");
+        page.remove(b"UserUnit");
         page.remove(b"Annots");
     }
     // The information dictionary and XMP metadata carry dates and a random
@@ -733,6 +734,7 @@ pub(crate) mod tests {
         assert_eq!(media, vec![0, 0, 10000, 6000]);
         assert_eq!(page.get(b"Rotate").unwrap().as_i64().unwrap(), 0);
         assert!(page.get(b"CropBox").is_err() && page.get(b"TrimBox").is_err());
+        assert!(page.get(b"UserUnit").is_err(), "no /UserUnit: one unit is one point (CON-01)");
         assert!(doc.trailer.get(b"Info").is_err(), "no information dictionary (dates)");
         let text = String::from_utf8_lossy(&first.bytes);
         assert!(!text.contains("CreationDate") && !text.contains("ModDate") && !text.contains("PLOT"));
