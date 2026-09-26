@@ -1,0 +1,13 @@
+# SecurePlan CAD development registration (Linux): handles secureplan-cad:
+# links for the current user. Linux builds are for development and automated
+# smoke tests only. Install with:
+#   sed "s|@EXECUTABLE@|$PWD/target/debug/OpenCADStudio|" packaging/dev/secureplan-cad.desktop \
+#     > ~/.local/share/applications/secureplan-cad-dev.desktop
+#   xdg-mime default secureplan-cad-dev.desktop x-scheme-handler/secureplan-cad
+[Desktop Entry]
+Type=Application
+Name=SecurePlan CAD (development)
+Exec="@EXECUTABLE@" %u
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/secureplan-cad;

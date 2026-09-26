@@ -29,6 +29,57 @@ fn main() -> iced::Result {
         use clap::Parser;
         let args = cli::Cli::parse();
 
+        // SecurePlan CAD runs no automation listener and loads no plugins
+        // (DSK-02): refuse those modes before anything else starts.
+        #[cfg(feature = "secureplan")]
+        {
+            use OpenCADStudio::app::secureplan::hardening;
+            if let Some(refusal) = hardening::headless_automation_refusal(args.mcp, args.serve) {
+                eprintln!("{refusal}");
+                std::process::exit(2);
+            }
+            if args.ocs_plugin_runner.is_some() {
+                eprintln!("{}", hardening::DISABLED);
+                std::process::exit(2);
+            }
+        }
+        // Test builds only: stdin pairing injection for the smoke tests.
+        #[cfg(feature = "secureplan-test")]
+        OpenCADStudio::app::secureplan::testdriver::start();
+        // A `secureplan-cad:` launch URL (Windows and Linux pass it as an
+        // argument) is used by this process only: it is never opened as a
+        // file or forwarded as an argument (DSK-04).
+        #[cfg(feature = "secureplan")]
+        let (args, launch_urls) = {
+            let mut args = args;
+            let (urls, files) = OpenCADStudio::app::secureplan::handoff::split_launch_args(std::mem::take(&mut args.files));
+            args.files = files;
+            (args, urls)
+        };
+        // Launch URLs reach a running copy over the authenticated per-user
+        // channel only; when none answers, this instance serves them. (The
+        // unauthenticated single-instance hand-off is off in SecurePlan CAD.)
+        #[cfg(feature = "secureplan")]
+        let launch_urls = if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
+            if args.files.is_empty() {
+                return Ok(());
+            }
+            Vec::new()
+        } else {
+            launch_urls
+        };
+        // Started by links alone: a link no website may use opens nothing;
+        // otherwise the editor stays hidden until a session opens (DSK-04).
+        #[cfg(feature = "secureplan")]
+        if !launch_urls.is_empty()
+            && args.files.is_empty()
+            && !args.new
+            && args.script.is_none()
+            && !OpenCADStudio::app::secureplan::begin_cold_start(&launch_urls)
+        {
+            return Ok(());
+        }
+
         // GPU probe child: exercise one backend offscreen, print one JSON
         // line on success and exit 0/1. This must run before any logging/GUI
         // setup; the parent interprets any non-zero exit (including a driver
@@ -135,6 +186,10 @@ fn main() -> iced::Result {
             }
         }
 
+        // This instance receives later launches, and uses its own once.
+        #[cfg(feature = "secureplan")]
+        OpenCADStudio::app::secureplan::handoff::start_primary(launch_urls);
+
         // GUI: stash the startup config for `app::boot` to pick up.
         let script_lines = args
             .script
@@ -149,7 +204,8 @@ fn main() -> iced::Result {
                     .map(str::to_string)
                     .collect(),
                 Err(e) => {
-                    eprintln!("--script: cannot read {}: {e}", p.display());
+                    // SecurePlan CAD never writes file paths to its output.
+                    eprintln!("--script: cannot read {}: {e}", io::diagnostic_path(p));
                     Vec::new()
                 }
             })

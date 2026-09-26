@@ -39,6 +39,26 @@ pub(crate) fn tooltip_style(theme: &Theme) -> container::Style {
     widgets::tip_style(theme)
 }
 
+/// Append the SecurePlan ribbon tab in SecurePlan builds; identity otherwise.
+fn with_secureplan_tab(
+    #[allow(unused_mut)] mut modules: Vec<Box<dyn CadModule>>,
+) -> Vec<Box<dyn CadModule>> {
+    #[cfg(feature = "secureplan")]
+    modules.push(Box::new(crate::app::secureplan::ribbon::SecurePlanModule));
+    modules
+}
+
+#[cfg(all(test, feature = "secureplan"))]
+mod secureplan_tests {
+    #[test]
+    fn ribbon_has_the_secureplan_tab() {
+        let mut ribbon = super::Ribbon::new();
+        assert!(ribbon.modules.iter().any(|m| m.id() == "secureplan"));
+        ribbon.set_modules(Vec::new());
+        assert!(ribbon.modules.iter().any(|m| m.id() == "secureplan"));
+    }
+}
+
 // ── Ribbon state ───────────────────────────────────────────────────────────
 
 pub struct Ribbon {
@@ -153,7 +173,7 @@ fn position_ribbon_dropdown<'a>(
 impl Ribbon {
     pub fn new() -> Self {
         Self {
-            modules: all_ribbon_modules(),
+            modules: with_secureplan_tab(all_ribbon_modules()),
             active: 0,
             active_tool: None,
             wireframe: false,
@@ -277,7 +297,7 @@ impl Ribbon {
     /// Replace the tab list (e.g. after a plugin is enabled/disabled in the
     /// Plugin Manager). Clamps the active tab so it stays in range.
     pub fn set_modules(&mut self, modules: Vec<Box<dyn CadModule>>) {
-        self.modules = modules;
+        self.modules = with_secureplan_tab(modules);
         if self.active >= self.modules.len() {
             self.active = self.modules.len().saturating_sub(1);
         }

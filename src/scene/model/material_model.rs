@@ -551,7 +551,10 @@ fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<Mate
             }
         }
     }
-    let path = candidates.into_iter().find(|path| path.is_file())?;
+    let path = candidates
+        .into_iter()
+        .filter(|path| crate::io::path_is_local(path))
+        .find(|path| path.is_file())?;
     let path = path.canonicalize().unwrap_or(path);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache.lock().ok()?.get(&path).cloned() {

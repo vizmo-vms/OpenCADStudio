@@ -85,6 +85,29 @@ fn deliver_or_launch(files: &[String]) {
     reassert_accessory_policy();
 }
 
+/// SecurePlan CAD: hand `secureplan-cad:` launch URLs to the running editor
+/// over the per-user channel, never as a process argument (DSK-04). With no
+/// editor running, start one without arguments and hand the URLs over once it
+/// is listening.
+#[cfg(all(target_os = "macos", feature = "secureplan"))]
+fn deliver_launches(urls: Vec<String>) {
+    use OpenCADStudio::app::secureplan::handoff;
+    std::thread::spawn(move || {
+        let Some(path) = handoff::descriptor_path() else { return };
+        let mut pending = urls;
+        pending.retain(|url| handoff::send_launch(&path, url).is_err());
+        if pending.is_empty() {
+            return;
+        }
+        deliver_or_launch(&[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !pending.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            pending.retain(|url| handoff::send_launch(&path, url).is_err());
+        }
+    });
+}
+
 /// Keep the windowless relay out of the Dock after an open event activates it.
 #[cfg(target_os = "macos")]
 fn reassert_accessory_policy() {
@@ -122,11 +145,31 @@ declare_class!(
         #[method(application:openURLs:)]
         fn open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
             DOCS_HANDLED.store(true, Ordering::SeqCst);
+            #[cfg(feature = "secureplan")]
+            let (launches, urls): (Vec<String>, Vec<_>) = {
+                use OpenCADStudio::app::secureplan::handoff::is_launch_url;
+                let mut launches = Vec::new();
+                let mut others = Vec::new();
+                for url in urls.iter() {
+                    match unsafe { url.absoluteString() }.map(|text| text.to_string()) {
+                        Some(text) if is_launch_url(&text) => launches.push(text),
+                        _ => others.push(url),
+                    }
+                }
+                (launches, others)
+            };
             let files: Vec<String> = urls
                 .iter()
                 .filter_map(|url| unsafe { url.path() })
                 .map(|path| path.to_string())
                 .collect();
+            #[cfg(feature = "secureplan")]
+            if !launches.is_empty() {
+                deliver_launches(launches);
+                if files.is_empty() {
+                    return;
+                }
+            }
             deliver_or_launch(&files);
         }
 

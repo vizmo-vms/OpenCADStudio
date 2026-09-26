@@ -13,6 +13,15 @@ members = [
     "crates/dwg-thumbnailer-win",
 ]
 
+[features]
+default = []
+# SecurePlan CAD: the SecurePlan companion build (hardening, loopback bridge,
+# SecurePlan-bound documents). Everything lives in src/secureplan/.
+secureplan = ["dep:aes-gcm", "dep:hkdf", "dep:hmac", "dep:lopdf", "dep:regex", "dep:sha2_011", "dep:tungstenite"]
+# Test-only hooks for the SecurePlan build (stdin pairing driver). Never
+# enabled by a release workflow; secureplan-ci.yml checks that.
+secureplan-test = ["secureplan"]
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
@@ -56,6 +65,18 @@ cosmic-text = "0.15"
 unicode-bidi = "0.3"
 lyon_tessellation = "1.0.20"
 pollster = "0.4"
+# SecurePlan bridge crypto and loopback WebSocket (feature `secureplan` only).
+# Pinned exactly and reviewed like any dependency; see src/secureplan/channel.rs.
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"], optional = true }
+hkdf = { version = "=0.13.0", optional = true }
+hmac = { version = "=0.13.0", optional = true }
+# Already in the dependency tree through printpdf (same version and features);
+# used to finish the published PDF (CON-01).
+lopdf = { version = "=0.39.0", default-features = false, features = ["time"], optional = true }
+# Already in the dependency tree; applies the protocol schemas' patterns.
+regex = { version = "=1.13.1", optional = true }
+sha2_011 = { package = "sha2", version = "=0.11.0", optional = true }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
 
 [dev-dependencies]
 fluent-syntax = "0.12"

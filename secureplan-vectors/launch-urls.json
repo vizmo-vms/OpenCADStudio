@@ -1,0 +1,190 @@
+{
+  "description": "BRG-01 launch URLs. Parameters appear exactly once, in any order; unknown parameters, fragments and other schemes are rejected. Values are percent-decoded before validation.",
+  "tokenTtlMs": 120000,
+  "valid": [
+    {
+      "name": "edit",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit",
+      "expect": {
+        "v": 1,
+        "origin": "https://secureplan.example",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "token": "EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw",
+        "survey": "7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f",
+        "intent": "edit"
+      }
+    },
+    {
+      "name": "view-reordered",
+      "url": "secureplan-cad://pair?intent=view&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&pairing=ijqBt8qFbTsKlBqG25qawQ&origin=https%3A%2F%2Fsecureplan.example&v=1",
+      "expect": {
+        "v": 1,
+        "origin": "https://secureplan.example",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "token": "EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw",
+        "survey": "7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f",
+        "intent": "view"
+      }
+    },
+    {
+      "name": "developer-origin",
+      "url": "secureplan-cad://pair?v=1&origin=http%3A%2F%2F127.0.0.1%3A8787&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit",
+      "expect": {
+        "v": 1,
+        "origin": "http://127.0.0.1:8787",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "token": "EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw",
+        "survey": "7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f",
+        "intent": "edit"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "wrong-scheme",
+      "url": "opencad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "wrong-action",
+      "url": "secureplan-cad://open?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "version-2",
+      "url": "secureplan-cad://pair?v=2&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "missing-token",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "duplicate-pairing",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit&pairing=ijqBt8qFbTsKlBqG25qawQ"
+    },
+    {
+      "name": "unknown-parameter-name",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit&name=Synthetic%20survey"
+    },
+    {
+      "name": "short-token",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSQ&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "short-pairing",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qa&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "survey-not-uuid",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=survey-1&intent=edit"
+    },
+    {
+      "name": "intent-unknown",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=admin"
+    },
+    {
+      "name": "origin-with-path",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example%2Fapp&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit"
+    },
+    {
+      "name": "fragment",
+      "url": "secureplan-cad://pair?v=1&origin=https%3A%2F%2Fsecureplan.example&pairing=ijqBt8qFbTsKlBqG25qawQ&token=EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw&survey=7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f&intent=edit#x"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://secureplan.example",
+      "serialized": true,
+      "eligibleDefault": true,
+      "eligibleDeveloper": true
+    },
+    {
+      "origin": "https://secureplan.example:8443",
+      "serialized": true,
+      "eligibleDefault": true,
+      "eligibleDeveloper": true
+    },
+    {
+      "origin": "https://192.168.10.20",
+      "serialized": true,
+      "eligibleDefault": true,
+      "eligibleDeveloper": true
+    },
+    {
+      "origin": "http://secureplan.example",
+      "serialized": true,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "http://localhost:5174",
+      "serialized": true,
+      "eligibleDefault": false,
+      "eligibleDeveloper": true
+    },
+    {
+      "origin": "http://127.0.0.1:8787",
+      "serialized": true,
+      "eligibleDefault": false,
+      "eligibleDeveloper": true
+    },
+    {
+      "origin": "http://localhost",
+      "serialized": true,
+      "eligibleDefault": false,
+      "eligibleDeveloper": true
+    },
+    {
+      "origin": "http://[::1]:5174",
+      "serialized": true,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "http://127.0.0.2:8787",
+      "serialized": true,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "https://secureplan.example/",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "https://secureplan.example/app",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "https://SecurePlan.example",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "https://user@secureplan.example",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "https://secureplan.example:443",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "wss://secureplan.example",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    },
+    {
+      "origin": "null",
+      "serialized": false,
+      "eligibleDefault": false,
+      "eligibleDeveloper": false
+    }
+  ]
+}

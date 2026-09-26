@@ -80,6 +80,100 @@ const LW_PX_TO_PT: f32 = MM_TO_PT / (96.0 / 25.4);
 #[cfg(not(target_arch = "wasm32"))]
 const SCREEN_DOT_MM: f32 = 25.4 / 96.0;
 
+/// A sheet position as a PDF point. Sheets are in mm, except while
+/// [`secureplan_page_pdf`] writes a SecurePlan page: then drawing coordinates
+/// go straight to whole-point page space through its transform, rounded to
+/// f32 exactly once (CON-01, CON-05).
+#[cfg(not(target_arch = "wasm32"))]
+fn sheet_point(x: f64, y: f64) -> Point {
+    #[cfg(feature = "secureplan")]
+    if let Some(transform) = SECUREPLAN_PAGE.with(std::cell::Cell::get) {
+        let (px, py) = transform.apply(x, y);
+        return Point { x: Pt(px as f32), y: Pt(py as f32) };
+    }
+    Point::new(Mm(x as f32), Mm(y as f32))
+}
+
+/// Points per drawing unit for lengths measured in the drawing (wide-polyline
+/// widths, linetype dashes, stroke-font pens): 1 mm per unit on a sheet, and
+/// the publication scale on a SecurePlan page. Physical pen widths do not use it.
+#[cfg(not(target_arch = "wasm32"))]
+fn drawing_unit_pt() -> f32 {
+    #[cfg(feature = "secureplan")]
+    if let Some(transform) = SECUREPLAN_PAGE.with(std::cell::Cell::get) {
+        return transform.points_per_cad_unit() as f32;
+    }
+    MM_TO_PT
+}
+
+#[cfg(all(feature = "secureplan", not(target_arch = "wasm32")))]
+thread_local! {
+    static SECUREPLAN_PAGE: std::cell::Cell<Option<crate::app::secureplan::publish::PageTransform>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Write one SecurePlan page (CON-01): drawing coordinates are mapped by
+/// `transform` to a `W`×`H`-point page, with no plot stamp, clipped to the
+/// page, and finished deterministically by the SecurePlan publisher.
+#[cfg(all(feature = "secureplan", not(target_arch = "wasm32")))]
+pub fn secureplan_page_pdf(
+    content: PlotContent,
+    transform: crate::app::secureplan::publish::PageTransform,
+) -> Result<Vec<u8>, String> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SECUREPLAN_PAGE.with(|page| page.set(None));
+        }
+    }
+    let (width_pt, height_pt) = (transform.placement.width_pt, transform.placement.height_pt);
+    let page = PdfPageInput {
+        content,
+        paper_w: width_pt as f64 / 2.834646,
+        paper_h: height_pt as f64 / 2.834646,
+        offset_x: 0.0,
+        offset_y: 0.0,
+        rotation_deg: 0,
+        scale: 1.0,
+        clip: None,
+        options: PdfPlotOptions { stamp: false, ..PdfPlotOptions::default() },
+        plot_style: None,
+    };
+    let mut doc = PdfDocument::new("SecurePlan plan");
+    let mut image_resources = std::collections::HashMap::new();
+    {
+        let _reset = Reset;
+        SECUREPLAN_PAGE.with(|slot| slot.set(Some(transform)));
+        append_pdf_page(&mut doc, &mut image_resources, &page, None)?;
+    }
+    let pdf_page = doc.pages.last_mut().ok_or("No page was written.")?;
+    let bounds = printpdf::Rect::from_wh(Pt(width_pt as f32), Pt(height_pt as f32));
+    pdf_page.media_box = bounds.clone();
+    pdf_page.trim_box = bounds.clone();
+    pdf_page.crop_box = bounds;
+    // Nothing outside the published window is visible on the page.
+    let (w, h) = (width_pt as f32, height_pt as f32);
+    let corner = |x: f32, y: f32| LinePoint { p: Point { x: Pt(x), y: Pt(y) }, bezier: false };
+    pdf_page.ops.splice(
+        0..0,
+        [
+            Op::SaveGraphicsState,
+            Op::DrawPolygon {
+                polygon: Polygon {
+                    rings: vec![PolygonRing { points: vec![corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)] }],
+                    mode: PaintMode::Clip,
+                    winding_order: WindingOrder::NonZero,
+                },
+            },
+        ],
+    );
+    pdf_page.ops.push(Op::RestoreGraphicsState);
+    let options = PdfSaveOptions { optimize: true, subset_fonts: true, secure: true, image_optimization: None };
+    let mut warnings = Vec::new();
+    let lopdf_doc = doc.to_lopdf_document(&options, &mut warnings);
+    crate::app::secureplan::publish::finish_pdf(lopdf_doc, width_pt, height_pt)
+}
+
 /// Output controls shared by preview, PDF export, and printer rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PdfPlotOptions {
@@ -763,7 +857,7 @@ fn append_pdf_page(
             scale.max(1e-6)
         };
         let lw_pt = if wire.world_width > 0.0 {
-            wire.world_width * MM_TO_PT
+            wire.world_width * drawing_unit_pt()
         } else {
             let physical = if options.object_lineweights {
                 lw_override.unwrap_or_else(|| (wire.line_weight_px * LW_PX_TO_PT).max(0.1))
@@ -779,7 +873,7 @@ fn append_pdf_page(
 
         // Linetype dash pattern. Without this every wire exported as a solid
         // line regardless of its linetype (dashed / centre / dash-dot). (#155)
-        let dash_arr = dash_array_from_pattern(wire.pattern_length, &wire.pattern, MM_TO_PT);
+        let dash_arr = dash_array_from_pattern(wire.pattern_length, &wire.pattern, drawing_unit_pt());
         let stationed =
             !dash_arr.is_empty() && wire.pattern_stations.len() > wire.points.len();
         if stationed {
@@ -805,9 +899,9 @@ fn append_pdf_page(
                 ) {
                     let point = |t: f32| {
                         LinePoint {
-                            p: Point::new(
-                                Mm((start.x + (end.x - start.x) * t as f64 + ox) as f32),
-                                Mm((start.y + (end.y - start.y) * t as f64 + oy) as f32),
+                            p: sheet_point(
+                                start.x + (end.x - start.x) * t as f64 + ox,
+                                start.y + (end.y - start.y) * t as f64 + oy,
                             ),
                             bezier: false,
                         }
@@ -843,10 +937,8 @@ fn append_pdf_page(
                 segment.clear();
             } else {
                 let point = wire.point_world(pi, paper_h as f64 / scale.max(1e-6) as f64);
-                let wx = (point.x + ox) as f32;
-                let wy = (point.y + oy) as f32;
                 segment.push(LinePoint {
-                    p: Point::new(Mm(wx), Mm(wy)),
+                    p: sheet_point(point.x + ox, point.y + oy),
                     bezier: false,
                 });
             }
@@ -906,7 +998,7 @@ fn visible_station_ranges(
     if count == 0 || pattern_length <= 1e-6 {
         return vec![[0.0, 1.0]];
     }
-    let dot = 1.0 / MM_TO_PT;
+    let dot = 1.0 / drawing_unit_pt();
     let mut elements: Vec<(f32, bool)> = pattern[..count]
         .iter()
         .map(|value| (if *value == 0.0 { dot } else { value.abs() }, *value >= 0.0))
@@ -1144,10 +1236,7 @@ fn emit_wire_fills(
                 let index = triangle_index * 3 + point_index;
                 let low = wire.fill_tris_low.get(index).copied().unwrap_or([0.0; 3]);
                 points.push(LinePoint {
-                    p: Point::new(
-                        Mm((x as f64 + low[0] as f64 + ox) as f32),
-                        Mm((y as f64 + low[1] as f64 + oy) as f32),
-                    ),
+                    p: sheet_point(x as f64 + low[0] as f64 + ox, y as f64 + low[1] as f64 + oy),
                     bezier: false,
                 });
             }
@@ -1307,10 +1396,8 @@ fn emit_hatch(
             }
             continue;
         }
-        let px = (bx as f64 + world_ox + ox) as f32;
-        let py = (by as f64 + world_oy + oy) as f32;
         current.push(LinePoint {
-            p: Point::new(Mm(px), Mm(py)),
+            p: sheet_point(bx as f64 + world_ox + ox, by as f64 + world_oy + oy),
             bezier: false,
         });
     }
@@ -1390,15 +1477,13 @@ fn emit_hatch(
         for [a, b_pt] in segments {
             // `pattern_segments` returns absolute world f64; cancel the offset
             // before narrowing, as everywhere else in this file.
-            let (ax, ay) = ((a[0] + ox) as f32, (a[1] + oy) as f32);
-            let (bx, by) = ((b_pt[0] + ox) as f32, (b_pt[1] + oy) as f32);
             let points = vec![
                 LinePoint {
-                    p: Point::new(Mm(ax), Mm(ay)),
+                    p: sheet_point(a[0] + ox, a[1] + oy),
                     bezier: false,
                 },
                 LinePoint {
-                    p: Point::new(Mm(bx), Mm(by)),
+                    p: sheet_point(b_pt[0] + ox, b_pt[1] + oy),
                     bezier: false,
                 },
             ];
@@ -1559,7 +1644,7 @@ fn emit_text(
 
             // Cancel the offset in f64, then narrow: the sheet-mm result is a
             // small number even when the world coordinate is UTM-scale.
-            let point = |wx: f64, wy: f64| Point::new(Mm((wx + ox) as f32), Mm((wy + oy) as f32));
+            let point = |wx: f64, wy: f64| sheet_point(wx + ox, wy + oy);
 
             if let Some(ge) = table.get(&key) {
                 // Affine basis of the quad: plane_min → bl, +x → br, +y → tl.
@@ -1622,7 +1707,7 @@ fn emit_text(
                         let glyph_unit_mm = (((tl[0] - bl[0]).powi(2) + (tl[1] - bl[1]).powi(2))
                             .sqrt()
                             / sy.abs() as f64) as f32;
-                        (2.0 * sdf_atlas::stroke_pen_half_units(ge.bold) * glyph_unit_mm * MM_TO_PT)
+                        (2.0 * sdf_atlas::stroke_pen_half_units(ge.bold) * glyph_unit_mm * drawing_unit_pt())
                             .max(0.1)
                     };
                     ops.push(Op::SetOutlineThickness { pt: Pt(pen) });

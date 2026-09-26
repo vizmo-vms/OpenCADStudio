@@ -22,6 +22,9 @@
 //! would otherwise block the iced executor; the result is delivered back
 //! through a oneshot channel that the async wrapper awaits.
 
+/// What SecurePlan CAD answers to any file-association request.
+const SECUREPLAN_REFUSAL: &str = "SecurePlan CAD does not register as a drawing opener.";
+
 /// Reverse-DNS bundle / app id, shared by the macOS handler binding, the
 /// Linux desktop-file name and the Wayland window app_id. Matches
 /// `CFBundleIdentifier` in packaging/Info.plist and the installed `*.desktop`
@@ -39,6 +42,11 @@ pub(crate) const APP_ID: &str = "io.github.HakanSeven12.OpenCadStudio";
 /// (registry / small file writes), so callers should invoke it off the UI
 /// thread.
 pub fn register_as_handler() -> Result<(), String> {
+    // SecurePlan CAD registers only its secureplan-cad: link, through its
+    // installer, and never touches drawing associations (DSK-05).
+    if cfg!(feature = "secureplan") {
+        return Err(SECUREPLAN_REFUSAL.into());
+    }
     #[cfg(target_os = "windows")]
     {
         windows_impl::register_handler()
@@ -63,6 +71,10 @@ pub fn register_as_handler() -> Result<(), String> {
 /// Remove this app's file-handler registration (the inverse of
 /// [`register_as_handler`]) so it no longer claims .dwg/.dxf/.bak. Best-effort.
 pub fn unregister_handler() -> Result<(), String> {
+    // Never remove another installed app's registrations (DSK-05).
+    if cfg!(feature = "secureplan") {
+        return Err(SECUREPLAN_REFUSAL.into());
+    }
     #[cfg(target_os = "windows")]
     {
         windows_impl::unregister_handler()
@@ -89,6 +101,9 @@ pub fn unregister_handler() -> Result<(), String> {
 /// bundled thumbnail-provider DLL.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn install_thumbnailer() {
+    if cfg!(feature = "secureplan") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     {
         let _ = linux_impl::install_thumbnailer();
@@ -117,6 +132,9 @@ pub async fn set_default_app() -> Result<String, String> {
 }
 
 fn set_default_app_blocking() -> Result<String, String> {
+    if cfg!(feature = "secureplan") {
+        return Err(SECUREPLAN_REFUSAL.into());
+    }
     // Boot no longer auto-registers, so make sure the handler entries (the
     // .desktop / mime package / ProgIDs) exist before asking the OS to default
     // to us — otherwise the default would point at nothing.

@@ -1,0 +1,330 @@
+{
+  "description": "BRG-04 mutual handshake. HMAC key = the 32 raw token bytes. Messages are the exact JSON objects sent as plaintext WebSocket text frames. welcome is the first sealed desktop-to-web frame (see sealed-frames.json).",
+  "inputs": {
+    "tokenHex": "121a1c3d714602420a99a5c0852c334d53fe860792b32de2bdadeda10649496c",
+    "token": "EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw",
+    "pairingHex": "8a3a81b7ca856d3b0a941a86db9a9ac1",
+    "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+    "nonceWHex": "2140f63d4134a2a60d3af9018f0932acb8651ac5180a59ecc23ae14ae0a1fae2",
+    "nonceDHex": "6e2a1fe6ebe69d480e34c2c71e6dcd1f6d191557b3eea14e6541f359cb39d5e1",
+    "origin": "https://secureplan.example",
+    "port": 47815
+  },
+  "steps": [
+    {
+      "step": 1,
+      "name": "hello",
+      "direction": "webToDesktop",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "name": "challenge",
+      "direction": "desktopToWeb",
+      "hmacMessageHex": "6465736b746f702140f63d4134a2a60d3af9018f0932acb8651ac5180a59ecc23ae14ae0a1fae26e2a1fe6ebe69d480e34c2c71e6dcd1f6d191557b3eea14e6541f359cb39d5e1",
+      "proofDHex": "854b05b55ab548fc1f6a2415dee75c487ace21813bcaf43767491895afa76930",
+      "message": {
+        "type": "challenge",
+        "requestId": "c1",
+        "nonceD": "biof5uvmnUgONMLHHm3NH20ZFVez7qFOZUHzWcs51eE",
+        "proofD": "hUsFtVq1SPwfaiQV3udcSHrOIYE7yvQ3Z0kYla-naTA"
+      }
+    },
+    {
+      "step": 3,
+      "name": "prove",
+      "direction": "webToDesktop",
+      "hmacMessageHex": "7765626e2a1fe6ebe69d480e34c2c71e6dcd1f6d191557b3eea14e6541f359cb39d5e12140f63d4134a2a60d3af9018f0932acb8651ac5180a59ecc23ae14ae0a1fae2",
+      "proofWHex": "65c5510f1510ac5f35aeb3af71299f689ad3a04ec76c9e830b450224037c74b0",
+      "message": {
+        "type": "prove",
+        "requestId": "p1",
+        "proofW": "ZcVRDxUQrF81rrOvcSmfaJrToE7HbJ6DC0UCJAN8dLA"
+      }
+    },
+    {
+      "step": 4,
+      "name": "keys",
+      "saltHex": "2140f63d4134a2a60d3af9018f0932acb8651ac5180a59ecc23ae14ae0a1fae26e2a1fe6ebe69d480e34c2c71e6dcd1f6d191557b3eea14e6541f359cb39d5e1",
+      "webToDesktop": {
+        "infoHex": "736563757265706c616e2d63616420776562e286926465736b746f70",
+        "keyHex": "2e431e03a0077117e2cea2275c127868d9b82fc82912d8d7e977b0b01cc1ce4d"
+      },
+      "desktopToWeb": {
+        "infoHex": "736563757265706c616e2d636164206465736b746f70e28692776562",
+        "keyHex": "a1739141c2d7cc4ebbfcf93f6acb6612375db346ef9c737224ed55d4e07856d3"
+      }
+    },
+    {
+      "step": 5,
+      "name": "welcome",
+      "direction": "desktopToWeb",
+      "sealed": true,
+      "counter": 0,
+      "message": {
+        "type": "welcome",
+        "requestId": "w1",
+        "desktopVersion": "1.0.0",
+        "protocol": 1,
+        "capabilities": [
+          "overlay",
+          "import",
+          "apply"
+        ]
+      }
+    }
+  ],
+  "rejections": [
+    {
+      "name": "proofD-wrong-token",
+      "side": "web",
+      "message": {
+        "type": "challenge",
+        "requestId": "c1",
+        "nonceD": "biof5uvmnUgONMLHHm3NH20ZFVez7qFOZUHzWcs51eE",
+        "proofD": "ilk9hiHLcrttEEttqPfCJCJlGdl-WSa-PWQ_LHZh0PI"
+      },
+      "expect": "closeAndTryNextPort"
+    },
+    {
+      "name": "proofD-web-label",
+      "side": "web",
+      "message": {
+        "type": "challenge",
+        "requestId": "c1",
+        "nonceD": "biof5uvmnUgONMLHHm3NH20ZFVez7qFOZUHzWcs51eE",
+        "proofD": "0X2pmTTv3UMzpd-2JE4MpSAtS8sYvPMatSO0YCom29Y"
+      },
+      "expect": "closeAndTryNextPort"
+    },
+    {
+      "name": "proofD-swapped-nonces",
+      "side": "web",
+      "message": {
+        "type": "challenge",
+        "requestId": "c1",
+        "nonceD": "biof5uvmnUgONMLHHm3NH20ZFVez7qFOZUHzWcs51eE",
+        "proofD": "XLz-1ulMY8aYzcQ-s1mOYHQcWOcubWMl1ufBV_Tj-v0"
+      },
+      "expect": "closeAndTryNextPort"
+    },
+    {
+      "name": "proofW-wrong-token",
+      "side": "desktop",
+      "message": {
+        "type": "prove",
+        "requestId": "p1",
+        "proofW": "sreWWphrq4yGHCUEYTn-DWMypTY8fzqIGWwNv0at4yk"
+      },
+      "expect": "closeWithoutWelcome"
+    },
+    {
+      "name": "proofW-reflected-proofD",
+      "side": "desktop",
+      "message": {
+        "type": "prove",
+        "requestId": "p1",
+        "proofW": "hUsFtVq1SPwfaiQV3udcSHrOIYE7yvQ3Z0kYla-naTA"
+      },
+      "expect": "closeWithoutWelcome"
+    },
+    {
+      "name": "unknown-pairing",
+      "side": "desktop",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "WoA3KbDq6mLCXt3ro5w3SQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ]
+      },
+      "expect": "closeWithoutChallenge"
+    },
+    {
+      "name": "consumed-pairing",
+      "side": "desktop",
+      "note": "A second hello for a pairing whose handshake already succeeded.",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ]
+      },
+      "expect": "closeWithoutChallenge"
+    },
+    {
+      "name": "expired-pairing",
+      "side": "desktop",
+      "note": "hello arrives 120001 ms after the launch URL was received.",
+      "pairingAgeMs": 120001,
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ]
+      },
+      "expect": "closeWithoutChallenge"
+    },
+    {
+      "name": "unsupported-protocols",
+      "side": "desktop",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          2
+        ]
+      },
+      "expect": "closeWithoutChallenge"
+    },
+    {
+      "name": "welcome-old-version",
+      "side": "web",
+      "note": "welcome.desktopVersion 0.9.0 is below hello.minDesktopVersion 1.0.0: the web sends close{unsupportedVersion} and shows update instructions.",
+      "message": {
+        "type": "welcome",
+        "requestId": "w1",
+        "desktopVersion": "0.9.0",
+        "protocol": 1,
+        "capabilities": [
+          "overlay",
+          "import",
+          "apply"
+        ]
+      },
+      "expect": "closeUnsupportedVersion"
+    },
+    {
+      "name": "welcome-unknown-protocol",
+      "side": "web",
+      "message": {
+        "type": "welcome",
+        "requestId": "w1",
+        "desktopVersion": "1.0.0",
+        "protocol": 2,
+        "capabilities": [
+          "overlay",
+          "import",
+          "apply"
+        ]
+      },
+      "expect": "closeUnsupportedVersion"
+    }
+  ],
+  "upgrades": {
+    "description": "BRG-03 WebSocket upgrade checks on port 47815 with one pending pairing for https://secureplan.example. Both checks run before any frame is read.",
+    "port": 47815,
+    "pendingOrigins": [
+      "https://secureplan.example"
+    ],
+    "cases": [
+      {
+        "name": "accepted",
+        "host": "127.0.0.1:47815",
+        "origin": "https://secureplan.example",
+        "accept": true
+      },
+      {
+        "name": "host-localhost",
+        "host": "localhost:47815",
+        "origin": "https://secureplan.example",
+        "accept": false
+      },
+      {
+        "name": "host-other-port",
+        "host": "127.0.0.1:47816",
+        "origin": "https://secureplan.example",
+        "accept": false
+      },
+      {
+        "name": "host-no-port",
+        "host": "127.0.0.1",
+        "origin": "https://secureplan.example",
+        "accept": false
+      },
+      {
+        "name": "host-rebinding",
+        "host": "attacker.example:47815",
+        "origin": "https://secureplan.example",
+        "accept": false
+      },
+      {
+        "name": "host-missing",
+        "host": null,
+        "origin": "https://secureplan.example",
+        "accept": false
+      },
+      {
+        "name": "origin-missing",
+        "host": "127.0.0.1:47815",
+        "origin": null,
+        "accept": false
+      },
+      {
+        "name": "origin-other-site",
+        "host": "127.0.0.1:47815",
+        "origin": "https://attacker.example",
+        "accept": false
+      },
+      {
+        "name": "origin-trailing-slash",
+        "host": "127.0.0.1:47815",
+        "origin": "https://secureplan.example/",
+        "accept": false
+      },
+      {
+        "name": "origin-case",
+        "host": "127.0.0.1:47815",
+        "origin": "https://SECUREPLAN.example",
+        "accept": false
+      },
+      {
+        "name": "origin-http",
+        "host": "127.0.0.1:47815",
+        "origin": "http://secureplan.example",
+        "accept": false
+      }
+    ]
+  },
+  "timeoutsMs": {
+    "handshake": 10000,
+    "tokenTtl": 120000,
+    "portSweepInterval": 1000
+  },
+  "ports": [
+    47815,
+    47816,
+    47817,
+    47818,
+    47819
+  ],
+  "maxPendingPairings": 4
+}

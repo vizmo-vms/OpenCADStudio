@@ -1,0 +1,366 @@
+{
+  "description": "SPSNAP v1: 36-byte little-endian header (magic SPSNAP01, u32 version=1, u32 flags, u32 pageWidthPt, u32 pageHeightPt, u32 pointCount, u32 segmentCount, u32 uncompressedBodyBytes), then the body: f32le[2*pointCount] then f32le[4*segmentCount], gzip-compressed when flags bit 0 is set. Flag bits other than bit 0 must be zero. uncompressedBodyBytes must equal 8*pointCount + 16*segmentCount and the (inflated) body length, and must not exceed 134217728. Coordinates must be finite and within [-1, width+1] x [-1, height+1]. pdfPage is the page size of the PDF the snap file is bound to.",
+  "maxBodyBytes": 134217728,
+  "rules": [
+    "header",
+    "magic",
+    "version",
+    "flags",
+    "nonFinite",
+    "outsidePage",
+    "pageSize",
+    "counts",
+    "bodyTooLarge"
+  ],
+  "valid": [
+    {
+      "name": "gzip",
+      "path": "snap/valid-gzip.spsnap",
+      "sha256": "fc47fd643a8b753373515ae4cd8eb4c29df7ad118c92312fbb3ee749bbead51a",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "expect": {
+        "version": 1,
+        "flags": 1,
+        "pageWidthPt": 600,
+        "pageHeightPt": 400,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            600,
+            400
+          ],
+          [
+            120.5,
+            80.25
+          ],
+          [
+            300.125,
+            399.875
+          ]
+        ],
+        "segments": [
+          [
+            0,
+            0,
+            600,
+            0
+          ],
+          [
+            600,
+            0,
+            600,
+            400
+          ],
+          [
+            120.5,
+            80.25,
+            300.125,
+            399.875
+          ]
+        ]
+      }
+    },
+    {
+      "name": "uncompressed",
+      "path": "snap/valid-uncompressed.spsnap",
+      "sha256": "475a4f20a2b1520aaef9dd7ff8e49558535269592ad92125662bfcf2554d2fab",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "expect": {
+        "version": 1,
+        "flags": 0,
+        "pageWidthPt": 600,
+        "pageHeightPt": 400,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            600,
+            400
+          ],
+          [
+            120.5,
+            80.25
+          ],
+          [
+            300.125,
+            399.875
+          ]
+        ],
+        "segments": [
+          [
+            0,
+            0,
+            600,
+            0
+          ],
+          [
+            600,
+            0,
+            600,
+            400
+          ],
+          [
+            120.5,
+            80.25,
+            300.125,
+            399.875
+          ]
+        ]
+      }
+    },
+    {
+      "name": "empty",
+      "path": "snap/valid-empty.spsnap",
+      "sha256": "eeb473cc39d4c56e7439453e9a972d0518a53b78780220d4c6410153c698f66f",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "expect": {
+        "version": 1,
+        "flags": 1,
+        "pageWidthPt": 600,
+        "pageHeightPt": 400,
+        "points": [],
+        "segments": []
+      }
+    },
+    {
+      "name": "one-point-margin",
+      "path": "snap/valid-one-point-margin.spsnap",
+      "sha256": "ced51fe58bdf68a1c7f7d993933448c4f49b15901f02dbd5cd4acc478486f88d",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "note": "Coordinates exactly 1 pt outside the page are accepted.",
+      "expect": {
+        "version": 1,
+        "flags": 1,
+        "pageWidthPt": 600,
+        "pageHeightPt": 400,
+        "points": [
+          [
+            -1,
+            -1
+          ],
+          [
+            601,
+            401
+          ]
+        ],
+        "segments": [
+          [
+            -1,
+            200,
+            601,
+            200
+          ]
+        ]
+      }
+    },
+    {
+      "name": "max-page",
+      "path": "snap/valid-max-page.spsnap",
+      "sha256": "6d39c86b102d223238b3eee4384355f9c491c5f333d6978ec32ac5726cbe1f38",
+      "pdfPage": {
+        "widthPt": 14400,
+        "heightPt": 4400
+      },
+      "expect": {
+        "version": 1,
+        "flags": 1,
+        "pageWidthPt": 14400,
+        "pageHeightPt": 4400,
+        "points": [
+          [
+            14399.9990234375,
+            4399.99951171875
+          ],
+          [
+            8191.99951171875,
+            1.5
+          ]
+        ],
+        "segments": [
+          [
+            0,
+            0,
+            14399.9990234375,
+            4399.99951171875
+          ],
+          [
+            8191.99951171875,
+            0,
+            8192,
+            4400
+          ]
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "bad-magic",
+      "path": "snap/invalid-bad-magic.spsnap",
+      "sha256": "32317fdd5cf38178d319665b027c28691f3b1b521c56f5de82bbee45520108a2",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "magic"
+    },
+    {
+      "name": "version-2",
+      "path": "snap/invalid-version-2.spsnap",
+      "sha256": "cd80266d6d5319b4bbcc16fed8de6496bfcd96a2ccbff978a28f5623933d3420",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "version"
+    },
+    {
+      "name": "reserved-flag",
+      "path": "snap/invalid-reserved-flag.spsnap",
+      "sha256": "cc8f356d30496609ca6a71870874ddefe647454474ca63d9e57a31984c5deb6e",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "flags"
+    },
+    {
+      "name": "truncated-header",
+      "path": "snap/invalid-truncated-header.spsnap",
+      "sha256": "d7e5058b65009d8d1e448a6f690bea899154180ac9083978ef5a4ef344602bc2",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "header"
+    },
+    {
+      "name": "nan-point",
+      "path": "snap/invalid-nan-point.spsnap",
+      "sha256": "1d5c2f52fa1be168c61c2207c1534730d2b4240f5bf965dc538534dd297f35d7",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "nonFinite"
+    },
+    {
+      "name": "infinite-segment",
+      "path": "snap/invalid-infinite-segment.spsnap",
+      "sha256": "df385deb998d4ddc01a3857874cd1fb170baf935e85292b6d0a141e74a37835c",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "nonFinite"
+    },
+    {
+      "name": "x-outside-page",
+      "path": "snap/invalid-x-outside-page.spsnap",
+      "sha256": "bd6451cc2fd392a68e406cfcd52d39485e71ac8ff6e2e840323c5858ae5b5aab",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "outsidePage"
+    },
+    {
+      "name": "y-outside-page",
+      "path": "snap/invalid-y-outside-page.spsnap",
+      "sha256": "91409e2a7928af8fefdd6b3b35ec2b69565e11f701c4565b2ec383378c8ead61",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "outsidePage"
+    },
+    {
+      "name": "page-size-mismatch",
+      "path": "snap/invalid-page-size-mismatch.spsnap",
+      "sha256": "fc47fd643a8b753373515ae4cd8eb4c29df7ad118c92312fbb3ee749bbead51a",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 401
+      },
+      "rule": "pageSize"
+    },
+    {
+      "name": "declared-bytes-mismatch",
+      "path": "snap/invalid-declared-bytes-mismatch.spsnap",
+      "sha256": "b49c30e8fb0f6e55623a31acdd97a0ce5b986169906fe2f94d80c86f6788b29d",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts"
+    },
+    {
+      "name": "body-short",
+      "path": "snap/invalid-body-short.spsnap",
+      "sha256": "b5ce822a10e7404891188d60c7ff0ea752e2bbfc0fdf0b90ad237592581c45e9",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts"
+    },
+    {
+      "name": "body-long",
+      "path": "snap/invalid-body-long.spsnap",
+      "sha256": "3ae569ffe7c1738f33b18d0f0011810d573821dd60d64bd825946669a0d65303",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts"
+    },
+    {
+      "name": "gzip-body-short",
+      "path": "snap/invalid-gzip-body-short.spsnap",
+      "sha256": "f5d957ede04e05d205e79c1cc67a41d504d791ee0650029bc8bb38ab75a42bab",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts"
+    },
+    {
+      "name": "gzip-corrupt",
+      "path": "snap/invalid-gzip-corrupt.spsnap",
+      "sha256": "d74161ef3f7618c8c04df33df1a64238e79a27362808969a60f498314cb2a30e",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts"
+    },
+    {
+      "name": "body-over-128mib",
+      "path": "snap/invalid-body-over-128mib.spsnap",
+      "sha256": "35fe5b312801045083ee7c9e1be940e6551ba031b6f2a1e99810d218f10841c3",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "bodyTooLarge",
+      "note": "Rejected from the header, before inflating."
+    }
+  ]
+}

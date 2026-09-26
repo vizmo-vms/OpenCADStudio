@@ -383,6 +383,13 @@ pub fn clear_image_cache() {
 /// raster loader and the unresolved-reference placeholder agree on one answer
 /// without fetching twice.
 pub fn resolve_image(path: &str) -> Option<DecodedImage> {
+    #[cfg(feature = "secureplan")]
+    if !crate::app::secureplan::guards::reference_allowed(
+        crate::app::secureplan::guards::ExternalResource::Image,
+        path,
+    ) {
+        return None;
+    }
     let path = path.trim();
     if path.is_empty() {
         return None;
@@ -425,6 +432,10 @@ fn decode_reference(path: &str) -> Option<DecodedImage> {
 /// synchronous fetch and would hit CORS on a cross-origin image anyway.
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch_remote(url: &str) -> Option<Vec<u8>> {
+    // A SecurePlan drawing can never cause a network request (DSK-02).
+    if cfg!(feature = "secureplan") {
+        return None;
+    }
     let agent = crate::network::agent(std::time::Duration::from_secs(8));
     let mut resp = agent
         .get(url)

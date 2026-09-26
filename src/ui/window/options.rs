@@ -407,6 +407,30 @@ pub fn view_window<'a>(
     // association were on General, which had become a page of three unrelated
     // controls; the autosave interval and the backup toggle have existed since
     // #205 with no control at all.
+    // SecurePlan CAD never registers as a drawing opener (DSK-05): no control.
+    let file_assoc_control: Element<'_, Message> = if cfg!(feature = "secureplan") {
+        Space::new().height(0).into()
+    } else {
+        column![
+            Space::new().height(14),
+            row![
+                iced::widget::checkbox(file_assoc_enabled)
+                    .on_toggle(Message::FileAssocChanged)
+                    .size(15),
+                text(crate::t!("Open .dwg and .dxf files with Open CAD Studio"))
+                    .size(12),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            Space::new().height(6),
+            text(crate::t!(
+                "Also installs the application and file-type icons the desktop shows."
+            ))
+            .size(11)
+            .width(sizing.width),
+        ]
+        .into()
+    };
     let open_and_save = column![
         text(crate::t!("Open and Save")).size(15),
         Space::new().height(10),
@@ -427,22 +451,7 @@ pub fn view_window<'a>(
         text(crate::tr!("options", "default-save-format-help"))
         .size(11)
         .width(sizing.width),
-        Space::new().height(14),
-        row![
-            iced::widget::checkbox(file_assoc_enabled)
-                .on_toggle(Message::FileAssocChanged)
-                .size(15),
-            text(crate::t!("Open .dwg and .dxf files with Open CAD Studio"))
-                .size(12),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
-        Space::new().height(6),
-        text(crate::t!(
-            "Also installs the application and file-type icons the desktop shows."
-        ))
-        .size(11)
-        .width(sizing.width),
+        file_assoc_control,
         Space::new().height(14),
         row![
             iced::widget::checkbox(show_constraint_values)

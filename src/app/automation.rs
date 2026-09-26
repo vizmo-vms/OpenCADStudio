@@ -27,6 +27,10 @@ use super::OpenCADStudio;
 /// a time (the document session persists across reconnects).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve() {
+    // SecurePlan CAD exposes no automation surface (DSK-02).
+    if cfg!(feature = "secureplan") {
+        return;
+    }
     let mut app = OpenCADStudio::new();
     match port_arg() {
         Some(port) => serve_socket(&mut app, port),
@@ -42,17 +46,19 @@ pub fn export_headless(input: &std::path::Path, output: &std::path::Path) -> i32
     let doc = match crate::io::load_file(input) {
         Ok(doc) => doc,
         Err(e) => {
-            eprintln!("export: cannot read {}: {e}", input.display());
+            let e = crate::io::scrub_paths(&e, &[input, output]);
+            eprintln!("export: cannot read {}: {e}", crate::io::diagnostic_path(input));
             return 1;
         }
     };
     match crate::io::save(&doc, output) {
         Ok(()) => {
-            println!("Exported {} → {}", input.display(), output.display());
+            println!("Exported {} → {}", crate::io::diagnostic_path(input), crate::io::diagnostic_path(output));
             0
         }
         Err(e) => {
-            eprintln!("export: cannot write {}: {e}", output.display());
+            let e = crate::io::scrub_paths(&e, &[input, output]);
+            eprintln!("export: cannot write {}: {e}", crate::io::diagnostic_path(output));
             1
         }
     }

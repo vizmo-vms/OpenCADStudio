@@ -3,7 +3,8 @@ use crate::scene::pipeline::{GpuAdapter, GpuStatus};
 
 impl OpenCADStudio {
     pub(super) fn queue_startup_prompts(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
+        // SecurePlan CAD never offers to become the drawing opener (DSK-05).
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "secureplan")))]
         if !self.default_assoc_prompted {
             self.pending_startup_modals
                 .push_back(ModalKind::AssocPrompt);
@@ -194,6 +195,8 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         app.apply_config(AppConfig::default());
         app.queue_startup_prompts();
+        // SecurePlan CAD has no association prompt: the donation prompt is first.
+        #[cfg(not(feature = "secureplan"))]
         assert_eq!(app.active_modal, Some(ModalKind::AssocPrompt));
         let _ = app.update(Message::UpdateCheckResult(Some(
             crate::io::update_check::UpdateInfo {
@@ -201,8 +204,11 @@ mod tests {
                 body: String::new(),
             },
         )));
-        assert_eq!(app.active_modal, Some(ModalKind::AssocPrompt));
-        let _ = app.update(Message::AssocPromptNo);
+        #[cfg(not(feature = "secureplan"))]
+        {
+            assert_eq!(app.active_modal, Some(ModalKind::AssocPrompt));
+            let _ = app.update(Message::AssocPromptNo);
+        }
         assert_eq!(app.active_modal, Some(ModalKind::DonationPrompt));
 
         // A file-recovery dialog may interrupt startup before the first frame.

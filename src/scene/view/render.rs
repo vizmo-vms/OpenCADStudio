@@ -2573,6 +2573,7 @@ impl Scene {
         }
         candidates
             .into_iter()
+            .filter(|path| crate::io::path_is_local(path))
             .find(|path| path.is_file())
             .and_then(|path| {
                 crate::scene::model::image_model::resolve_image(&path.to_string_lossy())
@@ -2605,7 +2606,10 @@ impl Scene {
                     }
                 }
             }
-            let path = candidates.into_iter().find(|path| path.is_file())?;
+            let path = candidates
+                .into_iter()
+                .filter(|path| crate::io::path_is_local(path))
+                .find(|path| path.is_file())?;
             let contents = std::fs::read_to_string(path).ok()?;
             let tilt_start = contents.lines().position(|line| {
                 line.trim_start().to_ascii_uppercase().starts_with("TILT=")

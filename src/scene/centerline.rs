@@ -267,6 +267,9 @@ impl Scene {
         if name == "CENTERLTYPEFILE" && !value.trim().is_empty() {
             #[cfg(not(target_arch = "wasm32"))]
             {
+                if !crate::io::reference_is_local(value) {
+                    return Err("CENTERLTYPEFILE: files on another computer are not allowed.".to_owned());
+                }
                 let source = std::fs::read_to_string(value)
                     .map_err(|error| format!("CENTERLTYPEFILE: {error}"))?;
                 crate::io::linetypes::populate_document_from_source(

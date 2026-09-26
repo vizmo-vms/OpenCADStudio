@@ -1271,7 +1271,7 @@ impl Scene {
         )
     }
 
-    fn layer_plottable_in_context(
+    pub(crate) fn layer_plottable_in_context(
         &self,
         entity: &EntityType,
         context: &crate::scene::render_graph::InstanceContext,

@@ -1,0 +1,599 @@
+{
+  "description": "BRG-06 transfer rules, as event sequences seen by a receiver after the handshake. Transfer ids are unique per session and direction and never reused. A zero-length transfer has no chunks and completes on transferStart. Chunks are non-empty, at most 1048576 payload bytes, with seq starting at 0 and increasing by 1. At most 3 transfers are in flight per session, split by direction so that no crossing can exceed it: at most 2 web-to-desktop and at most 1 desktop-to-web. A sender counts only its own unfinished outgoing transfers and waits for one to finish before exceeding its share; a receiver refuses a transferStart that would give it more unfinished incoming transfers than the sender's share. Cases with a receiver field apply to that receiver only.",
+  "limits": {
+    "maxControlBytes": 1048576,
+    "maxChunkPayloadBytes": 1048576,
+    "maxTransferBytes": 52428800,
+    "maxJsonPayloadBytes": 8388608,
+    "jsonPayloadMediaTypes": [
+      "application/vnd.secureplan.overlay+json",
+      "application/vnd.secureplan.export+json"
+    ],
+    "maxInFlightPerSession": 3,
+    "maxInFlightWebToDesktop": 2,
+    "maxInFlightDesktopToWeb": 1,
+    "noProgressTimeoutMs": 30000
+  },
+  "valid": [
+    {
+      "name": "three-chunks",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233"
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 1,
+          "payloadHex": "34353637"
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 2,
+          "payloadHex": "3839"
+        }
+      ],
+      "expect": {
+        "complete": [
+          7
+        ],
+        "bytesHex": "30313233343536373839"
+      }
+    },
+    {
+      "name": "zero-length",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts8",
+            "transferId": 8,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      ],
+      "expect": {
+        "complete": [
+          8
+        ],
+        "bytesHex": ""
+      }
+    },
+    {
+      "name": "one-after-another",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts1",
+            "transferId": 1,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 1,
+          "seq": 0,
+          "payloadHex": "30"
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts2",
+            "transferId": 2,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 2,
+          "seq": 0,
+          "payloadHex": "31"
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts3",
+            "transferId": 3,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"
+          }
+        }
+      ],
+      "expect": {
+        "complete": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "interleaved",
+      "receiver": "desktop",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts1",
+            "transferId": 1,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 4,
+            "sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a"
+          }
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts2",
+            "transferId": 2,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 4,
+            "sha256": "db2e7f1bd5ab9968ae76199b7cc74795ca7404d5a08d78567715ce532f9d2669"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 2,
+          "seq": 0,
+          "payloadHex": "34353637"
+        },
+        {
+          "event": "chunk",
+          "transferId": 1,
+          "seq": 0,
+          "payloadHex": "30313233"
+        }
+      ],
+      "expect": {
+        "complete": [
+          2,
+          1
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "seq-gap",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233"
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 2,
+          "payloadHex": "34353637"
+        }
+      ]
+    },
+    {
+      "name": "seq-repeat",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233"
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "34353637"
+        }
+      ]
+    },
+    {
+      "name": "seq-not-zero",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 1,
+          "payloadHex": "30313233"
+        }
+      ]
+    },
+    {
+      "name": "overrun",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233343536373839"
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 1,
+          "payloadHex": "78"
+        }
+      ]
+    },
+    {
+      "name": "sha-mismatch",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233343536373838"
+        }
+      ]
+    },
+    {
+      "name": "unknown-transfer",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 9,
+          "seq": 0,
+          "payloadHex": "30313233343536373839"
+        }
+      ]
+    },
+    {
+      "name": "chunk-before-start",
+      "events": [
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233343536373839"
+        }
+      ]
+    },
+    {
+      "name": "duplicate-transfer-id",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        }
+      ]
+    },
+    {
+      "name": "reused-after-complete",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts8",
+            "transferId": 8,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts8",
+            "transferId": 8,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      ]
+    },
+    {
+      "name": "empty-chunk",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": ""
+        }
+      ]
+    },
+    {
+      "name": "third-in-flight-to-desktop",
+      "receiver": "desktop",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts1",
+            "transferId": 1,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+          }
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts2",
+            "transferId": 2,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+          }
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts3",
+            "transferId": 3,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"
+          }
+        }
+      ]
+    },
+    {
+      "name": "second-in-flight-to-web",
+      "receiver": "web",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts1",
+            "transferId": 1,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+          }
+        },
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts2",
+            "transferId": 2,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 1,
+            "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+          }
+        }
+      ]
+    },
+    {
+      "name": "too-large",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts5",
+            "transferId": 5,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 52428801,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        }
+      ]
+    },
+    {
+      "name": "json-too-large",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts6",
+            "transferId": 6,
+            "name": "synthetic.dxf",
+            "mediaType": "application/vnd.secureplan.overlay+json",
+            "byteLength": 8388609,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        }
+      ]
+    },
+    {
+      "name": "chunk-too-large",
+      "note": "Payload of 1048577 bytes of 0x00; represented by length only.",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts5",
+            "transferId": 5,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 2097152,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 5,
+          "seq": 0,
+          "payloadLength": 1048577,
+          "payloadFill": 0
+        }
+      ]
+    },
+    {
+      "name": "stalled",
+      "note": "No chunk for 30001 ms after the last progress.",
+      "events": [
+        {
+          "event": "transferStart",
+          "message": {
+            "type": "transferStart",
+            "requestId": "ts7",
+            "transferId": 7,
+            "name": "synthetic.dxf",
+            "mediaType": "image/vnd.dxf",
+            "byteLength": 10,
+            "sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+          }
+        },
+        {
+          "event": "chunk",
+          "transferId": 7,
+          "seq": 0,
+          "payloadHex": "30313233"
+        },
+        {
+          "event": "advanceMs",
+          "ms": 30001
+        }
+      ]
+    }
+  ]
+}

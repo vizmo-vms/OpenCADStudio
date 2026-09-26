@@ -1,0 +1,1154 @@
+{
+  "description": "Page placement (CON-01) and float32 precision (CON-05). CAD->world: d = ((cx-ox)*s, -(cy-oy)*s); world = anchorMm + rot(q, d) with rot(0)=(x,y), rot(1)=(-y,x), rot(2)=(-x,-y), rot(3)=(y,-x). The window's four corners map to a world box [wx0,wy0,wx1,wy1]; widthPt = ceil((wx1-wx0)/mmPerPt - 1e-9), heightPt likewise; widthMm = widthPt*mmPerPt; centerX = wx0 + widthMm/2 (y likewise). World->page: x = (xw-wx0)/mmPerPt, y = heightPt - (yw-wy0)/mmPerPt. Web page->world uses mmPerPt = widthMm/widthPt and the CON-01 formulas. roundingBoundMm r = 0.5*ulp32(max(widthPt,heightPt))*mmPerPt; chordToleranceMm = max(0.1 - r, 0.01). errorMm is the world distance between the exact point and the web's result from the float32 page point.",
+  "limits": {
+    "maxSidePt": 14400,
+    "maxAreaPt2": 64000000,
+    "heightRelativeTolerance": 0.000001
+  },
+  "cases": [
+    {
+      "name": "empty-survey-origin",
+      "note": "First Apply on an empty survey: the window's top-left maps to world (0,0).",
+      "windowCad": [
+        0,
+        0,
+        30000,
+        18000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          18000
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 3,
+      "expect": {
+        "widthPt": 10000,
+        "heightPt": 6000,
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "pageWorldMin": [
+          0,
+          0
+        ],
+        "startsInsideCanvas": true,
+        "roundingBoundMm": 0.00146484375,
+        "chordToleranceMm": 0.09853515625,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            0,
+            18000
+          ],
+          "worldMm": [
+            0,
+            0
+          ],
+          "pagePt": [
+            0,
+            6000
+          ],
+          "pagePtF32": [
+            0,
+            6000
+          ],
+          "worldFromF32": [
+            0,
+            0
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            30000,
+            0
+          ],
+          "worldMm": [
+            30000,
+            18000
+          ],
+          "pagePt": [
+            10000,
+            0
+          ],
+          "pagePtF32": [
+            10000,
+            0
+          ],
+          "worldFromF32": [
+            30000,
+            18000
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            12345.6,
+            7890.1
+          ],
+          "worldMm": [
+            12345.6,
+            10109.9
+          ],
+          "pagePt": [
+            4115.2,
+            2630.0333333333333
+          ],
+          "pagePtF32": [
+            4115.2001953125,
+            2630.033447265625
+          ],
+          "worldFromF32": [
+            12345.6005859375,
+            10109.899658203125
+          ],
+          "errorMm": 0.0006783419911748057
+        },
+        {
+          "cad": [
+            29999.9,
+            17999.9
+          ],
+          "worldMm": [
+            29999.9,
+            0.09999999999854481
+          ],
+          "pagePt": [
+            9999.966666666667,
+            5999.966666666667
+          ],
+          "pagePtF32": [
+            9999.966796875,
+            5999.966796875
+          ],
+          "worldFromF32": [
+            29999.900390625,
+            0.099609375
+          ],
+          "errorMm": 0.0005524271707440387
+        }
+      ]
+    },
+    {
+      "name": "feet-quarter-turn",
+      "note": "Feet drawing, one quarter turn, anchored inside an existing canvas.",
+      "windowCad": [
+        -10,
+        5,
+        90,
+        65
+      ],
+      "mapping": {
+        "cadOrigin": [
+          -10,
+          65
+        ],
+        "anchorMm": [
+          30000,
+          2000
+        ],
+        "scaleMmPerCadUnit": 304.8,
+        "quarterTurns": 1
+      },
+      "mmPerPt": 5,
+      "expect": {
+        "widthPt": 3658,
+        "heightPt": 6096,
+        "placement": {
+          "widthPt": 3658,
+          "heightPt": 6096,
+          "centerX": 20857,
+          "centerY": 17240,
+          "widthMm": 18290,
+          "heightMm": 30480
+        },
+        "pageWorldMin": [
+          11712,
+          2000
+        ],
+        "startsInsideCanvas": true,
+        "roundingBoundMm": 0.001220703125,
+        "chordToleranceMm": 0.098779296875,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            -10,
+            65
+          ],
+          "worldMm": [
+            30000,
+            2000
+          ],
+          "pagePt": [
+            3657.6,
+            6096
+          ],
+          "pagePtF32": [
+            3657.60009765625,
+            6096
+          ],
+          "worldFromF32": [
+            30000.00048828125,
+            2000
+          ],
+          "errorMm": 0.00048828125
+        },
+        {
+          "cad": [
+            90,
+            5
+          ],
+          "worldMm": [
+            11712,
+            32480
+          ],
+          "pagePt": [
+            0,
+            0
+          ],
+          "pagePtF32": [
+            0,
+            0
+          ],
+          "worldFromF32": [
+            11712,
+            32480
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            40.25,
+            33.125
+          ],
+          "worldMm": [
+            20284.5,
+            17316.2
+          ],
+          "pagePt": [
+            1714.5,
+            3032.7599999999998
+          ],
+          "pagePtF32": [
+            1714.5,
+            3032.760009765625
+          ],
+          "worldFromF32": [
+            20284.5,
+            17316.199951171875
+          ],
+          "errorMm": 0.00004882812572759576
+        },
+        {
+          "cad": [
+            0,
+            10
+          ],
+          "worldMm": [
+            13236,
+            5048
+          ],
+          "pagePt": [
+            304.8,
+            5486.4
+          ],
+          "pagePtF32": [
+            304.79998779296875,
+            5486.39990234375
+          ],
+          "worldFromF32": [
+            13235.999938964844,
+            5048.00048828125
+          ],
+          "errorMm": 0.0004920811613951751
+        }
+      ]
+    },
+    {
+      "name": "half-turn-metres",
+      "note": "Metre drawing, half turn.",
+      "windowCad": [
+        100,
+        200,
+        160,
+        240
+      ],
+      "mapping": {
+        "cadOrigin": [
+          160,
+          200
+        ],
+        "anchorMm": [
+          1000,
+          1000
+        ],
+        "scaleMmPerCadUnit": 1000,
+        "quarterTurns": 2
+      },
+      "mmPerPt": 8,
+      "expect": {
+        "widthPt": 7500,
+        "heightPt": 5000,
+        "placement": {
+          "widthPt": 7500,
+          "heightPt": 5000,
+          "centerX": 31000,
+          "centerY": 21000,
+          "widthMm": 60000,
+          "heightMm": 40000
+        },
+        "pageWorldMin": [
+          1000,
+          1000
+        ],
+        "startsInsideCanvas": true,
+        "roundingBoundMm": 0.001953125,
+        "chordToleranceMm": 0.098046875,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            100,
+            200
+          ],
+          "worldMm": [
+            61000,
+            1000
+          ],
+          "pagePt": [
+            7500,
+            5000
+          ],
+          "pagePtF32": [
+            7500,
+            5000
+          ],
+          "worldFromF32": [
+            61000,
+            1000
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            160,
+            240
+          ],
+          "worldMm": [
+            1000,
+            41000
+          ],
+          "pagePt": [
+            0,
+            0
+          ],
+          "pagePtF32": [
+            0,
+            0
+          ],
+          "worldFromF32": [
+            1000,
+            41000
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            123.456,
+            222.222
+          ],
+          "worldMm": [
+            37544,
+            23222.000000000007
+          ],
+          "pagePt": [
+            4568,
+            2222.249999999999
+          ],
+          "pagePtF32": [
+            4568,
+            2222.25
+          ],
+          "worldFromF32": [
+            37544,
+            23222
+          ],
+          "errorMm": 7.275957614183426e-12
+        }
+      ]
+    },
+    {
+      "name": "three-quarter-turn-cm",
+      "note": "Centimetre drawing, three quarter turns.",
+      "windowCad": [
+        0,
+        0,
+        2000,
+        1000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          2000,
+          0
+        ],
+        "anchorMm": [
+          500,
+          500
+        ],
+        "scaleMmPerCadUnit": 10,
+        "quarterTurns": 3
+      },
+      "mmPerPt": 4,
+      "expect": {
+        "widthPt": 2500,
+        "heightPt": 5000,
+        "placement": {
+          "widthPt": 2500,
+          "heightPt": 5000,
+          "centerX": -4500,
+          "centerY": 10500,
+          "widthMm": 10000,
+          "heightMm": 20000
+        },
+        "pageWorldMin": [
+          -9500,
+          500
+        ],
+        "startsInsideCanvas": false,
+        "roundingBoundMm": 0.0009765625,
+        "chordToleranceMm": 0.0990234375,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            0,
+            0
+          ],
+          "worldMm": [
+            500,
+            20500
+          ],
+          "pagePt": [
+            2500,
+            0
+          ],
+          "pagePtF32": [
+            2500,
+            0
+          ],
+          "worldFromF32": [
+            500,
+            20500
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            2000,
+            1000
+          ],
+          "worldMm": [
+            -9500,
+            500
+          ],
+          "pagePt": [
+            0,
+            5000
+          ],
+          "pagePtF32": [
+            0,
+            5000
+          ],
+          "worldFromF32": [
+            -9500,
+            500
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            1999.99,
+            0.01
+          ],
+          "worldMm": [
+            499.9,
+            500.0999999999999
+          ],
+          "pagePt": [
+            2499.975,
+            4999.975
+          ],
+          "pagePtF32": [
+            2499.97509765625,
+            4999.97509765625
+          ],
+          "worldFromF32": [
+            499.900390625,
+            500.099609375
+          ],
+          "errorMm": 0.000552427172753757
+        }
+      ]
+    },
+    {
+      "name": "float32-boundary-8192",
+      "note": "Page x coordinates straddle 8192 pt, where the float32 spacing doubles.",
+      "windowCad": [
+        0,
+        0,
+        144000,
+        40000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          40000
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 10,
+      "expect": {
+        "widthPt": 14400,
+        "heightPt": 4000,
+        "placement": {
+          "widthPt": 14400,
+          "heightPt": 4000,
+          "centerX": 72000,
+          "centerY": 20000,
+          "widthMm": 144000,
+          "heightMm": 40000
+        },
+        "pageWorldMin": [
+          0,
+          0
+        ],
+        "startsInsideCanvas": true,
+        "roundingBoundMm": 0.0048828125,
+        "chordToleranceMm": 0.0951171875,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            81919.995,
+            20000
+          ],
+          "worldMm": [
+            81919.995,
+            20000
+          ],
+          "pagePt": [
+            8191.9995,
+            2000
+          ],
+          "pagePtF32": [
+            8191.99951171875,
+            2000
+          ],
+          "worldFromF32": [
+            81919.9951171875,
+            20000
+          ],
+          "errorMm": 0.00011718750465661287
+        },
+        {
+          "cad": [
+            81920,
+            20000
+          ],
+          "worldMm": [
+            81920,
+            20000
+          ],
+          "pagePt": [
+            8192,
+            2000
+          ],
+          "pagePtF32": [
+            8192,
+            2000
+          ],
+          "worldFromF32": [
+            81920,
+            20000
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            81920.003,
+            20000
+          ],
+          "worldMm": [
+            81920.003,
+            20000
+          ],
+          "pagePt": [
+            8192.0003,
+            2000
+          ],
+          "pagePtF32": [
+            8192,
+            2000
+          ],
+          "worldFromF32": [
+            81920,
+            20000
+          ],
+          "errorMm": 0.0029999999969732016
+        },
+        {
+          "cad": [
+            81919.9951,
+            1.2345
+          ],
+          "worldMm": [
+            81919.9951,
+            39998.7655
+          ],
+          "pagePt": [
+            8191.99951,
+            0.12345000000004802
+          ],
+          "pagePtF32": [
+            8191.99951171875,
+            0.12345000356435776
+          ],
+          "worldFromF32": [
+            81919.9951171875,
+            39998.76549996436
+          ],
+          "errorMm": 0.00001718753686857545
+        },
+        {
+          "cad": [
+            143999.996,
+            39999.996
+          ],
+          "worldMm": [
+            143999.996,
+            0.004000000000814907
+          ],
+          "pagePt": [
+            14399.999600000001,
+            3999.9996
+          ],
+          "pagePtF32": [
+            14400,
+            3999.99951171875
+          ],
+          "worldFromF32": [
+            144000,
+            0.0048828125
+          ],
+          "errorMm": 0.004096261441707715
+        },
+        {
+          "cad": [
+            143999.9999,
+            0.0001
+          ],
+          "worldMm": [
+            143999.9999,
+            39999.9999
+          ],
+          "pagePt": [
+            14399.99999,
+            0.000009999999747378752
+          ],
+          "pagePtF32": [
+            14400,
+            0.000009999999747378752
+          ],
+          "worldFromF32": [
+            144000,
+            39999.9999
+          ],
+          "errorMm": 0.00010000000474974513
+        }
+      ]
+    },
+    {
+      "name": "extent-500m",
+      "note": "500 m x 250 m at the area limit.",
+      "windowCad": [
+        0,
+        0,
+        500000,
+        250000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          250000
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 44.2,
+      "expect": {
+        "widthPt": 11313,
+        "heightPt": 5657,
+        "placement": {
+          "widthPt": 11313,
+          "heightPt": 5657,
+          "centerX": 250017.30000000002,
+          "centerY": 125019.70000000001,
+          "widthMm": 500034.60000000003,
+          "heightMm": 250039.40000000002
+        },
+        "pageWorldMin": [
+          0,
+          0
+        ],
+        "startsInsideCanvas": true,
+        "roundingBoundMm": 0.02158203125,
+        "chordToleranceMm": 0.07841796875000001,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            0,
+            250000
+          ],
+          "worldMm": [
+            0,
+            0
+          ],
+          "pagePt": [
+            0,
+            5657
+          ],
+          "pagePtF32": [
+            0,
+            5657
+          ],
+          "worldFromF32": [
+            0,
+            0
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            500000,
+            0
+          ],
+          "worldMm": [
+            500000,
+            250000
+          ],
+          "pagePt": [
+            11312.217194570136,
+            0.8914027149321555
+          ],
+          "pagePtF32": [
+            11312.216796875,
+            0.8914027214050293
+          ],
+          "worldFromF32": [
+            499999.98242187506,
+            249999.9999997139
+          ],
+          "errorMm": 0.017578124944120452
+        },
+        {
+          "cad": [
+            333333.333,
+            123456.789
+          ],
+          "worldMm": [
+            333333.333,
+            126543.211
+          ],
+          "pagePt": [
+            7541.478122171945,
+            2794.0314253393667
+          ],
+          "pagePtF32": [
+            7541.47802734375,
+            2794.031494140625
+          ],
+          "worldFromF32": [
+            333333.3288085938,
+            126543.20795898438
+          ],
+          "errorMm": 0.005178384093233985
+        },
+        {
+          "cad": [
+            499999.999,
+            0.001
+          ],
+          "worldMm": [
+            499999.999,
+            249999.999
+          ],
+          "pagePt": [
+            11312.2171719457,
+            0.8914253393668332
+          ],
+          "pagePtF32": [
+            11312.216796875,
+            0.8914253115653992
+          ],
+          "worldFromF32": [
+            499999.98242187506,
+            249999.99900122883
+          ],
+          "errorMm": 0.01657812499804459
+        }
+      ]
+    },
+    {
+      "name": "coarse-bound-disclosed",
+      "note": "A 5.76 km extent: r exceeds 0.09 mm, so the Apply summary shows it and the chord tolerance floors at 0.01 mm.",
+      "windowCad": [
+        0,
+        0,
+        5760000,
+        1000000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          1000000
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 400,
+      "expect": {
+        "widthPt": 14400,
+        "heightPt": 2500,
+        "placement": {
+          "widthPt": 14400,
+          "heightPt": 2500,
+          "centerX": 2880000,
+          "centerY": 500000,
+          "widthMm": 5760000,
+          "heightMm": 1000000
+        },
+        "pageWorldMin": [
+          0,
+          0
+        ],
+        "startsInsideCanvas": true,
+        "roundingBoundMm": 0.1953125,
+        "chordToleranceMm": 0.01,
+        "withinPointOneMm": false
+      },
+      "points": [
+        {
+          "cad": [
+            0,
+            1000000
+          ],
+          "worldMm": [
+            0,
+            0
+          ],
+          "pagePt": [
+            0,
+            2500
+          ],
+          "pagePtF32": [
+            0,
+            2500
+          ],
+          "worldFromF32": [
+            0,
+            0
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            5760000,
+            0
+          ],
+          "worldMm": [
+            5760000,
+            1000000
+          ],
+          "pagePt": [
+            14400,
+            0
+          ],
+          "pagePtF32": [
+            14400,
+            0
+          ],
+          "worldFromF32": [
+            5760000,
+            1000000
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            4096000.123,
+            500000.456
+          ],
+          "worldMm": [
+            4096000.123,
+            499999.544
+          ],
+          "pagePt": [
+            10240.0003075,
+            1250.00114
+          ],
+          "pagePtF32": [
+            10240,
+            1250.0010986328125
+          ],
+          "worldFromF32": [
+            4096000,
+            499999.560546875
+          ],
+          "errorMm": 0.12410801386839668
+        }
+      ]
+    },
+    {
+      "name": "page-outside-canvas",
+      "note": "A page whose world box starts below x = 0: blocked on a survey with content.",
+      "windowCad": [
+        0,
+        0,
+        1000,
+        1000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          1000
+        ],
+        "anchorMm": [
+          -500,
+          100
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 1,
+      "expect": {
+        "widthPt": 1000,
+        "heightPt": 1000,
+        "placement": {
+          "widthPt": 1000,
+          "heightPt": 1000,
+          "centerX": 0,
+          "centerY": 600,
+          "widthMm": 1000,
+          "heightMm": 1000
+        },
+        "pageWorldMin": [
+          -500,
+          100
+        ],
+        "startsInsideCanvas": false,
+        "roundingBoundMm": 0.000030517578125,
+        "chordToleranceMm": 0.099969482421875,
+        "withinPointOneMm": true
+      },
+      "points": [
+        {
+          "cad": [
+            0,
+            1000
+          ],
+          "worldMm": [
+            -500,
+            100
+          ],
+          "pagePt": [
+            0,
+            1000
+          ],
+          "pagePtF32": [
+            0,
+            1000
+          ],
+          "worldFromF32": [
+            -500,
+            100
+          ],
+          "errorMm": 0
+        },
+        {
+          "cad": [
+            1000,
+            0
+          ],
+          "worldMm": [
+            500,
+            1100
+          ],
+          "pagePt": [
+            1000,
+            0
+          ],
+          "pagePtF32": [
+            1000,
+            0
+          ],
+          "worldFromF32": [
+            500,
+            1100
+          ],
+          "errorMm": 0
+        }
+      ]
+    }
+  ],
+  "rejections": [
+    {
+      "name": "side-16384",
+      "windowCad": [
+        0,
+        0,
+        163840,
+        1000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          1000
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 10,
+      "expectError": "sideTooLarge"
+    },
+    {
+      "name": "side-14401",
+      "windowCad": [
+        0,
+        0,
+        14401,
+        100
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          100
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 1,
+      "expectError": "sideTooLarge"
+    },
+    {
+      "name": "area-over-64m",
+      "windowCad": [
+        0,
+        0,
+        8001,
+        8000
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          8000
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 1,
+      "expectError": "areaTooLarge"
+    },
+    {
+      "name": "zero-scale",
+      "windowCad": [
+        0,
+        0,
+        10,
+        10
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          10
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 0,
+      "expectError": "invalidScale"
+    },
+    {
+      "name": "inverted-window",
+      "windowCad": [
+        10,
+        0,
+        0,
+        10
+      ],
+      "mapping": {
+        "cadOrigin": [
+          0,
+          10
+        ],
+        "anchorMm": [
+          0,
+          0
+        ],
+        "scaleMmPerCadUnit": 1,
+        "quarterTurns": 0
+      },
+      "mmPerPt": 1,
+      "expectError": "invalidWindow"
+    }
+  ]
+}

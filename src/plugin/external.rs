@@ -130,6 +130,10 @@ pub(crate) fn acadrust_source_compatible(
 /// `<config>/OpenCADStudio/plugins`, matching the settings/recent-files store.
 /// Overridable via `OCS_PLUGINS_DIR` for tests.
 pub fn plugins_dir() -> Option<PathBuf> {
+    // SecurePlan CAD loads no plugins (DSK-02).
+    if cfg!(feature = "secureplan") {
+        return None;
+    }
     if let Ok(p) = std::env::var("OCS_PLUGINS_DIR") {
         return Some(PathBuf::from(p));
     }

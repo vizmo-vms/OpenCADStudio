@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "overlay.schema.json",
+  "title": "SecurePlan CAD bridge protocol v1: read-only design overlay payload (OVL-01)",
+  "description": "Transferred as application/vnd.secureplan.overlay+json (UTF-8, at most 8388608 bytes). World millimetres, built from the web draft. coverage is empty unless coverage was chosen.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "walls", "doors", "routes", "devices", "coverage"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "walls": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "material", "start", "end"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "material": { "$ref": "common.schema.json#/$defs/wallMaterial" },
+          "start": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "end": { "$ref": "common.schema.json#/$defs/pointMm" }
+        }
+      }
+    },
+    "doors": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "start", "end"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "start": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "end": { "$ref": "common.schema.json#/$defs/pointMm" }
+        }
+      }
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "points"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "points": { "type": "array", "minItems": 2, "maxItems": 10000, "items": { "$ref": "common.schema.json#/$defs/pointMm" } }
+        }
+      }
+    },
+    "devices": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "symbolKey", "name", "color", "position", "rotationDeg"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "kind": { "enum": ["camera", "equipment", "asset"] },
+          "symbolKey": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+          "name": { "$ref": "common.schema.json#/$defs/label" },
+          "color": { "$ref": "common.schema.json#/$defs/color" },
+          "position": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" }
+        }
+      }
+    },
+    "coverage": { "$ref": "#/$defs/coverage" }
+  },
+  "$defs": {
+    "coverage": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["elementId", "polygon"],
+        "properties": {
+          "elementId": { "$ref": "common.schema.json#/$defs/elementId" },
+          "polygon": { "type": "array", "minItems": 3, "maxItems": 4096, "items": { "$ref": "common.schema.json#/$defs/pointMm" } }
+        }
+      }
+    }
+  }
+}

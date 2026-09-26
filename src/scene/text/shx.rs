@@ -80,6 +80,9 @@ fn load_file(path: &str) -> Option<Arc<ShxFile>> {
 }
 
 fn parse_file(path: &str) -> Option<ShxFile> {
+    if !crate::io::reference_is_local(path) {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     // Header line: `AutoCAD-86 shapes 1.0`/`1.1` + CR LF SUB. Reject fonts.
     let head_end = bytes.iter().position(|&b| b == 0x1A)?;

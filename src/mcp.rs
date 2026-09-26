@@ -1280,6 +1280,10 @@ fn handle_message(
 
 /// Run the MCP stdio loop until the client closes stdin.
 pub fn run() {
+    // SecurePlan CAD exposes no automation surface (DSK-02).
+    if cfg!(feature = "secureplan") {
+        return;
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut output = stdout.lock();

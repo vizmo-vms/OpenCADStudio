@@ -38,7 +38,12 @@ use serde_json::{json, Value};
 /// Protocol tag. Bump the suffix on any wire-format change so a running older
 /// editor is recognised as a stranger and both processes degrade cleanly
 /// instead of misreading each other.
+#[cfg(not(feature = "secureplan"))]
 const MAGIC: &str = "OpenCADStudio/si/2";
+/// SecurePlan CAD elects its own single instance: a different tag gives it a
+/// different port and identity, so it never hands a launch to Open CAD Studio.
+#[cfg(feature = "secureplan")]
+const MAGIC: &str = "SecurePlanCAD/si/1";
 
 /// Neither end blocks forever. Long enough to cover a busy primary's accept
 /// backlog, short enough that a wedged peer costs a visible pause and not a
@@ -125,6 +130,12 @@ fn addr() -> SocketAddr {
 /// Binds loopback only — never `0.0.0.0`, which would raise a firewall prompt
 /// on Windows and expose the port to the network.
 pub fn claim() -> Claim {
+    // SecurePlan CAD has no unauthenticated file-open hand-off: nothing
+    // listens, and only SecurePlan links reach a running copy, over the
+    // authenticated per-user channel (DSK-04).
+    if cfg!(feature = "secureplan") {
+        return Claim::Primary;
+    }
     match TcpListener::bind(addr()) {
         Ok(l) => {
             *LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = Some(l);
@@ -142,6 +153,9 @@ pub fn claim() -> Claim {
 
 /// Reach an editor without claiming its port. Used by the macOS launcher.
 pub fn try_connect_existing() -> Option<TcpStream> {
+    if cfg!(feature = "secureplan") {
+        return None;
+    }
     TcpStream::connect_timeout(&addr(), IO_TIMEOUT).ok()
 }
 
@@ -184,6 +198,18 @@ pub fn handoff(stream: TcpStream, paths: &[PathBuf]) -> bool {
     // would demand the file exist (we want the editor's own error message, not
     // a silent boot) and on Windows yields a `\\?\` verbatim path that would
     // land verbatim in the recents list.
+    // SecurePlan launch URLs carry pairing data and go only over the per-user
+    // channel (DSK-04), never through this unauthenticated port.
+    #[cfg(feature = "secureplan")]
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| !p.to_str().is_some_and(crate::app::secureplan::handoff::is_launch_url))
+        .cloned()
+        .collect();
+    #[cfg(feature = "secureplan")]
+    if paths.is_empty() {
+        return false;
+    }
     let abs: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -227,6 +253,9 @@ pub fn handoff(stream: TcpStream, paths: &[PathBuf]) -> bool {
 /// Inert unless [`claim`] returned [`Claim::Primary`] in this process, so a
 /// window that lost the election simply never produces items.
 pub fn subscribe() -> iced::Subscription<PathBuf> {
+    if cfg!(feature = "secureplan") {
+        return iced::Subscription::none();
+    }
     // `worker` must stay a plain `fn` — `Subscription::run` keys the
     // subscription's identity off the function pointer, so turning this into a
     // closure would silently stop the listener with no error.
@@ -296,6 +325,11 @@ fn serve_one(out: &mut PathSender, stream: TcpStream) {
                     Some(a) => a
                         .iter()
                         .filter_map(|p| p.as_str())
+                        // Pairing URLs never arrive this way in SecurePlan CAD.
+                        .filter(|p| {
+                            !cfg!(feature = "secureplan")
+                                || !p.get(..15).is_some_and(|s| s.eq_ignore_ascii_case("secureplan-cad:"))
+                        })
                         .all(|p| out.try_send(PathBuf::from(p)).is_ok()),
                     None => false,
                 };
@@ -311,6 +345,45 @@ fn serve_one(out: &mut PathSender, stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "secureplan")]
+    #[test]
+    fn secureplan_runs_no_unauthenticated_hand_off() {
+        // No listener: another local process can neither open files nor
+        // deliver links through the single-instance port. (Links go only over
+        // the authenticated channel; see secureplan::handoff's tests.)
+        assert!(matches!(claim(), Claim::Primary));
+        assert!(LISTENER.lock().unwrap_or_else(|e| e.into_inner()).is_none(), "claim bound a listener");
+        assert!(TcpStream::connect_timeout(&addr(), IO_TIMEOUT).is_err(), "something serves the hand-off port");
+        assert!(try_connect_existing().is_none());
+    }
+
+    #[cfg(feature = "secureplan")]
+    #[test]
+    fn secureplan_launch_urls_are_never_forwarded_over_this_port() {
+        use std::io::Read;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            let mut all = String::new();
+            let _ = BufReader::new(s).read_to_string(&mut all);
+            all
+        });
+        let s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let url = PathBuf::from("secureplan-cad://pair?v=1&token=c2VjcmV0");
+        assert!(!handoff(s, &[url]), "a launch URL was handed off");
+        let seen = t.join().unwrap();
+        assert!(!seen.contains("token"), "{seen:?}");
+    }
+
+    #[cfg(feature = "secureplan")]
+    #[test]
+    fn secureplan_single_instance_key_differs_from_upstream() {
+        assert_ne!(MAGIC, "OpenCADStudio/si/2");
+        assert!(MAGIC.starts_with("SecurePlanCAD/"));
+    }
 
     #[test]
     fn port_is_deterministic_and_in_the_reserved_window() {
@@ -336,6 +409,9 @@ mod tests {
         );
     }
 
+    // SecurePlan CAD runs no single-instance listener at all; see
+    // `secureplan_runs_no_unauthenticated_hand_off`.
+    #[cfg(not(feature = "secureplan"))]
     #[test]
     fn claim_elects_exactly_one_owner() {
         // Hold the port the way a primary would, then prove a second claim in

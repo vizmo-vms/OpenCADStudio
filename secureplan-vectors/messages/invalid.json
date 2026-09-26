@@ -1,0 +1,1127 @@
+{
+  "description": "Invalid control messages. layer \"schema\" fails the JSON Schema; layer \"semantic\" passes it but breaks a rule stated in a schema description (size limits, page area, height consistency) that implementations must also enforce.",
+  "samples": [
+    {
+      "name": "unknown-type",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "shell",
+        "requestId": "z1"
+      }
+    },
+    {
+      "name": "not-an-object",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": [
+        {
+          "type": "ping",
+          "requestId": "g1"
+        }
+      ]
+    },
+    {
+      "name": "hello-carries-token",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ],
+        "token": "EhocPXFGAkIKmaXAhSwzTVP-hgeSsy3iva3toQZJSWw"
+      }
+    },
+    {
+      "name": "challenge-missing-proof",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "challenge",
+        "requestId": "c1",
+        "nonceD": "biof5uvmnUgONMLHHm3NH20ZFVez7qFOZUHzWcs51eE"
+      }
+    },
+    {
+      "name": "request-id-space",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "ping",
+        "requestId": "g 1"
+      }
+    },
+    {
+      "name": "request-id-too-long",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "ping",
+        "requestId": "ggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+      }
+    },
+    {
+      "name": "pairing-short",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qa",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "nonce-padded",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI=",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "protocols-empty",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "hello",
+        "requestId": "h1",
+        "pairing": "ijqBt8qFbTsKlBqG25qawQ",
+        "nonceW": "IUD2PUE0oqYNOvkBjwkyrLhlGsUYClnswjrhSuCh-uI",
+        "webVersion": "0.1.0",
+        "minDesktopVersion": "1.0.0",
+        "protocols": []
+      }
+    },
+    {
+      "name": "welcome-unknown-capability",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "welcome",
+        "requestId": "w1",
+        "desktopVersion": "1.0.0",
+        "protocol": 1,
+        "capabilities": [
+          "plugins"
+        ]
+      }
+    },
+    {
+      "name": "close-unknown-reason",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "close",
+        "requestId": "x1",
+        "reason": "bored"
+      }
+    },
+    {
+      "name": "transfer-too-large",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "transferStart",
+        "requestId": "t1",
+        "transferId": 7,
+        "name": "synthetic.dxf",
+        "mediaType": "image/vnd.dxf",
+        "byteLength": 52428801,
+        "sha256": "cde1143fc29e8d7e1bd0e46e84cd4697a8272e2988bcf29f31d09ee920ed5201"
+      }
+    },
+    {
+      "name": "transfer-json-over-8mib",
+      "direction": "webToDesktop",
+      "layer": "semantic",
+      "message": {
+        "type": "transferStart",
+        "requestId": "t1",
+        "transferId": 7,
+        "name": "synthetic.dxf",
+        "mediaType": "application/vnd.secureplan.overlay+json",
+        "byteLength": 8388609,
+        "sha256": "cde1143fc29e8d7e1bd0e46e84cd4697a8272e2988bcf29f31d09ee920ed5201"
+      }
+    },
+    {
+      "name": "transfer-name-path",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "transferStart",
+        "requestId": "t1",
+        "transferId": 7,
+        "name": "../secrets.dxf",
+        "mediaType": "image/vnd.dxf",
+        "byteLength": 13,
+        "sha256": "cde1143fc29e8d7e1bd0e46e84cd4697a8272e2988bcf29f31d09ee920ed5201"
+      }
+    },
+    {
+      "name": "transfer-unknown-media",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "transferStart",
+        "requestId": "t1",
+        "transferId": 7,
+        "name": "synthetic.dxf",
+        "mediaType": "application/zip",
+        "byteLength": 13,
+        "sha256": "cde1143fc29e8d7e1bd0e46e84cd4697a8272e2988bcf29f31d09ee920ed5201"
+      }
+    },
+    {
+      "name": "transfer-id-zero",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "transferStart",
+        "requestId": "t1",
+        "transferId": 0,
+        "name": "synthetic.dxf",
+        "mediaType": "image/vnd.dxf",
+        "byteLength": 13,
+        "sha256": "cde1143fc29e8d7e1bd0e46e84cd4697a8272e2988bcf29f31d09ee920ed5201"
+      }
+    },
+    {
+      "name": "sha-uppercase",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "transferStart",
+        "requestId": "t1",
+        "transferId": 7,
+        "name": "synthetic.dxf",
+        "mediaType": "image/vnd.dxf",
+        "byteLength": 13,
+        "sha256": "CDE1143FC29E8D7E1BD0E46E84CD4697A8272E2988BCF29F31D09EE920ED5201"
+      }
+    },
+    {
+      "name": "openSession-lease-field",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "edit",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
+        "overlayTransferId": 4,
+        "leaseToken": "never"
+      }
+    },
+    {
+      "name": "openSession-nested-extra",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "edit",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0,
+            "skew": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
+        "overlayTransferId": 4
+      }
+    },
+    {
+      "name": "openSession-bad-intent",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "admin",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
+        "overlayTransferId": 4
+      }
+    },
+    {
+      "name": "placement-side-over-limit",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "edit",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 14401,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
+        "overlayTransferId": 4
+      }
+    },
+    {
+      "name": "placement-area-over-limit",
+      "direction": "webToDesktop",
+      "layer": "semantic",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "edit",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 14400,
+          "heightPt": 14400,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 30000
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
+        "overlayTransferId": 4
+      }
+    },
+    {
+      "name": "placement-height-inconsistent",
+      "direction": "webToDesktop",
+      "layer": "semantic",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "edit",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18017.999999999996
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
+        "overlayTransferId": 4
+      }
+    },
+    {
+      "name": "planUpdate-base-uppercase-none",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "planUpdate",
+        "requestId": "plan-1",
+        "reason": "removed",
+        "cadPlan": null,
+        "placement": null,
+        "baseIdentity": "NONE",
+        "drawingTransferId": null
+      }
+    },
+    {
+      "name": "sessionState-progress-over-one",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "sessionState",
+        "requestId": "state-1",
+        "dirty": true,
+        "activeView": null,
+        "busy": {
+          "operation": "apply",
+          "progress": 1.5
+        },
+        "error": null
+      }
+    },
+    {
+      "name": "applyRequest-short-commit",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "applyRequest",
+        "requestId": "apply-1",
+        "baseIdentity": "none",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
+        "realigned": false,
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "roundingBoundMm": 0.0009765625,
+        "chordToleranceMm": 0.0990234375,
+        "drawing": {
+          "transferId": 11,
+          "formatVersion": "AC1027"
+        },
+        "original": {
+          "transferId": 12,
+          "formatVersion": "AC1027"
+        },
+        "pdfTransferId": 13,
+        "snapTransferId": 14,
+        "desktopVersion": "1.0.0",
+        "forkCommit": "0d023d2"
+      }
+    },
+    {
+      "name": "applyRequest-scale-zero",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "applyRequest",
+        "requestId": "apply-1",
+        "baseIdentity": "none",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 0,
+          "quarterTurns": 0
+        },
+        "realigned": false,
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "roundingBoundMm": 0.0009765625,
+        "chordToleranceMm": 0.0990234375,
+        "drawing": {
+          "transferId": 11,
+          "formatVersion": "AC1027"
+        },
+        "original": {
+          "transferId": 12,
+          "formatVersion": "AC1027"
+        },
+        "pdfTransferId": 13,
+        "snapTransferId": 14,
+        "desktopVersion": "1.0.0",
+        "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+      }
+    },
+    {
+      "name": "applyRequest-quarter-turn-4",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "applyRequest",
+        "requestId": "apply-1",
+        "baseIdentity": "none",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 4
+        },
+        "realigned": false,
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "roundingBoundMm": 0.0009765625,
+        "chordToleranceMm": 0.0990234375,
+        "drawing": {
+          "transferId": 11,
+          "formatVersion": "AC1027"
+        },
+        "original": {
+          "transferId": 12,
+          "formatVersion": "AC1027"
+        },
+        "pdfTransferId": 13,
+        "snapTransferId": 14,
+        "desktopVersion": "1.0.0",
+        "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+      }
+    },
+    {
+      "name": "applyRequest-viewport-handle-long",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "applyRequest",
+        "requestId": "apply-1",
+        "baseIdentity": "none",
+        "view": {
+          "kind": "layout",
+          "layoutName": "Sheet A1",
+          "viewportHandle": "0123456789ABCDEF0"
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
+        "realigned": false,
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "roundingBoundMm": 0.0009765625,
+        "chordToleranceMm": 0.0990234375,
+        "drawing": {
+          "transferId": 11,
+          "formatVersion": "AC1027"
+        },
+        "original": {
+          "transferId": 12,
+          "formatVersion": "AC1027"
+        },
+        "pdfTransferId": 13,
+        "snapTransferId": 14,
+        "desktopVersion": "1.0.0",
+        "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+      }
+    },
+    {
+      "name": "applyRequest-chord-below-floor",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "applyRequest",
+        "requestId": "apply-1",
+        "baseIdentity": "none",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
+        "realigned": false,
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "roundingBoundMm": 0.0009765625,
+        "chordToleranceMm": 0.001,
+        "drawing": {
+          "transferId": 11,
+          "formatVersion": "AC1027"
+        },
+        "original": {
+          "transferId": 12,
+          "formatVersion": "AC1027"
+        },
+        "pdfTransferId": 13,
+        "snapTransferId": 14,
+        "desktopVersion": "1.0.0",
+        "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+      }
+    },
+    {
+      "name": "applyResult-mixed",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "applyResult",
+        "requestId": "apply-1",
+        "status": "committed",
+        "planVersion": 1,
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "code": "QUOTA"
+      }
+    },
+    {
+      "name": "applyResult-unknown-code",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "applyResult",
+        "requestId": "apply-1",
+        "status": "error",
+        "code": "TEAPOT",
+        "detail": null
+      }
+    },
+    {
+      "name": "convertRequest-route-one-point",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "convertRequest",
+        "requestId": "conv-1",
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "candidates": {
+          "kind": "route",
+          "points": [
+            [
+              0,
+              0
+            ]
+          ],
+          "rejected": []
+        }
+      }
+    },
+    {
+      "name": "convertRequest-base-none",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "convertRequest",
+        "requestId": "conv-1",
+        "baseIdentity": "none",
+        "candidates": {
+          "kind": "route",
+          "points": [
+            [
+              0,
+              0
+            ],
+            [
+              2000,
+              0
+            ],
+            [
+              2000,
+              1500
+            ]
+          ],
+          "rejected": []
+        }
+      }
+    },
+    {
+      "name": "convertRequest-coordinate-out-of-range",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "convertRequest",
+        "requestId": "conv-1",
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "candidates": {
+          "kind": "walls",
+          "walls": [
+            {
+              "start": [
+                0,
+                0
+              ],
+              "end": [
+                20000000,
+                0
+              ]
+            }
+          ],
+          "rejected": []
+        }
+      }
+    },
+    {
+      "name": "exportResult-path-name",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "exportResult",
+        "requestId": "exp-1",
+        "status": "written",
+        "fileName": "C:\\Users\\x\\plan.dwg",
+        "format": "dwg",
+        "formatVersion": "AC1032"
+      }
+    },
+    {
+      "name": "exportResult-with-bytes",
+      "direction": "desktopToWeb",
+      "layer": "schema",
+      "message": {
+        "type": "exportResult",
+        "requestId": "exp-1",
+        "status": "written",
+        "fileName": "plan.dwg",
+        "format": "dwg",
+        "formatVersion": "AC1032",
+        "bytes": "AAAA"
+      }
+    }
+  ]
+}

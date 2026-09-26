@@ -4,3 +4,8 @@
 # Binary files must never be line-ending normalized.
 *.png binary
 *.ttf binary
+
+# SecurePlan protocol vectors are hashed byte-for-byte; never normalise them.
+secureplan-vectors/** -text
+# Windows registry files are read by regedit with CRLF line endings.
+packaging/dev/*.reg text eol=crlf

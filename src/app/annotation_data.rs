@@ -69,15 +69,23 @@ fn link_display_name(link: &DataLink) -> String {
 
 fn resolve_link_path(doc: &CadDocument, link: &DataLink) -> PathBuf {
     let stored = PathBuf::from(&link.connection_string);
-    if stored.is_absolute() || link.path_option == 1 {
-        return stored;
+    let resolved = if stored.is_absolute() || link.path_option == 1 {
+        stored
+    } else {
+        doc.source_path
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::parent)
+            .map(|parent| parent.join(&stored))
+            .unwrap_or(stored)
+    };
+    // A link to another computer resolves to nothing, so it is never
+    // stat'ed, read or written (DSK-02).
+    if crate::io::path_is_local(&resolved) {
+        resolved
+    } else {
+        PathBuf::new()
     }
-    doc.source_path
-        .as_deref()
-        .map(Path::new)
-        .and_then(Path::parent)
-        .map(|parent| parent.join(&stored))
-        .unwrap_or(stored)
 }
 
 fn data_link_choices(doc: &CadDocument) -> Vec<DataLinkChoice> {

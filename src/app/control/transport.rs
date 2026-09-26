@@ -13,6 +13,10 @@ use std::{
 };
 
 pub(in crate::app) fn subscribe() -> iced::Subscription<Envelope> {
+    // SecurePlan CAD runs no GUI-control listener (DSK-02).
+    if cfg!(feature = "secureplan") {
+        return iced::Subscription::none();
+    }
     iced::Subscription::run(worker)
 }
 
@@ -28,6 +32,12 @@ fn worker() -> impl Stream<Item = Envelope> {
 }
 
 fn listen(sender: mpsc::Sender<Envelope>) -> std::io::Result<()> {
+    // SecurePlan CAD runs no GUI-control listener and writes no token file.
+    if cfg!(feature = "secureplan") {
+        return Err(std::io::Error::other(
+            "The automation listener is disabled in SecurePlan CAD.",
+        ));
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let dir = crate::config::config_dir()
         .ok_or_else(|| std::io::Error::other("No user directory"))?
@@ -101,4 +111,21 @@ fn listen(sender: mpsc::Sender<Envelope>) -> std::io::Result<()> {
     }
     let _ = std::fs::remove_file(path);
     Ok(())
+}
+
+#[cfg(all(test, feature = "secureplan"))]
+mod secureplan_tests {
+    use super::*;
+
+    #[test]
+    fn no_listener_and_no_token_file() {
+        let descriptor = crate::config::config_dir()
+            .map(|dir| dir.join("automation").join(format!("{}.json", session_id())));
+        let (sender, _receiver) = mpsc::channel(1);
+        assert!(listen(sender).is_err(), "the GUI-control listener started");
+        assert!(
+            descriptor.is_none_or(|path| !path.exists()),
+            "a GUI-control token file was written"
+        );
+    }
 }
