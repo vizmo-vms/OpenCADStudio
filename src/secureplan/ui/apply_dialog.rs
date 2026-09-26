@@ -21,6 +21,8 @@ const X0: usize = 0;
 const Y0: usize = 1;
 const X1: usize = 2;
 const Y1: usize = 3;
+/// "Publish without N damaged items", shown only when the reader dropped some.
+const ACKNOWLEDGE: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct ApplyDialog {
@@ -57,12 +59,17 @@ impl ApplyDialog {
         let default_window = crate::app::secureplan::publish::default_window(extents);
         let default_window = if empty_survey { default_window } else { trim_margin_to_canvas(default_window, extents, &alignment.mapping) };
         let [x0, y0, x1, y1] = default_window;
-        let fields = vec![
+        let mut fields = vec![
             Field::number("Window left (CAD X)", x0),
             Field::number("Window bottom (CAD Y)", y0),
             Field::number("Window right (CAD X)", x1),
             Field::number("Window top (CAD Y)", y1),
         ];
+        // Damaged items the reader dropped: the user acknowledges publishing
+        // without them, every time (unticked by default).
+        if snapshot.lost_entities > 0 {
+            fields.push(Field::choice("Publish without the damaged items", vec!["No".into(), "Yes".into()], 0));
+        }
         let buttons = vec![
             ("Apply to SecurePlan".to_string(), Action::ApplyConfirm),
             ("Reset window".to_string(), Action::ApplyReset),
@@ -79,6 +86,13 @@ impl ApplyDialog {
             realigned,
             plan_version,
             origin: Default::default(),
+        }
+    }
+
+    /// Tick "Publish without N damaged items" (the stdin driver's flag).
+    pub fn acknowledge_damaged(&mut self) {
+        if self.snapshot.lost_entities > 0 && self.form.selected(ACKNOWLEDGE) == 0 {
+            self.form.cycle(ACKNOWLEDGE, true);
         }
     }
 
@@ -115,7 +129,11 @@ impl ApplyDialog {
         let mm_per_pt = choose_mm_per_pt(window, &mapping).map_err(|_| "The window is too large or too small to publish.".to_string())?;
         let placement = place_page(window, &mapping, mm_per_pt).map_err(|_| "The window is too large to publish.".to_string())?;
         check_placement(&placement).map_err(|block| block.to_string())?;
-        Ok(ApplyPlan { window_cad: window, mapping, mm_per_pt })
+        let damaged_acknowledged = self.snapshot.lost_entities == 0 || self.form.selected(ACKNOWLEDGE) == 1;
+        if !damaged_acknowledged {
+            return Err(format!("Choose Yes for \"Publish without {} damaged items\" to apply.", self.snapshot.lost_entities));
+        }
+        Ok(ApplyPlan { window_cad: window, mapping, mm_per_pt, damaged_acknowledged })
     }
 
     pub fn summary(&self) -> Vec<String> {
@@ -152,6 +170,12 @@ impl ApplyDialog {
         if self.snapshot.modified {
             lines.push("The drawing has edits: it is written in its original format and version.".into());
         }
+        if self.snapshot.lost_entities > 0 {
+            lines.push(format!(
+                "{} damaged items could not be read: they are not in the published plan. The original drawing is stored unchanged.",
+                self.snapshot.lost_entities
+            ));
+        }
         lines
     }
 }
@@ -186,6 +210,19 @@ mod tests {
         let extents = [0.0, 0.0, 30000.0, 18000.0];
         let alignment = Alignment { units: Units::Mm, mapping: mapping_at(extents, 1.0, 0, anchor) };
         ApplyDialog::new(1, snapshot, 0, extents, alignment, empty, false, None)
+    }
+
+    #[test]
+    fn damaged_items_need_a_keyboard_acknowledgement_on_every_apply() {
+        let base = dialog(true, [0.0, 0.0]);
+        let snapshot = Snapshot { lost_entities: 3, ..(*base.snapshot).clone() };
+        let mut dialog = ApplyDialog::new(1, Arc::new(snapshot), 0, [0.0, 0.0, 30000.0, 18000.0], base.alignment, true, false, None);
+        assert_eq!(dialog.plan().unwrap_err(), "Choose Yes for \"Publish without 3 damaged items\" to apply.");
+        dialog.form.focus = ACKNOWLEDGE;
+        dialog.form.key(DialogKey::Right);
+        let plan = dialog.plan().unwrap();
+        assert!(plan.damaged_acknowledged);
+        assert!(dialog.summary().iter().any(|l| l.starts_with("3 damaged items")));
     }
 
     #[test]

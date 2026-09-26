@@ -14,8 +14,10 @@
 //!   [origin=<x>,<y>] [anchor=<x>,<y>]`: set the alignment. `scale` (with no
 //!   `units`) is a calibration. On an empty survey the page goes to the
 //!   origin and `origin`/`anchor` are ignored.
-//! - `apply [window=<x0>,<y0>,<x1>,<y1>]`: Apply with the default window (the
-//!   visible extents plus 2%), or the given one, without the dialog.
+//! - `apply [window=<x0>,<y0>,<x1>,<y1>] [damaged=publish]`: Apply with the
+//!   default window (the visible extents plus 2%), or the given one, without
+//!   the dialog. `damaged=publish` ticks "Publish without N damaged items",
+//!   which a drawing with damaged items needs on every Apply.
 //! - `status`: print the state of the most recently opened drawing.
 //!
 //! Outcomes arrive later as `secureplan-test: event <name> [detail]` lines:
@@ -45,7 +47,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub enum Command {
     Import(PathBuf),
     Align { units: Option<Units>, scale: Option<f64>, turns: u8, origin: Option<[f64; 2]>, anchor: Option<[f64; 2]> },
-    Apply { window: Option<[f64; 4]> },
+    Apply { window: Option<[f64; 4]>, publish_damaged: bool },
     Status,
 }
 
@@ -131,14 +133,15 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Align { units, scale, turns, origin, anchor })
         }
         "apply" => {
-            let mut window_cad = None;
+            let (mut window_cad, mut publish_damaged) = (None, false);
             for option in options() {
                 match option? {
                     ("window", value) => window_cad = Some(window(value).ok_or("bad window")?),
+                    ("damaged", "publish") => publish_damaged = true,
                     (other, _) => return Err(format!("unknown option {other}")),
                 }
             }
-            Ok(Command::Apply { window: window_cad })
+            Ok(Command::Apply { window: window_cad, publish_damaged })
         }
         "status" if rest.is_empty() => Ok(Command::Status),
         _ => Err("unknown command".into()),
@@ -183,10 +186,13 @@ impl OpenCADStudio {
             Command::Status => {
                 let bound = self.secureplan.sessions.by_tab(tab_id).expect("found above");
                 let detail = format!(
-                    "connected={} mode={} dirty={} aligned={} base={} plan={} busy={}",
+                    "connected={} mode={} dirty={} modified={} original-pending={} damaged={} aligned={} base={} plan={} busy={}",
                     bound.connected(),
                     if bound.mode == super::session::Mode::Edit { "edit" } else { "view" },
                     self.secureplan_has_unapplied(index),
+                    self.secureplan_modified(index),
+                    bound.pending_original.is_some(),
+                    bound.lost_entities,
                     bound.alignment.is_some(),
                     bound.base_identity.chars().take(12).collect::<String>(),
                     bound.plan_version.map_or("none".to_string(), |v| v.to_string()),
@@ -227,8 +233,11 @@ impl OpenCADStudio {
                 self.secureplan_set_alignment(tab_id, Alignment { units, mapping });
                 Task::none()
             }
-            Command::Apply { window } => {
-                if let Err(reason) = self.secureplan_can_edit_survey() {
+            Command::Apply { window, publish_damaged } => {
+                let allowed = self.secureplan_can_edit_survey().and_then(|()| {
+                    self.secureplan.sessions.by_tab(tab_id).map_or(Ok(()), super::session::apply_allowed)
+                });
+                if let Err(reason) = allowed {
                     event("error", &reason);
                     return Task::none();
                 }
@@ -241,6 +250,9 @@ impl OpenCADStudio {
                     for (field, value) in window.into_iter().enumerate() {
                         dialog.form.set_number(field, value);
                     }
+                }
+                if publish_damaged {
+                    dialog.acknowledge_damaged();
                 }
                 match dialog.plan() {
                     Ok(plan) => self.secureplan_build_apply(dialog, plan),
@@ -294,8 +306,9 @@ mod tests {
             Ok(Command::Align { units: Some(Units::Ft), scale: None, turns: 1, origin: None, anchor: Some([100.0, 200.0]) })
         );
         assert_eq!(parse("align scale=20"), Ok(Command::Align { units: None, scale: Some(20.0), turns: 0, origin: None, anchor: None }));
-        assert_eq!(parse("apply"), Ok(Command::Apply { window: None }));
-        assert_eq!(parse("apply window=0,0,100,50"), Ok(Command::Apply { window: Some([0.0, 0.0, 100.0, 50.0]) }));
+        assert_eq!(parse("apply"), Ok(Command::Apply { window: None, publish_damaged: false }));
+        assert_eq!(parse("apply window=0,0,100,50"), Ok(Command::Apply { window: Some([0.0, 0.0, 100.0, 50.0]), publish_damaged: false }));
+        assert_eq!(parse("apply damaged=publish"), Ok(Command::Apply { window: None, publish_damaged: true }));
         assert_eq!(parse("status"), Ok(Command::Status));
         for bad in ["align", "align units=furlong", "align units=mm turns=4", "apply window=1,2,3", "import", "status now"] {
             assert!(parse(bad).is_err(), "{bad}");

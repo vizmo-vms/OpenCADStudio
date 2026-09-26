@@ -376,6 +376,14 @@ pub fn clear_image_cache() {
     }
 }
 
+#[cfg(all(test, feature = "secureplan"))]
+pub(crate) mod tests {
+    /// Whether `path` was ever resolved (read or tried) in this process.
+    pub(crate) fn cached(path: &str) -> bool {
+        super::image_cache().lock().unwrap_or_else(|e| e.into_inner()).contains_key(path.trim())
+    }
+}
+
 /// Resolve an image reference to decoded pixels, memoised per path. Handles a
 /// local file and — on native builds — an `http`/`https` URL. Returns `None`
 /// for anything that can't be shown (missing file, offline, decode error, or a

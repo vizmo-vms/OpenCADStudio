@@ -105,6 +105,19 @@ pub struct State {
     /// Per bound tab, the load or import whose result is awaited; any other
     /// result for that tab is dropped.
     pub load_jobs: std::collections::HashMap<u64, u64>,
+    /// Per bound tab: whether a parser worker is running, and the latest
+    /// load waiting for it (older waiting loads are dropped unstarted).
+    pub loads_running: std::collections::HashSet<u64>,
+    pub loads_pending: std::collections::HashMap<u64, super::import::PendingLoad>,
+    /// Worker jobs (parses, Apply builds) still running. While any runs,
+    /// external references stay refused even if every bound tab closed.
+    pub workers: usize,
+    /// How long a message may wait for a transfer before the session is
+    /// ended (tests shorten it).
+    pub transfer_wait: Duration,
+    /// Unit tests stand in for the import file picker with this file.
+    #[cfg(test)]
+    pub test_pick: Option<PathBuf>,
     /// Unit tests can hold worker jobs to interleave their completions.
     #[cfg(test)]
     pub held_jobs: Option<HeldJobs>,
@@ -135,6 +148,12 @@ impl Default for State {
             overlay_visible: true,
             next_job: 0,
             load_jobs: Default::default(),
+            loads_running: Default::default(),
+            loads_pending: Default::default(),
+            workers: 0,
+            transfer_wait: super::session::TRANSFER_WAIT,
+            #[cfg(test)]
+            test_pick: None,
             #[cfg(test)]
             held_jobs: None,
             notice: None,
@@ -342,12 +361,26 @@ impl OpenCADStudio {
                 if let Some(notice) = self.secureplan.notice.take() {
                     self.command_line.push_info(&notice);
                 }
+                self.secureplan_expire_waiting();
                 self.secureplan_report_states();
                 Task::none()
             }
-            Msg::Loaded(done) => self.secureplan_loaded(done),
-            Msg::ApplyBuilt(built) => self.secureplan_apply_built(built),
-            Msg::ImportPicked(tab_id, Some(path)) => self.secureplan_import_path(tab_id, path.expose()),
+            Msg::Loaded(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_loaded(done)
+            }
+            Msg::ApplyBuilt(built) => {
+                self.secureplan_worker_done();
+                self.secureplan_apply_built(built)
+            }
+            Msg::ImportPicked(tab_id, Some(path)) => {
+                // The tab the picker was opened for, if it may still import.
+                if let Err(reason) = self.secureplan_can_edit_tab(tab_id) {
+                    self.command_line.push_error(&reason);
+                    return Task::none();
+                }
+                self.secureplan_import_path(tab_id, path.expose())
+            }
             Msg::ImportPicked(_, None) => Task::none(),
             #[cfg(feature = "secureplan-test")]
             Msg::Driver(command) => self.secureplan_driver(command),
@@ -566,7 +599,7 @@ impl OpenCADStudio {
         if self.secureplan_dialog_open() {
             subscriptions.push(iced::event::listen_with(dialog_key));
         }
-        if !self.secureplan.sessions.bound.is_empty() || self.secureplan.notice.is_some() {
+        if !self.secureplan.sessions.bound.is_empty() || self.secureplan.notice.is_some() || !self.secureplan.sessions.deferred.is_empty() {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::SecurePlan(Msg::Tick)));
         }
         Subscription::batch(subscriptions)
@@ -599,6 +632,9 @@ impl OpenCADStudio {
     where
         F: FnOnce() -> Msg + Send + 'static,
     {
+        // References stay refused for the worker's whole life (DSK-02).
+        self.secureplan.workers += 1;
+        self.secureplan_refresh_guards();
         #[cfg(test)]
         {
             if let Some(held) = self.secureplan.held_jobs.as_mut() {
@@ -621,6 +657,13 @@ impl OpenCADStudio {
         }
     }
 
+    /// A worker finished: references may be allowed again if nothing else
+    /// needs them refused.
+    fn secureplan_worker_done(&mut self) {
+        self.secureplan.workers = self.secureplan.workers.saturating_sub(1);
+        self.secureplan_refresh_guards();
+    }
+
     /// Keep a form dialog's derived state in step with its fields.
     fn secureplan_refresh_dialog(&mut self) {
         if let Some(Dialog::Align(dialog)) = self.secureplan.dialog.as_mut() {
@@ -635,9 +678,11 @@ impl OpenCADStudio {
         if !keeps_dialog {
             self.secureplan.dialog = None;
         }
-        // Anything but Discard or Keep in the close prompt stops a quit.
+        // Anything but Discard or Keep in the close prompt stops a quit and
+        // abandons a Close All.
         if !matches!(action, Action::CloseDiscard(_) | Action::CloseKeep(_)) {
             self.secureplan.quitting = false;
+            self.pending_tab_closes.clear();
         }
         match action {
             Action::Dismiss => Task::none(),
@@ -666,6 +711,7 @@ impl OpenCADStudio {
                 } else {
                     // Nothing closes without its copy.
                     self.secureplan.quitting = false;
+                    self.pending_tab_closes.clear();
                     self.secureplan.dialog = Some(Dialog::notice(
                         "Not closed",
                         vec!["The recovery copy could not be saved, so the drawing stays open with your edits.".into()],
@@ -763,7 +809,7 @@ impl OpenCADStudio {
                 buttons.push(("Close".to_string(), Action::Dismiss));
                 self.secureplan.dialog = Some(Dialog::choice("SecurePlan", vec!["Choose a SecurePlan action.".to_string()], buttons));
             }
-            "SECUREPLANIMPORT" => return Some(self.secureplan_start_import()),
+            "SECUREPLANIMPORT" => return Some(self.secureplan_start_import(self.tabs[self.active_tab].id)),
             "SECUREPLANALIGN" => self.secureplan_open_align(false),
             "SECUREPLANAPPLY" => return Some(self.secureplan_begin_apply()),
             "SECUREPLANOVERLAY" => {
@@ -801,9 +847,12 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         app.automation_op(r#"{"op":"new"}"#);
         app.secureplan.settings = Settings::default();
+        // Each test its own settings folder: they run in parallel.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
         app.secureplan.settings_path = Some(
             std::env::temp_dir()
-                .join(format!("secureplan_hooks_{}_{}", std::process::id(), line!()))
+                .join(format!("secureplan_hooks_{}_{n}", std::process::id()))
                 .join("secureplan.json"),
         );
         app

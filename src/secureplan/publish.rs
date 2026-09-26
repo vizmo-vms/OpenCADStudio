@@ -620,6 +620,8 @@ pub struct ApplyPlan {
     pub window_cad: [f64; 4],
     pub mapping: Mapping,
     pub mm_per_pt: f64,
+    /// The user ticked "Publish without N damaged items" for this Apply.
+    pub damaged_acknowledged: bool,
 }
 
 impl ApplyPlan {
@@ -638,8 +640,9 @@ pub struct Snapshot {
     pub loaded: Option<super::session::Drawing>,
     pub modified: bool,
     pub pending_original: Option<super::session::Drawing>,
-    /// Corrupt entities the reader dropped from the loaded drawing: writing
-    /// the drawing would lose them (PUB-04 known loss).
+    /// Damaged items the reader dropped from the loaded drawing. They are
+    /// not in the published PDF and snap file (nor in a written drawing), so
+    /// every Apply needs the user's acknowledgement (PUB-01, PUB-04).
     pub lost_entities: usize,
 }
 
@@ -653,6 +656,8 @@ impl std::fmt::Debug for Snapshot {
 #[derive(Debug, Clone)]
 pub struct ApplyOutputs {
     pub drawing: super::session::Drawing,
+    /// The drawing is the writer's output, not the verbatim loaded bytes.
+    pub written: bool,
     pub original: Option<super::session::Drawing>,
     pub pdf: Vec<u8>,
     pub snap: Vec<u8>,
@@ -679,7 +684,16 @@ impl ApplyError {
 pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutputs, ApplyError> {
     use super::session::{Drawing, ErrorCode, Format};
     let transform = plan.transform().map_err(|error| ApplyError::new(ErrorCode::Internal, format!("The published page does not fit: {error:?}.")))?;
+    // Damaged items the reader dropped are published only with the user's
+    // acknowledgement, every time, edited or not.
+    if snapshot.lost_entities > 0 && !plan.damaged_acknowledged {
+        return Err(ApplyError::new(
+            ErrorCode::KnownLoss,
+            format!("Tick \"Publish without {} damaged items\" to apply this drawing.", snapshot.lost_entities),
+        ));
+    }
 
+    let written = snapshot.modified || snapshot.loaded.is_none();
     let drawing = match (&snapshot.loaded, snapshot.modified) {
         (Some(loaded), false) => loaded.clone(),
         (loaded, _) => {
@@ -687,15 +701,6 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
                 Some(loaded) => (loaded.format, loaded.version(), loaded.name.expose().clone()),
                 None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
             };
-            if snapshot.lost_entities > 0 {
-                return Err(ApplyError::new(
-                    ErrorCode::KnownLoss,
-                    format!(
-                        "{} damaged entit(ies) of the drawing could not be read, so writing the edited drawing would lose them. Repair the drawing in its source application, then import it again.",
-                        snapshot.lost_entities
-                    ),
-                ));
-            }
             let is_dxf = format == Format::Dxf;
             let dropped = crate::io::dropped_on_save_count(&snapshot.document, version, is_dxf);
             if dropped > 0 {
@@ -725,7 +730,7 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
     let pdf = model_pdf(&publication).map_err(|_| ApplyError::new(ErrorCode::WriterError, "The published PDF could not be written."))?;
     let snap = model_snap(&publication);
 
-    let outputs = ApplyOutputs { drawing, original: snapshot.pending_original.clone(), pdf: pdf.bytes, snap, transform, omitted_images: pdf.omitted_images };
+    let outputs = ApplyOutputs { drawing, written, original: snapshot.pending_original.clone(), pdf: pdf.bytes, snap, transform, omitted_images: pdf.omitted_images };
     let sizes = [
         ("drawing", outputs.drawing.bytes.len()),
         ("original drawing", outputs.original.as_ref().map_or(0, |o| o.bytes.len())),

@@ -62,6 +62,50 @@ struct Meta {
     saved_unix: u64,
     drawing: FileMeta,
     original: Option<FileMeta>,
+    /// Damaged items the reader had dropped from the drawing (they stay
+    /// dropped in this copy, and publishing still needs acknowledgement).
+    #[serde(default)]
+    lost_entities: usize,
+    /// The alignment the work was made with; `None` means align again.
+    #[serde(default)]
+    alignment: Option<StoredAlignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAlignment {
+    units: String,
+    cad_origin: [f64; 2],
+    anchor_mm: [f64; 2],
+    scale_mm_per_cad_unit: f64,
+    quarter_turns: u8,
+}
+
+impl StoredAlignment {
+    fn of(alignment: &super::align::Alignment) -> Self {
+        let m = &alignment.mapping;
+        Self {
+            units: alignment.units.as_str().into(),
+            cad_origin: m.cad_origin,
+            anchor_mm: m.anchor_mm,
+            scale_mm_per_cad_unit: m.scale_mm_per_cad_unit,
+            quarter_turns: m.quarter_turns,
+        }
+    }
+
+    fn alignment(&self) -> Option<super::align::Alignment> {
+        let finite = |v: &[f64; 2]| v.iter().all(|x| x.is_finite());
+        (finite(&self.cad_origin) && finite(&self.anchor_mm) && self.scale_mm_per_cad_unit > 0.0 && self.quarter_turns < 4).then_some(())?;
+        Some(super::align::Alignment {
+            units: super::align::Units::parse(&self.units)?,
+            mapping: super::publish::Mapping {
+                cad_origin: self.cad_origin,
+                anchor_mm: self.anchor_mm,
+                scale_mm_per_cad_unit: self.scale_mm_per_cad_unit,
+                quarter_turns: self.quarter_turns,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +142,9 @@ pub struct Entry {
     pub saved: SystemTime,
     pub drawing: Drawing,
     pub original: Option<Drawing>,
+    /// Damaged items the reader had dropped (see [`Meta`]).
+    pub lost_entities: usize,
+    pub alignment: Option<super::align::Alignment>,
 }
 
 /// The recovery folder.
@@ -146,6 +193,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
+    #[cfg(test)]
+    if let Some(cut) = tests::CRASH_AFTER.with(|c| c.take()) {
+        // A crash part-way through writing (tests only).
+        file.write_all(&bytes[..cut.min(bytes.len())])?;
+        return Err(std::io::Error::other("simulated crash"));
+    }
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
@@ -176,6 +229,8 @@ impl Store {
             saved_unix: unix(entry.saved),
             drawing: FileMeta::of(&entry.drawing),
             original: entry.original.as_ref().map(FileMeta::of),
+            lost_entities: entry.lost_entities,
+            alignment: entry.alignment.as_ref().map(StoredAlignment::of),
         };
         let meta = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         let mut bytes = Vec::with_capacity(MAGIC.len() + 12 + meta.len() + entry.drawing.bytes.len());
@@ -215,6 +270,8 @@ impl Store {
             saved: UNIX_EPOCH + Duration::from_secs(meta.saved_unix),
             drawing,
             original,
+            lost_entities: meta.lost_entities,
+            alignment: meta.alignment.as_ref().and_then(StoredAlignment::alignment),
         })
     }
 
@@ -262,11 +319,18 @@ impl crate::app::OpenCADStudio {
                     None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
                 };
                 let document = &tab.scene.document;
+                // A copy that would drop content is no copy: the caller
+                // reports the preservation as failed.
+                let lossless = |format: Format, version| crate::io::dropped_on_save_count(document, version, format == Format::Dxf) == 0;
                 // A copy that cannot be written in the drawing's own format is
                 // kept as DXF rather than lost.
-                let (format, bytes) = match crate::io::save_to_bytes(document, format.ext(), version) {
-                    Ok(bytes) => (format, bytes),
-                    Err(_) => (Format::Dxf, crate::io::save_to_bytes(document, "dxf", acadrust::DxfVersion::AC1032).ok()?),
+                let written = lossless(format, version).then(|| crate::io::save_to_bytes(document, format.ext(), version).ok()).flatten();
+                let (format, bytes) = match written {
+                    Some(bytes) => (format, bytes),
+                    None if lossless(Format::Dxf, acadrust::DxfVersion::AC1032) => {
+                        (Format::Dxf, crate::io::save_to_bytes(document, "dxf", acadrust::DxfVersion::AC1032).ok()?)
+                    }
+                    None => return None,
                 };
                 let version = if format == Format::Dwg { version.as_str().to_string() } else { document.version.as_str().to_string() };
                 Drawing { bytes: Arc::new(bytes), name: name.into(), format, format_version: version }
@@ -280,6 +344,8 @@ impl crate::app::OpenCADStudio {
             saved: SystemTime::now(),
             drawing,
             original: bound.pending_original.clone(),
+            lost_entities: bound.lost_entities,
+            alignment: bound.alignment,
         })
     }
 
@@ -374,14 +440,17 @@ impl crate::app::OpenCADStudio {
         // version; nothing of it is in SecurePlan yet (`recovered_base`).
         self.secureplan_install(index, document, Some(entry.drawing.clone()));
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
-            bound.lost_entities = report.lost_entities;
+            // Items dropped when the work began stay dropped in the copy.
+            bound.lost_entities = entry.lost_entities.max(report.lost_entities);
+            // The alignment the work was made with, never the current plan's
+            // for another drawing; without one, align again. A different
+            // mapping from the stored one is disclosed as a re-alignment.
+            let before = bound.alignment;
+            bound.alignment = entry.alignment;
+            bound.realigned = bound.has_plan && bound.alignment.is_some() && bound.alignment != before;
             bound.replace_confirmed = entry.base_identity != bound.base_identity;
             bound.recovered_base = Some(entry.base_identity);
             bound.pending_original = entry.original;
-            // The mapping of an unapplied import is chosen again.
-            if bound.pending_original.is_some() {
-                bound.alignment = None;
-            }
         }
         self.command_line.push_info("SecurePlan: recovered edits restored. Apply them to send them to SecurePlan.");
     }
@@ -396,6 +465,11 @@ impl crate::app::OpenCADStudio {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// Makes the next private write stop after this many bytes, as a crash would.
+        pub(crate) static CRASH_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
 
     pub(crate) fn temp_store(tag: &str) -> Store {
         Store::at(std::env::temp_dir().join(format!("secureplan_recovery_{tag}_{}", std::process::id())).join("recovery"))
@@ -414,6 +488,8 @@ pub(crate) mod tests {
             saved: SystemTime::now(),
             drawing: drawing(b"0\nSECTION\n"),
             original: Some(drawing(b"original bytes")),
+            lost_entities: 0,
+            alignment: None,
         }
     }
 
@@ -452,26 +528,25 @@ pub(crate) mod tests {
         let store = temp_store("atomic");
         let first = entry("https://a.example", "11111111-1111-4111-8111-111111111111", "none");
         store.save(&first).unwrap();
-        let dir = store.dir(&first.origin, &first.survey).unwrap();
-        // A second save that died after writing part of its new generation:
-        // its temporary file holds a newer drawing and no original yet.
         let mut second = entry(&first.origin, &first.survey, "0".repeat(64).as_str());
         second.drawing = drawing(b"0\nSECTION\nnewer\n");
         second.original = None;
-        let mut partial = Vec::new();
-        partial.extend_from_slice(MAGIC);
-        partial.extend_from_slice(&[0xff, 0, 0]);
-        std::fs::write(dir.join("entry.tmp"), &partial).unwrap();
-        let loaded = store.load(&first.origin, &first.survey).expect("the previous copy");
-        assert_eq!(loaded.base_identity, "none");
-        assert_eq!(loaded.drawing.bytes, first.drawing.bytes);
-        assert_eq!(loaded.original.unwrap().bytes.as_slice(), b"original bytes", "one generation, not a mix");
-        // A cut-short entry is never read as a mix of parts either.
-        let whole = std::fs::read(dir.join(ENTRY)).unwrap();
-        for cut in [whole.len() - 1, whole.len() - 20, 20] {
-            std::fs::write(dir.join(ENTRY), &whole[..cut]).unwrap();
-            assert!(store.load(&first.origin, &first.survey).is_none(), "cut at {cut}");
+        // The real save dies part-way through writing the new generation, at
+        // several points: the previous complete copy is what loads.
+        let whole_len = std::fs::read(store.dir(&first.origin, &first.survey).unwrap().join(ENTRY)).unwrap().len();
+        for cut in [0, 12, 40, whole_len / 2, whole_len - 1] {
+            CRASH_AFTER.with(|c| c.set(Some(cut)));
+            assert!(store.save(&second).is_err(), "the crash was not injected");
+            let loaded = store.load(&first.origin, &first.survey).unwrap_or_else(|| panic!("no copy after a crash at byte {cut}"));
+            assert_eq!(loaded.base_identity, "none", "crash at byte {cut}");
+            assert_eq!(loaded.drawing.bytes, first.drawing.bytes);
+            assert_eq!(loaded.original.unwrap().bytes.as_slice(), b"original bytes", "one generation, not a mix");
         }
+        // A cut-short entry is never read as a mix of parts either.
+        let dir = store.dir(&first.origin, &first.survey).unwrap();
+        let whole = std::fs::read(dir.join(ENTRY)).unwrap();
+        std::fs::write(dir.join(ENTRY), &whole[..whole.len() - 1]).unwrap();
+        assert!(store.load(&first.origin, &first.survey).is_none());
         // The next save replaces it whole.
         store.save(&second).unwrap();
         let loaded = store.load(&first.origin, &first.survey).unwrap();

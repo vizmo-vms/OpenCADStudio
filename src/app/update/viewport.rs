@@ -789,7 +789,16 @@ impl OpenCADStudio {
         // If the camera moved since we last synced, write it back to
         // the document and mark the file dirty.
         let gen = self.tabs[i].scene.camera_generation;
-        if gen != self.tabs[i].last_synced_camera_gen {
+        // A SecurePlan drawing's view is not an edit: zooming or panning it
+        // neither rewrites its saved view nor marks it changed, so an
+        // unedited drawing is still applied byte for byte (PUB-04).
+        #[cfg(feature = "secureplan")]
+        let view_only = self.secureplan_is_bound(i);
+        #[cfg(not(feature = "secureplan"))]
+        let view_only = false;
+        if gen != self.tabs[i].last_synced_camera_gen && view_only {
+            self.tabs[i].last_synced_camera_gen = gen;
+        } else if gen != self.tabs[i].last_synced_camera_gen {
             self.tabs[i].last_synced_camera_gen = gen;
             if self.tabs[i].active_block_edit.is_some() {
                 let camera = self.tabs[i].scene.camera.borrow().clone();

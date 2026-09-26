@@ -107,8 +107,18 @@ thread_local! {
     static TEST_REFUSED: std::cell::Cell<[bool; 3]> = const { std::cell::Cell::new([false; 3]) };
 }
 
+/// Tests that run alone in a child process set this to use the process-wide
+/// flags as the application does (code on other threads then sees them too).
+#[cfg(test)]
+pub(crate) static TEST_PROCESS_WIDE: AtomicBool = AtomicBool::new(false);
+
 /// Refuse (or allow again) every resolution of `kind`.
 pub fn set_external_resource_refused(kind: ExternalResource, refused: bool) {
+    #[cfg(test)]
+    if TEST_PROCESS_WIDE.load(Ordering::SeqCst) {
+        flag(kind).store(refused, Ordering::SeqCst);
+        return;
+    }
     #[cfg(test)]
     TEST_REFUSED.with(|cell| {
         let mut flags = cell.get();

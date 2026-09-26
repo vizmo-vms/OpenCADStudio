@@ -51,7 +51,11 @@ pub fn export_headless(input: &std::path::Path, output: &std::path::Path) -> i32
             return 1;
         }
     };
-    match crate::io::save(&doc, output) {
+    let saved = crate::io::save(&doc, output);
+    // The process exits next: the save's PERF lines must reach stderr first.
+    #[cfg(feature = "secureplan")]
+    crate::perf::flush();
+    match saved {
         Ok(()) => {
             println!("Exported {} → {}", crate::io::diagnostic_path(input), crate::io::diagnostic_path(output));
             0

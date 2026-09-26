@@ -218,6 +218,8 @@ pub struct ApplyInFlight {
     pub snapshot_revision: u64,
     /// The drawing that was sent; it becomes the current drawing on commit.
     pub drawing: Drawing,
+    /// Whether it is the writer's output (not the verbatim loaded bytes).
+    pub written: bool,
 }
 
 /// The survey's plan as `openSession` or `planUpdate` describe it. It is
@@ -302,8 +304,12 @@ pub struct Bound {
     /// local work kept first): Apply is blocked until the survey is reopened.
     pub unresolved: bool,
     /// Entities of the loaded drawing that could not be read (corrupt records
-    /// the reader dropped). Writing the drawing would lose them.
+    /// the reader dropped). Publishing needs the user's acknowledgement.
     pub lost_entities: usize,
+    /// The tab's dirty flag taken into an Apply build. While the build and
+    /// its request run, the tab's own flag records only changes made after
+    /// the snapshot; the commit keeps those and drops this one.
+    pub held_dirty: bool,
 }
 
 impl Bound {
@@ -336,6 +342,7 @@ impl Bound {
             staged: None,
             unresolved: false,
             lost_entities: 0,
+            held_dirty: false,
         }
     }
 
@@ -379,6 +386,10 @@ pub struct Sessions {
     /// of their session names (BRG-07: a session's messages are handled in
     /// order).
     pub deferred: Vec<(SessionId, String, String, Value)>,
+    /// Transfers already used by a message; naming one again is an error.
+    pub consumed: std::collections::HashSet<(SessionId, u32)>,
+    /// When each session last made progress while messages waited.
+    pub last_progress: HashMap<SessionId, std::time::Instant>,
     next_request: u64,
 }
 
@@ -410,8 +421,16 @@ impl Sessions {
         self.pending.remove(&session);
         self.transfers.retain(|(s, _), _| *s != session);
         self.deferred.retain(|(s, ..)| *s != session);
+        self.consumed.retain(|(s, _)| *s != session);
+        self.last_progress.remove(&session);
     }
 }
+
+/// How long a message may wait for a transfer it names with nothing arriving
+/// on its session. Transfers are announced before the message (BRG-06) and a
+/// stalled one fails after 30 s, so a longer silence means a transfer that
+/// will never come.
+pub const TRANSFER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Completed transfers a session may hold before the messages that name them.
 const MAX_WAITING_TRANSFERS: usize = 16;
@@ -464,14 +483,14 @@ impl OpenCADStudio {
     /// Whether the bound document in tab `index` holds work SecurePlan lacks.
     pub(crate) fn secureplan_has_unapplied(&self, index: usize) -> bool {
         let Some(tab) = self.tabs.get(index) else { return false };
-        self.secureplan.sessions.by_tab(tab.id).is_some_and(|b| tab.dirty || b.unapplied())
+        self.secureplan.sessions.by_tab(tab.id).is_some_and(|b| tab.dirty || b.held_dirty || b.unapplied())
     }
 
     /// Whether the document differs from the bytes it was loaded from.
     pub(crate) fn secureplan_modified(&self, index: usize) -> bool {
         let tab = &self.tabs[index];
         match self.secureplan.sessions.by_tab(tab.id) {
-            Some(bound) => bound.loaded.is_none() || tab.dirty || tab.edit_revision != bound.clean_revision,
+            Some(bound) => bound.loaded.is_none() || tab.dirty || bound.held_dirty || tab.edit_revision != bound.clean_revision,
             None => tab.dirty,
         }
     }
@@ -517,7 +536,7 @@ impl OpenCADStudio {
     /// Refuse Xrefs and external images while any bound document is open.
     pub(crate) fn secureplan_refresh_guards(&self) {
         use super::guards::{set_external_resource_refused, ExternalResource};
-        let bound = !self.secureplan.sessions.bound.is_empty();
+        let bound = !self.secureplan.sessions.bound.is_empty() || self.secureplan.workers > 0;
         set_external_resource_refused(ExternalResource::Xref, bound);
         set_external_resource_refused(ExternalResource::Image, bound);
         set_external_resource_refused(ExternalResource::DataLink, bound);
@@ -583,6 +602,8 @@ impl OpenCADStudio {
             bound.busy = None;
             bound.apply = None;
             bound.last_state = None;
+            let tab_id = bound.tab_id;
+            self.secureplan_release_held(tab_id);
         }
         super::testdriver_event("closed", "");
     }
@@ -595,6 +616,11 @@ impl OpenCADStudio {
             self.secureplan_protocol_error(session);
             return Task::none();
         }
+        if self.secureplan.sessions.consumed.contains(&(session, transfer.transfer_id)) {
+            self.secureplan_protocol_error(session);
+            return Task::none();
+        }
+        self.secureplan.sessions.last_progress.insert(session, std::time::Instant::now());
         self.secureplan.sessions.transfers.insert((session, transfer.transfer_id), transfer);
         // Handle this session's queued messages, in order, up to the first
         // that still waits for a transfer.
@@ -613,18 +639,37 @@ impl OpenCADStudio {
         Task::batch(tasks)
     }
 
-    fn secureplan_take_transfer(&mut self, session: SessionId, id: u32) -> Option<Arc<Completed>> {
+    pub(crate) fn secureplan_take_transfer(&mut self, session: SessionId, id: u32) -> Option<Arc<Completed>> {
+        self.secureplan.sessions.consumed.insert((session, id));
         self.secureplan.sessions.transfers.remove(&(session, id))
     }
 
-    /// End a session that broke the protocol.
+    /// End a session that broke the protocol, dropping what it left waiting.
     pub(crate) fn secureplan_protocol_error(&mut self, session: SessionId) {
+        self.secureplan.sessions.drop_session(session);
         if let Some(bridge) = self.secureplan_bridge() {
             bridge.close(session, "protocolError");
         }
     }
 
+    /// End sessions whose waiting messages name transfers that never came.
+    pub(crate) fn secureplan_expire_waiting(&mut self) {
+        let now = std::time::Instant::now();
+        let wait = self.secureplan.transfer_wait;
+        let mut expired: Vec<SessionId> = self.secureplan.sessions.deferred.iter().map(|(s, ..)| *s).collect();
+        expired.dedup();
+        expired.retain(|s| self.secureplan.sessions.last_progress.get(s).is_none_or(|t| now.duration_since(*t) >= wait));
+        for session in expired {
+            self.secureplan_protocol_error(session);
+        }
+    }
+
     pub(crate) fn secureplan_message(&mut self, session: SessionId, kind: String, request_id: String, body: Value) -> Task<Message> {
+        // A transfer can be used once: naming a used one again is an error.
+        if referenced_transfers(&kind, &body).into_iter().any(|id| self.secureplan.sessions.consumed.contains(&(session, id))) {
+            self.secureplan_protocol_error(session);
+            return Task::none();
+        }
         // A message is handled only once every transfer it names is complete,
         // and after every earlier message of its session.
         let queued_ahead = self.secureplan.sessions.deferred.iter().any(|(s, ..)| *s == session);
@@ -636,6 +681,9 @@ impl OpenCADStudio {
             if self.secureplan.sessions.deferred.iter().filter(|(s, ..)| *s == session).count() >= MAX_WAITING_MESSAGES {
                 self.secureplan_protocol_error(session);
                 return Task::none();
+            }
+            if !queued_ahead {
+                self.secureplan.sessions.last_progress.insert(session, std::time::Instant::now());
             }
             self.secureplan.sessions.deferred.push((session, kind, request_id, body));
             return Task::none();
@@ -650,9 +698,10 @@ impl OpenCADStudio {
             "sessionMode" => {
                 if let (Some(mode), Some(bound)) = (Mode::parse(&body["mode"]), self.secureplan.sessions.by_session_mut(session)) {
                     bound.mode = mode;
+                    let tab_id = bound.tab_id;
                     if mode == Mode::View {
                         self.command_line.push_info("SecurePlan: view only. Apply is not available.");
-                        self.secureplan_close_form_dialogs();
+                        self.secureplan_close_form_dialogs(tab_id);
                     } else {
                         self.command_line.push_info("SecurePlan: editing enabled.");
                     }
@@ -759,7 +808,8 @@ impl OpenCADStudio {
             let bound = self.secureplan.sessions.by_tab_mut(tab_id).expect("bound above");
             bound.session = Some(session);
             bound.generation += 1;
-            bound.intent = pending.intent;
+            // What the page asks for now (openSession), over the launch's.
+            bound.intent = body["intent"].as_str().and_then(Intent::parse).unwrap_or(pending.intent);
             bound.mode = mode;
             bound.label = label.clone().into();
             bound.overlay = Some(overlay);
@@ -813,6 +863,12 @@ impl OpenCADStudio {
         purpose: super::import::LoadPurpose,
     ) -> Task<Message> {
         let Some(index) = self.secureplan_tab_index(tab_id) else { return Task::none() };
+        // Every replacement makes loads started for an earlier one stale,
+        // with or without a drawing of its own.
+        self.secureplan_invalidate_loads(tab_id);
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            bound.generation += 1;
+        }
         match drawing {
             Some((transfer, format)) => {
                 if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
@@ -871,8 +927,9 @@ impl OpenCADStudio {
             .sessions
             .by_tab(tab_id)
             .is_some_and(|b| b.intent == Intent::Import && b.mode == Mode::Edit);
-        if wants_import && super::native_dialogs_allowed() {
-            return self.secureplan_start_import();
+        let may_pick = super::native_dialogs_allowed() || cfg!(test);
+        if wants_import && may_pick {
+            return self.secureplan_start_import(tab_id);
         }
         Task::none()
     }
@@ -893,11 +950,19 @@ impl OpenCADStudio {
             tab.current_path = None;
             tab.is_start = false;
             tab.active_layer = tab.scene.document.header.current_layer_name.clone();
+            // The model-space annotation scale from CANNOSCALEVALUE and the
+            // drawing's units, as opening a drawing does.
+            let cannoscale = tab.scene.document.header.annotation_scale_value;
+            let unit_factor = tab.scene.annotation_scale_unit_factor();
+            tab.scene.annotation_scale =
+                if cannoscale > 1e-9 { ((1.0 / cannoscale) / unit_factor) as f32 } else { (1.0 / unit_factor) as f32 };
             tab.scene.rebuild_derived_caches();
             tab.scene.current_layout = "Model".to_string();
             tab.scene.load_current_layout_state();
             tab.scene.reset_transient_visibility();
             tab.scene.restore_saved_camera();
+            // The camera placed on open is not an edit of the drawing.
+            tab.last_synced_camera_gen = tab.scene.camera_generation;
             tab.history = crate::app::document::HistoryState::default();
             tab.dirty = false;
             tab.recovery_save_as_required = false;
@@ -910,6 +975,7 @@ impl OpenCADStudio {
             bound.loaded = loaded;
             bound.clean_revision = revision;
             bound.lost_entities = 0;
+            bound.held_dirty = false;
             // Work started on the previous document is stale now.
             bound.generation += 1;
             bound.apply = None;
@@ -1078,7 +1144,11 @@ impl OpenCADStudio {
     /// Whether an Apply begun under `origin` still matches the document.
     fn secureplan_apply_current(&self, tab_id: u64, origin: &ApplyOrigin) -> bool {
         self.secureplan.sessions.by_tab(tab_id).is_some_and(|b| {
-            b.session == origin.session && b.base_identity == origin.base_identity && b.generation == origin.generation && apply_allowed(b).is_ok()
+            b.session == origin.session
+                && b.base_identity == origin.base_identity
+                && b.generation == origin.generation
+                && b.mode == Mode::Edit
+                && apply_allowed(b).is_ok()
         })
     }
 
@@ -1089,10 +1159,11 @@ impl OpenCADStudio {
                 bound.busy = None;
             }
         }
+        self.secureplan_release_held(tab_id);
         self.secureplan.dialog = Some(super::ui::Dialog::notice(
             "Apply stopped",
             vec![
-                "The survey changed in SecurePlan (or reconnected) while this Apply was being prepared.".into(),
+                "The survey changed in SecurePlan (its plan, the connection or the editing mode) while this Apply was being prepared.".into(),
                 "Nothing was sent. Check the drawing, then Apply again.".into(),
             ],
         ));
@@ -1120,7 +1191,13 @@ impl OpenCADStudio {
 
     pub(crate) fn secureplan_build_apply(&mut self, dialog: super::ui::apply_dialog::ApplyDialog, plan: super::publish::ApplyPlan) -> Task<Message> {
         let tab_id = dialog.tab_id;
+        // From here the tab's dirty flag records only later changes (the
+        // snapshot's own go into `held_dirty`), so a commit never clears a
+        // change made while the Apply ran, whatever marked it.
+        let Some(index) = self.secureplan_tab_index(tab_id) else { return Task::none() };
+        let was_dirty = std::mem::take(&mut self.tabs[index].dirty);
         let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) else { return Task::none() };
+        bound.held_dirty |= was_dirty;
         bound.busy = Some(Busy { operation: "apply", progress: None });
         bound.error = None;
         let alignment = Alignment { units: dialog.alignment.units, mapping: plan.mapping };
@@ -1148,6 +1225,7 @@ impl OpenCADStudio {
                 bound.busy = None;
                 bound.error = code;
             }
+            app.secureplan_release_held(built.tab_id);
             app.secureplan.dialog = Some(super::ui::Dialog::notice("Apply stopped", vec![message, "Nothing was sent. Your edits are kept.".into()]));
             super::testdriver_event("apply-failed", code.map_or("", ErrorCode::as_str));
             app.secureplan_report_states();
@@ -1209,7 +1287,7 @@ impl OpenCADStudio {
             return fail(self, Some(ErrorCode::TransferFailed), "The request could not be sent to SecurePlan.".into());
         }
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(built.tab_id) {
-            bound.apply = Some(ApplyInFlight { request_id, snapshot_revision: built.snapshot_revision, drawing: outputs.drawing });
+            bound.apply = Some(ApplyInFlight { request_id, snapshot_revision: built.snapshot_revision, drawing: outputs.drawing, written: outputs.written });
             bound.alignment = Some(built.alignment);
         }
         let mut note = "SecurePlan: sent. Confirm the Apply in SecurePlan.".to_string();
@@ -1253,22 +1331,31 @@ impl OpenCADStudio {
             bound.recovered_base = None;
             bound.replace_confirmed = false;
             bound.realigned = false;
+            // Written by the writer, the stored drawing no longer holds the
+            // damaged items the reader dropped.
+            if apply.written {
+                bound.lost_entities = 0;
+            }
             bound.loaded = Some(apply.drawing);
+            bound.held_dirty = false;
+            bound.clean_revision = apply.snapshot_revision;
             let (origin, survey) = (bound.origin.clone(), bound.survey.expose().clone());
             if let Some(index) = self.secureplan_tab_index(tab_id) {
-                // Clean only if nothing changed since the snapshot was frozen.
-                if self.tabs[index].edit_revision == apply.snapshot_revision {
-                    self.tabs[index].dirty = false;
+                // The tab's dirty flag now records only changes made after the
+                // snapshot; an undo or redo since then changes the document too.
+                if self.tabs[index].edit_revision != apply.snapshot_revision {
+                    self.tabs[index].dirty = true;
                 }
-                if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
-                    bound.clean_revision = apply.snapshot_revision;
+                // A recovery copy of later work stays.
+                if !self.secureplan_has_unapplied(index) {
+                    self.secureplan.recovery.delete(&origin, &survey);
                 }
             }
-            self.secureplan.recovery.delete(&origin, &survey);
             let version = version.map_or(String::new(), |v| format!(" as plan version {v}"));
             self.command_line.push_info(&format!("SecurePlan: applied{version}."));
             super::testdriver_event("applied", body["planVersion"].as_u64().map(|v| v.to_string()).as_deref().unwrap_or(""));
         } else {
+            self.secureplan_release_held(tab_id);
             let code = body["code"].as_str().unwrap_or("SAVE_FAILED").to_string();
             let reason = match code.as_str() {
                 "PLAN_CHANGED" => "The survey's plan changed in SecurePlan. The new plan is being loaded.",
@@ -1331,10 +1418,24 @@ impl OpenCADStudio {
 
     // ── Dialog helpers ──────────────────────────────────────────────────────
 
-    /// Close the alignment or Apply dialog (the mode left `edit`).
-    pub(crate) fn secureplan_close_form_dialogs(&mut self) {
-        if matches!(self.secureplan.dialog, Some(super::ui::Dialog::Align(_) | super::ui::Dialog::Apply(_))) {
+    /// Close tab `tab_id`'s alignment or Apply dialog (its mode left `edit`).
+    pub(crate) fn secureplan_close_form_dialogs(&mut self, tab_id: u64) {
+        let owner = match &self.secureplan.dialog {
+            Some(super::ui::Dialog::Align(dialog)) => Some(dialog.tab_id),
+            Some(super::ui::Dialog::Apply(dialog)) => Some(dialog.tab_id),
+            _ => None,
+        };
+        if owner == Some(tab_id) {
             self.secureplan.dialog = None;
+        }
+    }
+
+    /// An Apply ended without a commit: changes taken into its snapshot are
+    /// unapplied again.
+    pub(crate) fn secureplan_release_held(&mut self, tab_id: u64) {
+        let held = self.secureplan.sessions.by_tab_mut(tab_id).is_some_and(|b| std::mem::take(&mut b.held_dirty));
+        if let (true, Some(index)) = (held, self.secureplan_tab_index(tab_id)) {
+            self.tabs[index].dirty = true;
         }
     }
 
@@ -1873,6 +1974,8 @@ pub(crate) mod tests {
             saved: std::time::SystemTime::now(),
             drawing: drawing.clone(),
             original: Some(drawing),
+            lost_entities: 0,
+            alignment: None,
         };
         h.app.secureplan.recovery.save(&entry).unwrap();
         // The survey now has a plan: the copy was made from another one.
@@ -2039,6 +2142,7 @@ pub(crate) mod tests {
             window_cad: [x0, y0, x1, y1],
             mapping: crate::app::secureplan::align::Alignment::from_cad_plan(&json!({ "cadUnits": "mm", "mapping": request["mapping"] })).unwrap().mapping,
             mm_per_pt: w / wp as f64,
+            damaged_acknowledged: false,
         };
         let transform = plan.transform().unwrap();
         let points = publish::tests::content_points(&pdf);
@@ -2095,7 +2199,7 @@ pub(crate) mod tests {
         let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: Some(loaded.clone()), modified: true, pending_original: None, lost_entities: 0 };
         let window = [0.0, 0.0, 30000.0, 18000.0];
         let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
-        let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: publish::choose_mm_per_pt(window, &mapping).unwrap() };
+        let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: publish::choose_mm_per_pt(window, &mapping).unwrap(), damaged_acknowledged: false };
         let first = publish::build_outputs(&snapshot, &plan).unwrap();
         let second = publish::build_outputs(&snapshot, &plan).unwrap();
         assert_eq!(first.drawing.bytes, second.drawing.bytes, "the writer output repeats");
@@ -2140,7 +2244,7 @@ pub(crate) mod tests {
         let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: None, modified: true, pending_original: None, lost_entities: 0 };
         let window = [0.0, 0.0, 30000.0, 18000.0];
         let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
-        let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: 3.0 };
+        let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: 3.0, damaged_acknowledged: false };
         publish::build_outputs(&snapshot, &plan).expect("outputs");
     }
 
@@ -2324,32 +2428,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_partly_damaged_drawing_imports_with_a_warning_and_applies_only_unedited() {
-        use acadrust::types::Vector2;
-        let mut doc = testutil::synthetic_document();
-        let mut damaged = acadrust::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);
-        damaged.elevation = 1.0e11;
-        doc.add_entity(acadrust::EntityType::LwPolyline(damaged)).unwrap();
-        let bytes = crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap();
-        let mut h = Harness::new("damaged");
-        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
-        let file = h.dir().join("damaged.dxf");
-        std::fs::write(&file, &bytes).unwrap();
-        let tab_id = h.tab_id();
-        let _ = h.app.secureplan_import_path(tab_id, &file);
-        let Some(Dialog::Choice { lines, .. }) = &h.app.secureplan.dialog else { panic!("no report") };
-        assert!(lines.iter().any(|l| l.contains("1 damaged entit")), "{lines:?}");
-        assert_eq!(h.bound().lost_entities, 1);
-        h.key(DialogKey::Activate);
-        // Edited, the drawing would be written without the damaged entity.
-        h.edit((1.0, 1.0), (2.0, 2.0));
-        align_and_open_apply(&mut h);
-        h.key(DialogKey::Activate);
-        assert_eq!(h.bound().error, Some(ErrorCode::KnownLoss));
-        assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"));
-    }
-
-    #[test]
     fn a_restored_copy_applies_in_its_own_format_and_version() {
         for (bytes, format, version) in [
             (testutil::synthetic_dwg(), Format::Dwg, "AC1032"),
@@ -2357,7 +2435,7 @@ pub(crate) mod tests {
         ] {
             let mut h = Harness::new(&format!("restore_{version}_{}", format.ext()));
             let drawing = Drawing { bytes: Arc::new(bytes.clone()), name: format!("kept.{}", format.ext()).into(), format, format_version: version.into() };
-            let entry = recovery::Entry { origin: ORIGIN.into(), survey: SURVEY.into(), base_identity: "none".into(), plan_version: None, saved: std::time::SystemTime::now(), drawing, original: None };
+            let entry = recovery::Entry { origin: ORIGIN.into(), survey: SURVEY.into(), base_identity: "none".into(), plan_version: None, saved: std::time::SystemTime::now(), drawing, original: None, lost_entities: 0, alignment: None };
             h.app.secureplan.recovery.save(&entry).unwrap();
             h.open_dxf();
             let tab_id = h.tab_id();
@@ -2496,5 +2574,409 @@ pub(crate) mod tests {
         let id = h.transfer("overlay.json", "application/vnd.secureplan.overlay+json", &overlay::tests::overlay_bytes(&[]));
         h.send(json!({ "type": "overlayUpdate", "requestId": "o2", "overlayTransferId": id, "surveyEmpty": true }));
         assert!(survey_is_empty(h.bound()));
+    }
+
+    // ── Fix round 2 ─────────────────────────────────────────────────────────
+
+    #[cfg(feature = "secureplan-test")]
+    fn driver(h: &mut Harness, line: &str) {
+        let _ = h.app.secureplan_driver(crate::app::secureplan::testdriver::parse(line).unwrap());
+    }
+
+    #[cfg(feature = "secureplan-test")]
+    fn tick(h: &mut Harness) {
+        let _ = h.app.update(Message::Tick(iced::time::Instant::now()));
+    }
+
+    /// The synthetic plan with one damaged polyline the reader drops.
+    #[cfg(feature = "secureplan-test")]
+    fn damaged_dxf() -> Vec<u8> {
+        use acadrust::types::Vector2;
+        let mut doc = testutil::synthetic_document();
+        let mut damaged = acadrust::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);
+        damaged.elevation = 1.0e11;
+        doc.add_entity(acadrust::EntityType::LwPolyline(damaged)).unwrap();
+        crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap()
+    }
+
+    #[cfg(feature = "secureplan-test")]
+    fn import_file(h: &mut Harness, name: &str, bytes: &[u8]) {
+        let file = h.dir().join(name);
+        std::fs::write(&file, bytes).unwrap();
+        driver(h, &format!("import {}", file.display()));
+    }
+
+    #[cfg(feature = "secureplan-test")]
+    const MINIMAL_DXF: &str = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n30\n0.0\n11\n1000.0\n21\n500.0\n31\n0.0\n0\nENDSEC\n0\nEOF\n";
+
+    #[test]
+    #[cfg(feature = "secureplan-test")]
+    fn an_unedited_import_is_applied_byte_for_byte_through_the_driver() {
+        for (name, bytes) in [("minimal.dxf", MINIMAL_DXF.as_bytes().to_vec()), ("resaved.dxf", testutil::synthetic_dxf())] {
+            let mut h = Harness::new(&format!("verbatim_{name}"));
+            h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+            import_file(&mut h, name, &bytes);
+            h.app.secureplan.dialog = None;
+            // Frames run, and the user zooms: neither is an edit.
+            tick(&mut h);
+            let index = h.app.active_tab;
+            h.app.tabs[index].scene.fit_all();
+            tick(&mut h);
+            assert!(!h.app.secureplan_modified(index), "{name}: the view counted as an edit");
+            driver(&mut h, "align units=mm");
+            driver(&mut h, "apply");
+            let (request, transfers) = h.receive("applyRequest");
+            let sent = &transfers[&request["drawing"]["transferId"].as_u64().unwrap()].1;
+            let original = &transfers[&request["original"]["transferId"].as_u64().unwrap()].1;
+            assert_eq!(original, &bytes, "{name}: the original");
+            assert_eq!(sent, &bytes, "{name}: an unedited import is sent byte for byte");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "secureplan-test")]
+    fn damaged_items_are_published_only_with_an_acknowledgement_every_time() {
+        let bytes = damaged_dxf();
+        let mut h = Harness::new("damaged");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+        import_file(&mut h, "damaged.dxf", &bytes);
+        let Some(Dialog::Choice { lines, .. }) = &h.app.secureplan.dialog else { panic!("no report") };
+        assert!(lines.iter().any(|l| l.contains("1 damaged items could not be read")), "{lines:?}");
+        h.app.secureplan.dialog = None;
+        driver(&mut h, "align units=mm");
+        // Unedited: refused without the acknowledgement, applied with it.
+        driver(&mut h, "apply");
+        assert!(h.bound().apply.is_none(), "applied without the acknowledgement");
+        driver(&mut h, "apply damaged=publish");
+        let (request, transfers) = h.receive("applyRequest");
+        assert_eq!(transfers[&request["drawing"]["transferId"].as_u64().unwrap()].1, bytes, "unedited: the original bytes");
+        assert_eq!(transfers[&request["original"]["transferId"].as_u64().unwrap()].1, bytes, "the original is stored unchanged");
+        h.send(json!({ "type": "applyResult", "requestId": request["requestId"], "status": "error", "code": "LEASE_LOST", "detail": null }));
+        // Edited: still asked, every time, through the dialog too.
+        h.edit((1.0, 1.0), (2.0, 2.0));
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        h.key(DialogKey::Activate);
+        assert!(h.bound().apply.is_none() && matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "applied without the acknowledgement");
+        h.app.secureplan.dialog.as_mut().unwrap().form_mut().focus = 4;
+        h.key(DialogKey::Right);
+        h.key(DialogKey::Previous);
+        h.key(DialogKey::Activate);
+        let (request, _) = h.receive("applyRequest");
+        assert_eq!(request["type"], "applyRequest");
+    }
+
+    /// Runs only in the child process started by the test below, alone, so
+    /// the refusals can be process-wide (as in the app), where code on other
+    /// threads (the scene's parallel cache builds) sees them too.
+    #[test]
+    #[ignore = "run by a_worker_keeps_references_refused_after_the_last_drawing_closes in a child process"]
+    fn worker_guard_child() {
+        use crate::app::secureplan::guards::{external_resource_allowed, ExternalResource, TEST_PROCESS_WIDE};
+        if std::env::var_os("SECUREPLAN_WORKER_GUARD_CHILD").is_none() {
+            return;
+        }
+        TEST_PROCESS_WIDE.store(true, std::sync::atomic::Ordering::SeqCst);
+        use acadrust::objects::{ImageDefinition, ObjectType};
+        let mut h = Harness::new("worker_guard");
+        let png = h.dir().join("worker.png");
+        image::RgbaImage::new(1, 1).save(&png).unwrap();
+        let reference = png.to_string_lossy().into_owned();
+        let mut doc = testutil::synthetic_document();
+        let handle = doc.allocate_handle();
+        let mut definition = ImageDefinition::with_dimensions(&reference, 1, 1);
+        definition.handle = handle;
+        doc.objects.insert(handle, ObjectType::ImageDefinition(definition));
+        let mut raster = acadrust::entities::RasterImage::new(&reference, acadrust::types::Vector3::new(100.0, 100.0, 0.0), 1.0, 1.0);
+        raster.definition_handle = Some(handle);
+        doc.add_entity(acadrust::EntityType::RasterImage(raster)).unwrap();
+        let bytes = crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        h.open(Some(("images.dxf", Format::Dxf, bytes)), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        assert!(!crate::scene::model::image_model::tests::cached(&reference), "read on open");
+        align_and_open_apply(&mut h);
+        h.hold_jobs();
+        h.key(DialogKey::Activate);
+        assert_eq!(h.held(), 1);
+        // The last SecurePlan drawing closes while its Apply build runs.
+        let index = h.app.active_tab;
+        let _ = h.app.update(Message::TabClose(index));
+        assert!(h.app.secureplan.sessions.bound.is_empty());
+        assert!(!external_resource_allowed(ExternalResource::Image), "references allowed while the worker runs");
+        h.release(0);
+        assert!(!crate::scene::model::image_model::tests::cached(&reference), "the worker read the drawing's image");
+        assert!(external_resource_allowed(ExternalResource::Image), "allowed again once no worker runs");
+        // Control: with references allowed, building the same scene reads it.
+        let _ = crate::app::secureplan::snap::tests::scene_of(doc);
+        assert!(crate::scene::model::image_model::tests::cached(&reference), "the control read nothing");
+    }
+
+    #[test]
+    fn a_worker_keeps_references_refused_after_the_last_drawing_closes() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app::secureplan::session::tests::worker_guard_child", "--include-ignored", "--test-threads", "1", "--nocapture"])
+            .env("SECUREPLAN_WORKER_GUARD_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && text.contains("1 passed"), "{text}\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn an_older_load_never_lands_after_a_newer_removal() {
+        let mut h = Harness::new("older_load");
+        h.open_dxf();
+        h.hold_jobs();
+        plan_update(&mut h, Some(("new.dwg", "image/vnd.dwg", testutil::synthetic_dwg())), BASE);
+        assert_eq!(h.held(), 1);
+        let mut removed = sample("planUpdate-removed");
+        removed["requestId"] = json!("plan-9");
+        h.send(removed);
+        assert!(h.bound().loaded.is_none() && h.entity_count() == 0, "the removal installs at once");
+        h.release(0);
+        assert!(h.bound().loaded.is_none(), "the older drawing landed");
+        assert_eq!(h.entity_count(), 0);
+        assert_eq!(h.bound().base_identity, "none");
+    }
+
+    #[test]
+    fn edits_made_while_a_replacement_parses_are_kept() {
+        let mut h = Harness::new("edit_during_parse");
+        h.open_dxf();
+        let before = h.entity_count();
+        h.hold_jobs();
+        plan_update(&mut h, Some(("new.dwg", "image/vnd.dwg", testutil::synthetic_dwg())), BASE);
+        h.edit((5.0, 5.0), (6.0, 6.0));
+        h.release(0);
+        let entry = h.app.secureplan.recovery.load(ORIGIN, SURVEY).expect("the edit was kept");
+        let (kept, _) = crate::app::secureplan::import::load_drawing("x", entry.drawing.bytes.as_ref().clone()).unwrap();
+        assert_eq!(kept.entities().count(), before + 1, "the copy lacks the edit made during the parse");
+        assert_eq!(h.bound().base_identity, BASE);
+        // And if it cannot be kept, nothing is replaced.
+        let mut h = Harness::new("edit_during_parse_fail");
+        h.open_dxf();
+        h.hold_jobs();
+        plan_update(&mut h, Some(("new.dwg", "image/vnd.dwg", testutil::synthetic_dwg())), BASE);
+        h.edit((5.0, 5.0), (6.0, 6.0));
+        h.break_recovery_store();
+        h.release(0);
+        assert_eq!(h.bound().loaded.as_ref().unwrap().format, Format::Dxf, "replaced over unkept edits");
+        assert!(h.bound().unresolved);
+    }
+
+    #[test]
+    #[cfg(feature = "secureplan-test")]
+    fn a_recovered_copy_keeps_its_damaged_items_and_needs_the_acknowledgement() {
+        let mut h = Harness::new("recovered_loss");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+        import_file(&mut h, "damaged.dxf", &damaged_dxf());
+        h.app.secureplan.dialog = None;
+        driver(&mut h, "align units=mm");
+        h.edit((1.0, 1.0), (2.0, 2.0));
+        driver(&mut h, "apply");
+        assert!(h.bound().apply.is_none());
+        let tab_id = h.tab_id();
+        let session = h.session;
+        let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::CloseKeep(tab_id))));
+        h.pump_until_closed(session);
+        let kept = h.app.secureplan.recovery.load(ORIGIN, SURVEY).expect("kept");
+        assert_eq!(kept.lost_entities, 1);
+        assert!(kept.alignment.is_some(), "the copy has no alignment");
+        // Reopened and restored: still needs the acknowledgement.
+        h.pair_again(31, None);
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let tab_id = h.tab_id();
+        let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::RecoveryRestore(tab_id))));
+        assert_eq!(h.bound().lost_entities, 1);
+        assert!(h.bound().alignment.is_some(), "the copy's alignment came back");
+        driver(&mut h, "apply");
+        assert!(h.bound().apply.is_none(), "the purged copy was applied without the acknowledgement");
+    }
+
+    #[test]
+    fn a_restored_copy_brings_its_own_alignment() {
+        use crate::app::secureplan::align::{Alignment, Units};
+        let current = Alignment::from_cad_plan(&sample("openSession-edit")["cadPlan"]).unwrap();
+        let theirs = Alignment { units: Units::M, mapping: crate::app::secureplan::publish::Mapping { cad_origin: [1.0, 2.0], anchor_mm: [500.0, 500.0], scale_mm_per_cad_unit: 1000.0, quarter_turns: 3 } };
+        for stored in [Some(theirs), None] {
+            let mut h = Harness::new(&format!("restore_mapping_{}", stored.is_some()));
+            let drawing = Drawing { bytes: Arc::new(testutil::synthetic_dxf()), name: "a.dxf".to_string().into(), format: Format::Dxf, format_version: "AC1032".into() };
+            let entry = recovery::Entry { origin: ORIGIN.into(), survey: SURVEY.into(), base_identity: BASE.into(), plan_version: Some(1), saved: std::time::SystemTime::now(), drawing, original: None, lost_entities: 0, alignment: stored };
+            h.app.secureplan.recovery.save(&entry).unwrap();
+            h.open(Some(("b.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", sample("openSession-edit")["cadPlan"].clone(), BASE, "edit");
+            assert_eq!(h.bound().alignment, Some(current));
+            let tab_id = h.tab_id();
+            let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::RecoveryRestore(tab_id))));
+            assert_eq!(h.bound().alignment, stored, "the current plan's mapping was kept for another drawing");
+            assert_eq!(h.bound().realigned, stored.is_some());
+            if stored.is_none() {
+                let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+                assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "align again first");
+            }
+        }
+    }
+
+    #[test]
+    fn a_commit_keeps_changes_made_while_the_apply_ran_whatever_marked_them() {
+        for control in ["visibility", "scale"] {
+            let mut h = Harness::new(&format!("held_dirty_{control}"));
+            h.open_dxf();
+            h.edit((1.0, 1.0), (2.0, 2.0));
+            align_and_open_apply(&mut h);
+            h.hold_jobs();
+            h.key(DialogKey::Activate);
+            let index = h.app.active_tab;
+            let revision = h.app.tabs[index].edit_revision;
+            match control {
+                "visibility" => {
+                    let _ = h.app.update(Message::ToggleAnnotationVisibility);
+                }
+                _ => {
+                    h.app.tabs[index].scene.set_annotation_all_visible(true);
+                    let _ = h.app.update(Message::SyncViewportAnnotationScale);
+                    h.app.tabs[index].dirty = true; // what the scale control does
+                }
+            }
+            assert_eq!(h.app.tabs[index].edit_revision, revision, "{control}: the control bumped the revision (test premise)");
+            h.release(0);
+            let (request, _) = h.receive("applyRequest");
+            h.send(json!({ "type": "applyResult", "requestId": request["requestId"], "status": "committed", "planVersion": 1, "baseIdentity": BASE }));
+            assert!(h.app.tabs[index].dirty, "{control}: the commit cleared a later change");
+            assert!(h.app.secureplan_has_unapplied(index));
+        }
+    }
+
+    #[test]
+    fn a_bound_drawing_gets_the_annotation_scale_it_declares() {
+        // The DXF writer does not write $CANNOSCALEVALUE: add it to the header.
+        let bytes = |scale: f64| {
+            let text = String::from_utf8(testutil::synthetic_dxf()).unwrap();
+            let at = text.find("HEADER").unwrap() + "HEADER".len();
+            let at = at + text[at..].find('\n').unwrap() + 1;
+            format!("{}  9\n$CANNOSCALEVALUE\n 40\n{scale}\n{}", &text[..at], &text[at..]).into_bytes()
+        };
+        let mut h = Harness::new("annoscale");
+        h.open(Some(("a.dxf", Format::Dxf, bytes(0.01))), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let index = h.app.active_tab;
+        let factor = h.app.tabs[index].scene.annotation_scale_unit_factor();
+        assert!((h.app.tabs[index].scene.annotation_scale as f64 - 100.0 / factor).abs() < 1e-3, "{}", h.app.tabs[index].scene.annotation_scale);
+        plan_update(&mut h, Some(("b.dxf", "image/vnd.dxf", bytes(0.02))), BASE);
+        let factor = h.app.tabs[index].scene.annotation_scale_unit_factor();
+        assert!((h.app.tabs[index].scene.annotation_scale as f64 - 50.0 / factor).abs() < 1e-3, "{}", h.app.tabs[index].scene.annotation_scale);
+    }
+
+    #[test]
+    fn an_import_asked_for_at_open_goes_to_the_survey_that_asked() {
+        let mut h = Harness::new("import_target");
+        let file = h.dir().join("picked.dxf");
+        std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+        h.hold_jobs();
+        h.open(Some(("a.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+        let a = h.tab_id();
+        h.pair_again(41, Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"));
+        h.open(Some(("b.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let b = h.tab_id();
+        h.release(1);
+        h.app.secureplan.test_pick = Some(file);
+        // A finishes loading while B is active: the picker's file goes to A.
+        h.release(0);
+        while h.held() > 0 {
+            h.release(0);
+        }
+        let pending = |h: &Harness, tab: u64| h.app.secureplan.sessions.by_tab(tab).is_some_and(|b| b.pending_original.is_some());
+        assert!(pending(&h, a), "A did not get its import");
+        assert!(!pending(&h, b), "the import went to B");
+        // A pick for a survey that can no longer import is refused.
+        h.app.secureplan.sessions.by_tab_mut(b).unwrap().mode = Mode::View;
+        let file = h.dir().join("picked.dxf");
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(b, Some(file.into()))));
+        assert!(!pending(&h, b));
+    }
+
+    #[test]
+    fn a_burst_of_drawing_updates_runs_one_parser_at_a_time_and_lands_the_latest() {
+        let mut h = Harness::new("burst");
+        h.open_dxf();
+        h.hold_jobs();
+        for i in 0..5 {
+            let base = format!("{:064x}", i + 1);
+            let (name, media, bytes) = if i == 4 { ("last.dwg", "image/vnd.dwg", testutil::synthetic_dwg()) } else { ("mid.dxf", "image/vnd.dxf", testutil::synthetic_dxf()) };
+            plan_update(&mut h, Some((name, media, bytes)), &base);
+            assert_eq!(h.held(), 1, "update {i}: more than one parser started");
+        }
+        h.release(0); // the first, superseded; the latest starts
+        assert_eq!(h.held(), 1, "only the latest waiting load starts");
+        h.release(0);
+        assert_eq!(h.held(), 0);
+        assert_eq!(h.bound().loaded.as_ref().unwrap().format, Format::Dwg);
+        assert_eq!(h.bound().base_identity, format!("{:064x}", 5));
+    }
+
+    #[test]
+    fn a_transfer_that_never_comes_or_is_reused_ends_the_session() {
+        let mut h = Harness::new("never");
+        h.app.secureplan.transfer_wait = std::time::Duration::ZERO;
+        h.web.send(&json!({
+            "type": "openSession", "requestId": "open-1", "intent": "edit", "mode": "edit",
+            "surveyLabel": "Synthetic survey", "cadPlan": null, "placement": null,
+            "baseIdentity": "none", "drawingTransferId": null, "overlayTransferId": 99, "surveyEmpty": true,
+        }));
+        h.pump();
+        let _ = h.app.update(Message::SecurePlan(Msg::Tick));
+        assert!(h.app.secureplan.sessions.deferred.is_empty(), "the waiting message was kept");
+        let (close, _) = h.receive("close");
+        assert_eq!(close["reason"], "protocolError");
+        // A used transfer named again.
+        let mut h = Harness::new("reused");
+        h.open_dxf();
+        h.send(json!({ "type": "overlayUpdate", "requestId": "o1", "overlayTransferId": 1, "surveyEmpty": true }));
+        let (close, _) = h.receive("close");
+        assert_eq!(close["reason"], "protocolError");
+    }
+
+    #[test]
+    fn a_build_finishing_after_view_mode_sends_nothing() {
+        let mut h = Harness::new("view_during_build");
+        h.open_dxf();
+        align_and_open_apply(&mut h);
+        h.hold_jobs();
+        h.key(DialogKey::Activate);
+        h.send(json!({ "type": "sessionMode", "requestId": "m1", "mode": "view", "reason": "leaseLost" }));
+        h.release(0);
+        assert!(h.bound().apply.is_none(), "sent in view mode");
+        assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"));
+    }
+
+    #[test]
+    fn view_mode_for_one_survey_leaves_another_surveys_dialog_open() {
+        let mut h = Harness::new("scoped_close");
+        h.open_dxf();
+        let a_session = h.session;
+        h.pair_again(51, Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"));
+        h.open_dxf();
+        // Back on A, its alignment dialog opens.
+        let a = h.app.secureplan.sessions.by_session_mut(a_session).unwrap().tab_id;
+        h.app.active_tab = h.app.secureplan_tab_index(a).unwrap();
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))));
+        h.send(json!({ "type": "sessionMode", "requestId": "m1", "mode": "view", "reason": "leaseLost" }));
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "B's view mode closed A's dialog");
+    }
+
+    #[test]
+    fn cancelling_close_all_forgets_the_rest_of_it() {
+        let mut h = Harness::new("close_all");
+        h.open_dxf();
+        h.edit((1.0, 1.0), (2.0, 2.0));
+        let a = h.tab_id();
+        let _ = h.app.update(Message::TabNew);
+        let other = h.app.tabs[h.app.active_tab].id;
+        let _ = h.app.update(Message::DocTabCloseAll);
+        assert_eq!(h.dialog_title().as_deref(), Some("Unapplied edits"));
+        let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::Dismiss)));
+        // Later, just the SecurePlan tab is closed and kept.
+        let index = h.app.secureplan_tab_index(a).unwrap();
+        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::CloseKeep(a))));
+        assert!(h.app.secureplan_tab_index(a).is_none());
+        assert!(h.app.tabs.iter().any(|t| t.id == other), "the abandoned Close All closed another tab");
     }
 }
