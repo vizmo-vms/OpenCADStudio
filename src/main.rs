@@ -56,6 +56,18 @@ fn main() -> iced::Result {
             args.files = files;
             (args, urls)
         };
+        // Launch URLs reach a running copy over the authenticated per-user
+        // channel only; when none answers, this instance serves them. (The
+        // unauthenticated single-instance hand-off is off in SecurePlan CAD.)
+        #[cfg(feature = "secureplan")]
+        let launch_urls = if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
+            if args.files.is_empty() {
+                return Ok(());
+            }
+            Vec::new()
+        } else {
+            launch_urls
+        };
 
         // GPU probe child: exercise one backend offscreen, print one JSON
         // line on success and exit 0/1. This must run before any logging/GUI
@@ -149,12 +161,6 @@ fn main() -> iced::Result {
         // the first time a mode is added; a position cannot.
         if !args.new_instance {
             if let io::single_instance::Claim::Existing(stream) = io::single_instance::claim() {
-                // Launch URLs go to the running instance over the per-user
-                // channel only; if that fails, this instance serves them.
-                #[cfg(feature = "secureplan")]
-                if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) && args.files.is_empty() {
-                    return Ok(());
-                }
                 // Only bare files forward. `--read-only` / `--script` / `--new`
                 // configure the whole editor rather than a tab, so they always
                 // get a process of their own.
@@ -187,7 +193,9 @@ fn main() -> iced::Result {
                     .map(str::to_string)
                     .collect(),
                 Err(e) => {
-                    eprintln!("--script: cannot read {}: {e}", p.display());
+                    // SecurePlan CAD never writes file paths to its output.
+                    let shown = if cfg!(feature = "secureplan") { "[redacted]".to_string() } else { p.display().to_string() };
+                    eprintln!("--script: cannot read {shown}: {e}");
                     Vec::new()
                 }
             })

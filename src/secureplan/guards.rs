@@ -2,9 +2,11 @@
 //! DSK-03):
 //! - [`CommandGuard`] refuses named commands (PLOT, WBLOCK, SAVE, …) in bound
 //!   tabs; `dispatch_command` consults it before running anything.
-//! - the external-resource guard refuses Xref and image-reference resolution;
-//!   `io::xref` and `scene::model::image_model` consult it before touching the
-//!   disk or the network.
+//! - the external-resource guard refuses Xref and image-reference resolution
+//!   (raster images and PDF underlays); `io::xref`, `io::resolve_image_file`,
+//!   `scene::model::image_model` and `scene::model::pdf_raster` consult it
+//!   before touching the disk or the network. References to another machine
+//!   (UNC paths, URLs) are refused in SecurePlan builds whatever the setting.
 //!
 //! Both allow everything until configured.
 
@@ -102,6 +104,22 @@ pub fn external_resource_allowed(kind: ExternalResource) -> bool {
     !flag(kind).load(Ordering::SeqCst)
 }
 
+/// Whether a drawing reference names another machine: a UNC path
+/// (`\\host\share`, `//host/share`, `\\?\UNC\…`, other `\\?\` and `\\.\`
+/// device paths) or a URL. Even a stat of such a path can reach the network
+/// (and on Windows send the user's credentials), so a SecurePlan build never
+/// touches one (DSK-02).
+pub fn is_remote_reference(reference: &str) -> bool {
+    let normalised = reference.trim().replace('\\', "/");
+    normalised.starts_with("//") || normalised.contains("://")
+}
+
+/// Whether the reference `reference` of `kind` may be resolved: the kind is
+/// not refused and the reference is local.
+pub fn reference_allowed(kind: ExternalResource, reference: &str) -> bool {
+    external_resource_allowed(kind) && !is_remote_reference(reference)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -117,6 +135,27 @@ pub(crate) mod tests {
         assert_eq!(command_verb("  .saveas "), "SAVEAS");
         assert_eq!(command_verb("'zoom"), "ZOOM");
         assert_eq!(command_verb(""), "");
+    }
+
+    #[test]
+    fn remote_references_are_recognised() {
+        for remote in [
+            "\\\\qa-host\\share\\plan.png",
+            "//qa-host/share/plan.png",
+            "\\\\?\\UNC\\qa-host\\share\\plan.pdf",
+            "\\\\?\\C:\\plans\\plan.png",
+            "\\\\.\\pipe\\x",
+            "/\\qa-host/share/plan.png",
+            "  \\\\qa-host\\share\\plan.png",
+            "file://qa-host/share/plan.png",
+            "smb://qa-host/share/plan.png",
+            "https://example.com/plan.png",
+        ] {
+            assert!(is_remote_reference(remote), "{remote}");
+        }
+        for local in ["C:\\plans\\plan.png", "/home/user/plan.png", "plans/plan.png", "plan.png", "C:/plans/plan.png"] {
+            assert!(!is_remote_reference(local), "{local}");
+        }
     }
 
     #[test]
@@ -185,6 +224,92 @@ pub(crate) mod tests {
             allowed.iter().any(|info| matches!(info.status, XrefStatus::Loaded)),
             "the fixture xref does not resolve"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A synthetic one-page PDF on disk.
+    fn write_pdf(path: &std::path::Path) {
+        use printpdf::{Mm, PdfDocument, PdfPage, PdfSaveOptions};
+        let mut document = PdfDocument::new("Synthetic underlay");
+        document.pages.push(PdfPage::new(Mm(25.4), Mm(25.4), Vec::new()));
+        std::fs::write(path, document.save(&PdfSaveOptions::default(), &mut Vec::new())).unwrap();
+    }
+
+    #[test]
+    fn references_to_another_machine_are_never_touched() {
+        // `//tmp/...` is a real local path on Linux, so a successful read
+        // would prove the guard missed it; on Windows it would be UNC.
+        let _lock = RESOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("remote");
+        let image = dir.join("pixel.png");
+        image::RgbaImage::new(1, 1).save(&image).unwrap();
+        let pdf = dir.join("plan.pdf");
+        write_pdf(&pdf);
+        let unc = |path: &std::path::Path| format!("/{}", path.display());
+        assert!(crate::scene::model::image_model::resolve_image(&unc(&image)).is_none());
+        assert!(crate::io::resolve_image_file(&unc(&image), None).is_none());
+        assert!(crate::io::resolve_image_file("pixel.png", Some(std::path::Path::new(&unc(&dir)))).is_none());
+        assert!(crate::scene::model::pdf_raster::rasterize_page(&unc(&pdf), "1").is_none());
+        // The same files by their ordinary paths resolve.
+        assert!(crate::io::resolve_image_file(&image.to_string_lossy(), None).is_some());
+        assert!(crate::scene::model::pdf_raster::rasterize_page(&pdf.to_string_lossy(), "1").is_some());
+
+        let target = dir.join("inner.dwg");
+        let inner = acadrust::CadDocument::new();
+        std::fs::write(&target, crate::io::save_to_bytes(&inner, "dwg", inner.version).unwrap()).unwrap();
+        let mut host = acadrust::CadDocument::new();
+        let mut record = acadrust::tables::BlockRecord::new("INNER");
+        record.flags.is_xref = true;
+        record.xref_path = unc(&target);
+        host.block_records.add(record).unwrap();
+        let (infos, _) = crate::io::xref::resolve_xrefs(&mut host, &dir);
+        assert!(infos.iter().all(|info| matches!(info.status, crate::io::xref::XrefStatus::NotFound)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_drawing_with_a_pdf_underlay_loads_without_reading_it_while_refused() {
+        use acadrust::entities::{Underlay, UnderlayDefinition, UnderlayType};
+        use acadrust::objects::ObjectType;
+        let _lock = RESOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("underlay");
+        write_pdf(&dir.join("plan.pdf"));
+        let mut doc = acadrust::CadDocument::new();
+        let mut definition = UnderlayDefinition::new(UnderlayType::Pdf);
+        definition.handle = doc.allocate_handle();
+        definition.file_path = "plan.pdf".into();
+        definition.page_name = "1".into();
+        definition.name = "plan".into();
+        let definition_handle = definition.handle;
+        doc.objects.insert(definition_handle, ObjectType::UnderlayDefinition(definition));
+        let mut underlay = Underlay::new(UnderlayType::Pdf);
+        underlay.definition_handle = definition_handle;
+        doc.add_entity(acadrust::EntityType::Underlay(underlay)).unwrap();
+        let drawing = dir.join("synthetic.dwg");
+        std::fs::write(&drawing, crate::io::save_to_bytes(&doc, "dwg", doc.version).unwrap()).unwrap();
+
+        // Load the whole drawing and build its images, as opening it does.
+        let load = || {
+            let doc = crate::io::load_file(&drawing).expect("load the synthetic drawing");
+            let (underlay, definition) = doc
+                .entities()
+                .find_map(|entity| match entity {
+                    acadrust::EntityType::Underlay(u) => match doc.objects.get(&u.definition_handle) {
+                        Some(ObjectType::UnderlayDefinition(def)) => Some((u.clone(), def.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("the underlay survives the round trip");
+            let image = crate::scene::model::image_model::ImageModel::from_underlay(&underlay, &definition);
+            (definition.file_path, image.is_some())
+        };
+        set_external_resource_refused(ExternalResource::Image, true);
+        let refused = load();
+        set_external_resource_refused(ExternalResource::Image, false);
+        let allowed = load();
+        assert_eq!(refused, ("plan.pdf".to_string(), false), "the underlay was probed or read while refused");
+        assert!(allowed.0.ends_with("plan.pdf") && allowed.0 != "plan.pdf" && allowed.1, "{allowed:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

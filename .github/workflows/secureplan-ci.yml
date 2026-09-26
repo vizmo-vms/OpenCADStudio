@@ -50,8 +50,16 @@ jobs:
       - name: Protocol vectors match the pinned manifest
         run: cargo test --locked --features secureplan --lib secureplan::vectors
 
-      - name: SecurePlan tests
-        run: cargo test --locked --features secureplan,secureplan-test --lib --test secureplan_listeners secureplan
+      # The whole suite (upstream and SecurePlan tests) with the SecurePlan
+      # features. The two skipped tests fail identically on the pinned upstream
+      # base 0d023d267bc5b7afeca3b54e98875b0efd4f3926 without any SecurePlan
+      # change (parametric-constraint solver); remove the skips when a pin
+      # bump fixes them.
+      - name: All tests (secureplan)
+        run: >
+          cargo test --locked --features secureplan,secureplan-test --
+          --skip arc_grips_drive_center_start_and_end_but_not_midpoint
+          --skip symmetric_constraint_mirrors_one_circles_center_across_the_axis_line
 
       - name: No other workflow enables secureplan-test
         run: |
@@ -93,6 +101,33 @@ jobs:
             packaging/dev/secureplan-cad.desktop
           if-no-files-found: error
           retention-days: 14
+
+  upstream-tests:
+    name: Upstream tests (default features)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev
+
+      # Proves the fork without the feature still passes upstream's suite. The
+      # skipped tests fail the same way on the pinned base (see above).
+      - name: Upstream tests
+        run: >
+          cargo test --locked --
+          --skip arc_grips_drive_center_start_and_end_but_not_midpoint
+          --skip symmetric_constraint_mirrors_one_circles_center_across_the_axis_line
 
   macos:
     name: macOS ${{ matrix.arch }} debug build

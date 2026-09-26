@@ -309,9 +309,11 @@ fn resolve_xrefs_with_filter(
 /// Handles absolute paths, relative paths, and Windows-style separators.
 fn resolve_path(raw: &str, base_dir: &Path) -> Option<PathBuf> {
     #[cfg(feature = "secureplan")]
-    if !crate::app::secureplan::guards::external_resource_allowed(
+    if !crate::app::secureplan::guards::reference_allowed(
         crate::app::secureplan::guards::ExternalResource::Xref,
-    ) {
+        raw,
+    ) || crate::app::secureplan::guards::is_remote_reference(&base_dir.to_string_lossy())
+    {
         return None;
     }
     let normalised = raw.replace('\\', "/");

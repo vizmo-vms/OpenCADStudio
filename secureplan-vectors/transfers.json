@@ -1,5 +1,5 @@
 {
-  "description": "BRG-06 transfer rules, as event sequences seen by a receiver after the handshake. Transfer ids are unique per session and direction and never reused. A zero-length transfer has no chunks and completes on transferStart. Chunks are non-empty, at most 1048576 payload bytes, with seq starting at 0 and increasing by 1.",
+  "description": "BRG-06 transfer rules, as event sequences seen by a receiver after the handshake. Transfer ids are unique per session and direction and never reused. A zero-length transfer has no chunks and completes on transferStart. Chunks are non-empty, at most 1048576 payload bytes, with seq starting at 0 and increasing by 1. At most 3 transfers are in flight per session, both directions together: a sender starts one only while fewer than 3 are in flight as it sees them (its unfinished outgoing plus unfinished incoming) and otherwise waits. Because two transferStart frames can cross, a receiver refuses a transferStart only when it would then hold more than 3 unfinished incoming transfers.",
   "limits": {
     "maxControlBytes": 1048576,
     "maxChunkPayloadBytes": 1048576,
@@ -9,7 +9,8 @@
       "application/vnd.secureplan.overlay+json",
       "application/vnd.secureplan.export+json"
     ],
-    "maxInFlight": 3,
+    "maxInFlightPerSession": 3,
+    "maxIncomingInFlight": 3,
     "noProgressTimeoutMs": 30000
   },
   "valid": [

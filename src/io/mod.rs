@@ -1261,7 +1261,13 @@ fn resolve_raster_image_paths(doc: &mut CadDocument, base_dir: Option<&Path>) {
             if raw.trim().is_empty() {
                 continue;
             }
-            if let Some(resolved) = resolve_image_file(&raw, base_dir) {
+            #[cfg(feature = "secureplan")]
+            let refused = !crate::app::secureplan::guards::external_resource_allowed(
+                crate::app::secureplan::guards::ExternalResource::Image,
+            );
+            #[cfg(not(feature = "secureplan"))]
+            let refused = false;
+            if let Some(resolved) = (!refused).then(|| resolve_image_file(&raw, base_dir)).flatten() {
                 img.file_path = resolved;
             } else {
                 // At least surface the stored path so the renderer can try it.
@@ -1278,6 +1284,12 @@ fn resolve_raster_image_paths(doc: &mut CadDocument, base_dir: Option<&Path>) {
             if def.file_path.trim().is_empty() {
                 continue;
             }
+            #[cfg(feature = "secureplan")]
+            if !crate::app::secureplan::guards::external_resource_allowed(
+                crate::app::secureplan::guards::ExternalResource::Image,
+            ) {
+                continue;
+            }
             if let Some(resolved) = resolve_image_file(&def.file_path, base_dir) {
                 def.file_path = resolved;
             }
@@ -1289,6 +1301,13 @@ fn resolve_raster_image_paths(doc: &mut CadDocument, base_dir: Option<&Path>) {
 /// as stored, then relative to the drawing folder, then just the file name
 /// next to the drawing.
 pub(crate) fn resolve_image_file(raw: &str, base_dir: Option<&Path>) -> Option<String> {
+    // SecurePlan CAD never stats a path on another machine (DSK-02).
+    #[cfg(feature = "secureplan")]
+    if crate::app::secureplan::guards::is_remote_reference(raw)
+        || base_dir.is_some_and(|dir| crate::app::secureplan::guards::is_remote_reference(&dir.to_string_lossy()))
+    {
+        return None;
+    }
     if Path::new(raw).is_file() {
         return Some(raw.to_string());
     }

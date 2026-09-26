@@ -149,12 +149,22 @@ impl PendingPairings {
     /// Add a pairing silently. A repeated pairing id replaces the earlier
     /// one; beyond [`MAX_PENDING`] the oldest is dropped.
     pub fn insert(&mut self, request: LaunchRequest, now: Instant) {
+        self.insert_received(request, now, now);
+    }
+
+    /// Add a pairing whose launch arrived at `received` (earlier than `now`
+    /// when the user was asked to trust its origin first): the token still
+    /// expires [`TOKEN_TTL`] after `received`, and an expired one is dropped.
+    pub fn insert_received(&mut self, request: LaunchRequest, received: Instant, now: Instant) {
         self.prune(now);
+        if now.saturating_duration_since(received) >= TOKEN_TTL {
+            return;
+        }
         self.entries.retain(|entry| entry.request.pairing != request.pairing);
         while self.entries.len() >= MAX_PENDING {
             self.entries.pop_front();
         }
-        self.entries.push_back(Pending { request, received: now });
+        self.entries.push_back(Pending { request, received });
     }
 
     /// Whether any live pairing names `origin` (the WebSocket upgrade check).
@@ -170,6 +180,11 @@ impl PendingPairings {
             .iter()
             .find(|entry| entry.request.pairing.expose() == pairing && entry.request.origin == origin)
             .map(|entry| entry.request.clone())
+    }
+
+    /// Drop every pairing whose origin `keep` rejects (trust was revoked).
+    pub fn retain_origins(&mut self, keep: impl Fn(&str) -> bool) {
+        self.entries.retain(|entry| keep(&entry.request.origin));
     }
 
     /// Remove a pairing once its handshake has succeeded, so it can never be
@@ -244,6 +259,19 @@ pub(crate) mod tests {
         assert!(!text.contains(cases["valid"][0]["expect"]["token"].as_str().unwrap()));
         assert!(!text.contains("secureplan.example"));
         assert!(!text.contains("7d3c1f6e"));
+    }
+
+    #[test]
+    fn a_pairing_keeps_its_launch_time_through_a_trust_prompt() {
+        let received = Instant::now();
+        let mut pending = PendingPairings::default();
+        // Approved after 60 s: it lives only the remaining 60 s.
+        pending.insert_received(launch("https://secureplan.example", 1), received, received + Duration::from_secs(60));
+        assert!(pending.find(&[1; 16], "https://secureplan.example", received + Duration::from_secs(119)).is_some());
+        assert!(pending.find(&[1; 16], "https://secureplan.example", received + TOKEN_TTL).is_none());
+        // Approved after the token expired: never added.
+        pending.insert_received(launch("https://secureplan.example", 2), received, received + TOKEN_TTL + Duration::from_secs(1));
+        assert!(pending.is_empty());
     }
 
     #[test]

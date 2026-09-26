@@ -94,6 +94,18 @@ fn sheet_point(x: f64, y: f64) -> Point {
     Point::new(Mm(x as f32), Mm(y as f32))
 }
 
+/// Points per drawing unit for lengths measured in the drawing (wide-polyline
+/// widths, linetype dashes, stroke-font pens): 1 mm per unit on a sheet, and
+/// the publication scale on a SecurePlan page. Physical pen widths do not use it.
+#[cfg(not(target_arch = "wasm32"))]
+fn drawing_unit_pt() -> f32 {
+    #[cfg(feature = "secureplan")]
+    if let Some(transform) = SECUREPLAN_PAGE.with(std::cell::Cell::get) {
+        return transform.points_per_cad_unit() as f32;
+    }
+    MM_TO_PT
+}
+
 #[cfg(all(feature = "secureplan", not(target_arch = "wasm32")))]
 thread_local! {
     static SECUREPLAN_PAGE: std::cell::Cell<Option<crate::app::secureplan::publish::PageTransform>> =
@@ -845,7 +857,7 @@ fn append_pdf_page(
             scale.max(1e-6)
         };
         let lw_pt = if wire.world_width > 0.0 {
-            wire.world_width * MM_TO_PT
+            wire.world_width * drawing_unit_pt()
         } else {
             let physical = if options.object_lineweights {
                 lw_override.unwrap_or_else(|| (wire.line_weight_px * LW_PX_TO_PT).max(0.1))
@@ -861,7 +873,7 @@ fn append_pdf_page(
 
         // Linetype dash pattern. Without this every wire exported as a solid
         // line regardless of its linetype (dashed / centre / dash-dot). (#155)
-        let dash_arr = dash_array_from_pattern(wire.pattern_length, &wire.pattern, MM_TO_PT);
+        let dash_arr = dash_array_from_pattern(wire.pattern_length, &wire.pattern, drawing_unit_pt());
         let stationed =
             !dash_arr.is_empty() && wire.pattern_stations.len() > wire.points.len();
         if stationed {
@@ -986,7 +998,7 @@ fn visible_station_ranges(
     if count == 0 || pattern_length <= 1e-6 {
         return vec![[0.0, 1.0]];
     }
-    let dot = 1.0 / MM_TO_PT;
+    let dot = 1.0 / drawing_unit_pt();
     let mut elements: Vec<(f32, bool)> = pattern[..count]
         .iter()
         .map(|value| (if *value == 0.0 { dot } else { value.abs() }, *value >= 0.0))
@@ -1695,7 +1707,7 @@ fn emit_text(
                         let glyph_unit_mm = (((tl[0] - bl[0]).powi(2) + (tl[1] - bl[1]).powi(2))
                             .sqrt()
                             / sy.abs() as f64) as f32;
-                        (2.0 * sdf_atlas::stroke_pen_half_units(ge.bold) * glyph_unit_mm * MM_TO_PT)
+                        (2.0 * sdf_atlas::stroke_pen_half_units(ge.bold) * glyph_unit_mm * drawing_unit_pt())
                             .max(0.1)
                     };
                     ops.push(Op::SetOutlineThickness { pt: Pt(pen) });

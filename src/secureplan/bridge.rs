@@ -101,6 +101,9 @@ struct SessionEntry {
 struct Shared {
     config: BridgeConfig,
     port: u16,
+    /// Origins the user trusts (and may pair from), or `None` before the
+    /// application first says; every pairing and session is checked against it.
+    trusted: Mutex<Option<HashSet<String>>>,
     pending: Mutex<PendingPairings>,
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     open_documents: Mutex<HashSet<(String, String)>>,
@@ -115,6 +118,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Shared {
     fn now(&self) -> Instant {
         (self.config.clock)()
+    }
+
+    fn origin_allowed(&self, origin: &str) -> bool {
+        lock(&self.trusted).as_ref().is_none_or(|trusted| trusted.contains(origin))
     }
 
     fn emit(&self, event: BridgeEvent) {
@@ -158,6 +165,7 @@ impl Bridge {
         let shared = Arc::new(Shared {
             config,
             port,
+            trusted: Mutex::default(),
             pending: Mutex::default(),
             sessions: Mutex::default(),
             open_documents: Mutex::default(),
@@ -180,7 +188,28 @@ impl Bridge {
 
     /// Add a pending pairing for a trusted origin (silently).
     pub fn add_pending(&self, request: LaunchRequest) {
-        lock(&self.shared.pending).insert(request, self.shared.now());
+        self.add_pending_received(request, self.shared.now());
+    }
+
+    /// Add a pending pairing whose launch arrived at `received`; it expires
+    /// 120 s after that, not after this call.
+    pub fn add_pending_received(&self, request: LaunchRequest, received: Instant) {
+        if self.shared.origin_allowed(&request.origin) {
+            lock(&self.shared.pending).insert_received(request, received, self.shared.now());
+        }
+    }
+
+    /// Set the origins that may pair. Pending pairings and handshakes from
+    /// any other origin are dropped at once, and its open sessions closed:
+    /// revoking trust takes effect immediately (BRG-02).
+    pub fn set_trusted_origins(&self, origins: HashSet<String>) {
+        *lock(&self.shared.trusted) = Some(origins);
+        lock(&self.shared.pending).retain_origins(|origin| self.shared.origin_allowed(origin));
+        for entry in lock(&self.shared.sessions).values() {
+            if !self.shared.origin_allowed(&entry.origin) {
+                let _ = entry.outbound.send(Outbound::Close("userCancelled"));
+            }
+        }
     }
 
     /// The event stream; available once.
@@ -321,7 +350,8 @@ fn serve_connection(shared: Arc<Shared>, stream: TcpStream) {
             }
         };
         let host_ok = single("host").is_some_and(|host| host == format!("127.0.0.1:{port}"));
-        let origin = single("origin").filter(|origin| lock(&shared.pending).has_origin(origin, shared.now()));
+        let origin = single("origin")
+            .filter(|origin| shared.origin_allowed(origin) && lock(&shared.pending).has_origin(origin, shared.now()));
         match (host_ok, origin) {
             (true, Some(origin)) => {
                 upgrade_origin = Some(origin);
@@ -372,11 +402,15 @@ fn handshake(shared: &Shared, socket: &mut Socket, origin: &str, deadline: Insta
     if !channel::verify_web_proof(&token, &hello.nonce_w, &nonce_d, &proof_w) {
         return None;
     }
-    // Consume the pairing exactly once, even if two connections raced.
+    // Consume the pairing exactly once, even if two connections raced, and
+    // only while its origin is still trusted (trust can be revoked mid-handshake).
     {
         let mut pending = lock(&shared.pending);
         pending.find(&hello.pairing, origin, shared.now())?;
         pending.consume(&hello.pairing);
+        if !shared.origin_allowed(origin) {
+            return None;
+        }
     }
     let keys = channel::derive_keys(&token, &hello.nonce_w, &nonce_d);
     let mut established = Established {
@@ -412,8 +446,12 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
     let needs_confirmation = lock(&shared.open_documents).contains(&(origin.clone(), survey.clone()));
     lock(&shared.sessions).insert(
         session,
-        SessionEntry { origin: origin.clone(), survey, confirmed: !needs_confirmation, outbound: outbound_sender },
+        SessionEntry { origin: origin.clone(), survey, confirmed: !needs_confirmation, outbound: outbound_sender.clone() },
     );
+    // Trust revoked between the handshake and registration: end it at once.
+    if !shared.origin_allowed(&origin) {
+        let _ = outbound_sender.send(Outbound::Close("userCancelled"));
+    }
     if !needs_confirmation {
         shared.supersede(session);
     }
@@ -430,10 +468,20 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
     let mut incoming = Incoming::default();
     let mut next_transfer: u32 = 1;
     let mut last_ping = shared.now();
+    let mut queued: std::collections::VecDeque<Outbound> = std::collections::VecDeque::new();
     let end = loop {
-        // Frames the application queued.
+        // Frames the application queued, in order. A transfer waits while
+        // the session already has 3 in flight (both directions together;
+        // ours complete as they are sent, so only incoming ones count), and
+        // everything queued after it waits too, so no message ever precedes
+        // the transfer it references (BRG-06).
         let mut local_end = None;
-        while let Ok(item) = outbound.try_recv() {
+        queued.extend(outbound.try_iter());
+        while let Some(item) = queued.pop_front() {
+            if matches!(item, Outbound::Transfer { .. }) && incoming.in_flight() >= transfer::MAX_IN_FLIGHT {
+                queued.push_front(item);
+                break;
+            }
             let result = match item {
                 Outbound::Message(message) => send_control(&mut socket, &mut established.sealer, &message),
                 Outbound::Transfer { name, media_type, bytes } => {
@@ -636,7 +684,11 @@ pub(crate) mod tests {
                         let plaintext = self.opener.open(FrameKind::Control, &sealed).ok()?;
                         return serde_json::from_slice(&plaintext).ok();
                     }
-                    Ok(Message::Binary(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                    // Chunks are opened (and dropped) so the frame counter stays in step.
+                    Ok(Message::Binary(sealed)) => {
+                        self.opener.open(FrameKind::Chunk, &sealed).ok()?;
+                    }
+                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
                     _ => return None,
                 }
             }
@@ -754,6 +806,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn revoking_trust_invalidates_pending_pairings_handshakes_and_sessions() {
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        let port = bridge.port();
+        let trusted = |origins: &[&str]| origins.iter().map(|o| o.to_string()).collect::<HashSet<_>>();
+        bridge.set_trusted_origins(trusted(&[ORIGIN]));
+
+        // launch → revoke → handshake: refused.
+        let request = launch(ORIGIN, 70);
+        bridge.add_pending(request.clone());
+        bridge.set_trusted_origins(trusted(&[]));
+        assert!(connect_web(port, &request).is_err(), "a revoked origin still paired");
+
+        // A launch for an untrusted origin is never added.
+        bridge.add_pending(launch(ORIGIN, 71));
+        assert!(connect_web(port, &launch(ORIGIN, 71)).is_err());
+
+        // Revoked in the middle of a handshake (after hello, before prove).
+        bridge.set_trusted_origins(trusted(&[ORIGIN]));
+        let request = launch(ORIGIN, 72);
+        bridge.add_pending(request.clone());
+        let (mut socket, _) = upgrade(port, Some(&format!("127.0.0.1:{port}")), Some(ORIGIN)).unwrap();
+        let nonce_w = [0x42u8; 32];
+        let hello = json!({ "type": "hello", "requestId": "h1", "pairing": b64url_encode(request.pairing.expose()), "nonceW": b64url_encode(&nonce_w), "webVersion": "0.1.0", "minDesktopVersion": "0.1.0", "protocols": [1] });
+        socket.send(Message::text(hello.to_string())).unwrap();
+        let challenge: Value = serde_json::from_str(&read_text(&mut socket).expect("challenge")).unwrap();
+        bridge.set_trusted_origins(trusted(&[]));
+        let nonce_d: [u8; 32] = channel::b64url_array(challenge["nonceD"].as_str().unwrap()).unwrap();
+        let proof_w = channel::web_proof(request.token.expose(), &nonce_w, &nonce_d);
+        socket.send(Message::text(json!({ "type": "prove", "requestId": "p1", "proofW": b64url_encode(&proof_w) }).to_string())).unwrap();
+        assert!(read_text(&mut socket).is_none(), "welcome after the origin was revoked");
+
+        // An open session from the origin is closed.
+        bridge.set_trusted_origins(trusted(&[ORIGIN]));
+        let request = launch(ORIGIN, 73);
+        bridge.add_pending(request.clone());
+        let mut web = connect_web(port, &request).unwrap();
+        assert!(matches!(next_event(&events), BridgeEvent::Opened { .. }));
+        bridge.set_trusted_origins(trusted(&[]));
+        assert_eq!(web.receive_non_ping().unwrap()["reason"], "userCancelled");
+    }
+
+    #[test]
     fn expired_pairings_are_refused() {
         let offset = Arc::new(AtomicU64::new(0));
         let clock_offset = Arc::clone(&offset);
@@ -834,6 +929,36 @@ pub(crate) mod tests {
         let start = web.receive_non_ping().unwrap();
         assert_eq!(start["type"], "transferStart");
         assert_eq!(start["byteLength"], 8);
+    }
+
+    #[test]
+    fn transfers_wait_while_three_are_in_flight_in_either_direction() {
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        let request = launch(ORIGIN, 80);
+        bridge.add_pending(request.clone());
+        let mut web = connect_web(bridge.port(), &request).unwrap();
+        let BridgeEvent::Opened { session, .. } = next_event(&events) else { panic!() };
+        // Three incoming transfers stay incomplete.
+        let payload = b"0123456789".to_vec();
+        for id in 1..=3u32 {
+            web.send(&json!({ "type": "transferStart", "requestId": format!("t{id}"), "transferId": id, "name": "synthetic.dxf", "mediaType": "image/vnd.dxf", "byteLength": payload.len(), "sha256": sha256_hex(&payload) }));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())));
+        assert!(bridge.send(session, protocol::session_state("s1", true, json!(null), json!(null), json!(null))));
+        web.socket.get_mut().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        assert!(web.receive_non_ping().is_none(), "the desktop started a fourth transfer");
+        // One incoming transfer completes: the outgoing one starts, then the message.
+        let mut chunk = 1u32.to_le_bytes().to_vec();
+        chunk.extend_from_slice(&0u32.to_le_bytes());
+        chunk.extend_from_slice(&payload);
+        let sealed = web.sealer.seal(FrameKind::Chunk, &chunk).unwrap();
+        web.send_raw(Message::binary(sealed));
+        assert!(matches!(next_event(&events), BridgeEvent::Transfer { .. }));
+        web.socket.get_mut().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(web.receive_non_ping().unwrap()["type"], "transferStart");
+        assert_eq!(web.receive_non_ping().unwrap()["type"], "sessionState");
     }
 
     #[test]

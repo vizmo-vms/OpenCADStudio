@@ -152,6 +152,129 @@ impl PageTransform {
     }
 }
 
+/// The published view, ready to write: a copy of the drawing in which every
+/// drawn curve (circle, arc, ellipse, spline, bulged or tilted polyline) is
+/// replaced by a polyline within the placement's chord tolerance, built from
+/// the renderer's own curve definitions (OCS normals included). The PDF and
+/// the SPSNAP file are both derived from this copy, so they agree with each
+/// other and never depend on the editor's zoom-level tessellation (CON-05).
+pub struct Publication {
+    pub scene: crate::scene::Scene,
+    pub transform: PageTransform,
+    /// The snap end points of each replaced curve (arc and chain ends), in
+    /// its block's coordinates, by entity handle.
+    key_points: rustc_hash::FxHashMap<u64, Vec<[f64; 3]>>,
+}
+
+/// Walk the model-space entities drawn in `scene` — through block references
+/// and array instances, with the renderer's own transforms and visibility
+/// (off, frozen, invisible) — calling `leaf` for each drawn entity of a block
+/// reference or of model space itself. Content that belongs to dimensions,
+/// tables and leaders is skipped. `plot_only` also skips non-plotting layers.
+pub(crate) fn walk_model<F>(scene: &crate::scene::Scene, plot_only: bool, mut leaf: F)
+where
+    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+{
+    use crate::scene::render_graph::{BlockRoot, BlockRootRole, RenderSceneGraph, SceneRoot};
+    let document = &scene.document;
+    let depths = scene.draw_depth_map();
+    let annotation = crate::scene::annotative::scale_handle_by_name(document, &document.header.current_annotation_scale);
+    let graph = RenderSceneGraph::new(document, None, annotation, false, depths.as_ref())
+        .with_annotation_scale(scene.annotation_scale);
+    let root = SceneRoot::Block(BlockRoot { record: scene.current_layout_block_handle_pub(), role: BlockRootRole::ModelSpace });
+    graph.walk_root(
+        root,
+        |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context),
+        |entity, context| {
+            let owned_content = !context.root_handle.is_null()
+                && !matches!(document.get_entity(context.root_handle), Some(acadrust::EntityType::Insert(_)));
+            if !owned_content {
+                leaf(entity, context);
+            }
+        },
+    );
+}
+
+/// The largest length scale of a transform's plan part.
+fn plan_scale(transform: &acadrust::types::Transform) -> f64 {
+    use acadrust::types::Vector3;
+    let x = transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0));
+    let y = transform.apply_rotation(Vector3::new(0.0, 1.0, 0.0));
+    x.x.hypot(x.y).max(y.x.hypot(y.y)).max(f64::MIN_POSITIVE)
+}
+
+/// Whether the drawn geometry of `entity` needs replacing by a polyline in
+/// world XY: every curved or OCS-placed kind the snap file includes.
+fn needs_flattening(entity: &acadrust::EntityType) -> bool {
+    use acadrust::EntityType;
+    match entity {
+        EntityType::Circle(_) | EntityType::Arc(_) | EntityType::Ellipse(_) | EntityType::Spline(_) | EntityType::Polyline2D(_) => true,
+        EntityType::LwPolyline(polyline) => {
+            polyline.vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-12)
+                || (polyline.normal.x, polyline.normal.y, polyline.normal.z) != (0.0, 0.0, 1.0)
+        }
+        _ => false,
+    }
+}
+
+/// Prepare the model-space view of `source` for publication.
+pub fn prepare_model(source: &crate::scene::Scene, transform: PageTransform) -> Result<Publication, String> {
+    use crate::scene::model::wire_model::SnapHint;
+    use acadrust::entities::LwPolyline;
+    use acadrust::types::Vector2;
+    use acadrust::EntityType;
+    if source.current_layout != "Model" {
+        return Err("The published view must be model space.".into());
+    }
+    let tolerance_cad = transform.placement.chord_tolerance_mm / transform.mapping.scale_mm_per_cad_unit;
+    // The finest tolerance each curve needs, over every instance that draws it.
+    let mut scales: rustc_hash::FxHashMap<u64, f64> = rustc_hash::FxHashMap::default();
+    walk_model(source, false, |entity, context| {
+        if needs_flattening(entity) {
+            let scale = plan_scale(&context.transform);
+            let slot = scales.entry(entity.common().handle.value()).or_insert(scale);
+            *slot = slot.max(scale);
+        }
+    });
+    let mut document = source.document.clone();
+    let mut key_points = rustc_hash::FxHashMap::default();
+    for (handle, scale) in scales {
+        let handle = acadrust::types::Handle::new(handle);
+        let Some(entity) = document.get_entity(handle) else { continue };
+        // Planar curves only; a curve through space stays as the renderer draws it.
+        let Some(curve) = crate::entities::curve::entity_curve(entity) else { continue };
+        let points = curve.tessellate_within(tolerance_cad / scale);
+        if points.len() < 2 {
+            continue;
+        }
+        let mut polyline = LwPolyline::from_points(points.iter().map(|p| Vector2::new(p[0], p[1])).collect());
+        polyline.common = entity.common().clone();
+        // Linetypes run along the whole curve, as they did on the original.
+        polyline.plinegen = true;
+        if let EntityType::LwPolyline(original) = entity {
+            polyline.constant_width = original.constant_width;
+        }
+        // Chain vertices (polylines) and curve ends (arcs, open ellipses and splines).
+        let snap = crate::entities::curve::snap_from(&curve);
+        let mut keys = snap.key_vertices;
+        keys.extend(snap.snap_pts.iter().filter(|(_, hint)| matches!(hint, SnapHint::Endpoint)).map(|(point, _)| point.to_array()));
+        key_points.insert(handle.value(), keys);
+        document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::LwPolyline(polyline)));
+    }
+    let mut scene = crate::scene::Scene::new();
+    scene.document = document;
+    scene.annotation_scale = source.annotation_scale;
+    scene.rebuild_derived_caches();
+    Ok(Publication { scene, transform, key_points })
+}
+
+impl Publication {
+    /// Snap end points recorded for a replaced curve.
+    pub(crate) fn key_points(&self, handle: u64) -> Option<&[[f64; 3]]> {
+        self.key_points.get(&handle).map(Vec::as_slice)
+    }
+}
+
 /// A published page: the vector PDF bytes and what could not be drawn.
 pub struct PublishedPdf {
     pub bytes: Vec<u8>,
@@ -160,12 +283,10 @@ pub struct PublishedPdf {
     pub omitted_images: usize,
 }
 
-/// The model-space view of `scene` as a one-page CON-01 PDF.
-pub fn model_pdf(scene: &crate::scene::Scene, transform: PageTransform) -> Result<PublishedPdf, String> {
+/// The published model-space view as a one-page CON-01 PDF.
+pub fn model_pdf(publication: &Publication) -> Result<PublishedPdf, String> {
     use crate::io::pdf_export::{PlotContent, PlotGroupSplits, PlotWire};
-    if scene.current_layout != "Model" {
-        return Err("The published view must be model space.".into());
-    }
+    let scene = &publication.scene;
     let (wires, _) = scene.plot_wire_groups(None);
     let wires: Vec<_> = wires.into_iter().filter(|wire| wire.plot_visible).collect();
     let depths = scene.plot_wire_depths(&wires);
@@ -180,7 +301,7 @@ pub fn model_pdf(scene: &crate::scene::Scene, transform: PageTransform) -> Resul
         wipeouts,
         images: Vec::new(),
     };
-    let bytes = crate::io::pdf_export::secureplan_page_pdf(content, transform)?;
+    let bytes = crate::io::pdf_export::secureplan_page_pdf(content, publication.transform)?;
     Ok(PublishedPdf { bytes, omitted_images })
 }
 
@@ -229,10 +350,10 @@ pub(crate) fn finish_pdf(mut doc: lopdf::Document, width_pt: u32, height_pt: u32
     save(&mut doc)
 }
 
-/// Build the SPSNAP file for the model-space view (CON-05).
-pub fn model_snap(doc: &acadrust::CadDocument, transform: PageTransform) -> Vec<u8> {
-    let geometry = snap::extract_model(doc, &transform);
-    snap::write(&geometry, transform.placement.width_pt, transform.placement.height_pt)
+/// The SPSNAP file for the published model-space view (CON-05).
+pub fn model_snap(publication: &Publication) -> Vec<u8> {
+    let geometry = snap::extract(publication);
+    snap::write(&geometry, publication.transform.placement.width_pt, publication.transform.placement.height_pt)
 }
 
 #[cfg(test)]
@@ -320,8 +441,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A synthetic floor plan, written as DXF and read back like an import.
+    /// A synthetic floor plan, written as DXF and read back like an import:
+    /// lines, a circle, an arc, a closed room polyline and a legacy POLYLINE
+    /// with a bulge.
     pub(crate) fn synthetic_dxf_scene() -> crate::scene::Scene {
+        use acadrust::entities::{Polyline2D, Vertex2D};
         let mut doc = CadDocument::new();
         let line = |x0: f64, y0: f64, x1: f64, y1: f64| {
             EntityType::Line(Line::from_points(Vector3::new(x0, y0, 0.0), Vector3::new(x1, y1, 0.0)))
@@ -354,6 +478,14 @@ pub(crate) mod tests {
         ]);
         room.is_closed = true;
         doc.add_entity(EntityType::LwPolyline(room)).unwrap();
+        // A legacy POLYLINE: a half-circle bulge from (10000,2000) to (12000,2000), then straight up.
+        let mut legacy = Polyline2D::new();
+        let mut first = Vertex2D::new(Vector3::new(10000.0, 2000.0, 0.0));
+        first.bulge = 1.0;
+        legacy.add_vertex(first);
+        legacy.add_vertex(Vertex2D::new(Vector3::new(12000.0, 2000.0, 0.0)));
+        legacy.add_vertex(Vertex2D::new(Vector3::new(12000.0, 3000.0, 0.0)));
+        doc.add_entity(EntityType::Polyline2D(legacy)).unwrap();
         let bytes = crate::io::save_to_bytes(&doc, "dxf", doc.version).unwrap();
         let mut scene = crate::scene::Scene::new();
         scene.document = crate::io::load_bytes("synthetic.dxf", bytes).unwrap();
@@ -367,18 +499,43 @@ pub(crate) mod tests {
         PageTransform { mapping, placement }
     }
 
+    pub(crate) fn publish(scene: &crate::scene::Scene, transform: PageTransform) -> (PublishedPdf, Publication) {
+        let publication = prepare_model(scene, transform).unwrap();
+        (model_pdf(&publication).unwrap(), publication)
+    }
+
     fn page_dict(doc: &lopdf::Document) -> lopdf::Dictionary {
         let pages = doc.get_pages();
         assert_eq!(pages.len(), 1);
         doc.get_object(*pages.values().next().unwrap()).unwrap().as_dict().unwrap().clone()
     }
 
+    /// Every operation of the page content.
+    fn operations(bytes: &[u8]) -> Vec<lopdf::content::Operation> {
+        let doc = lopdf::Document::load_mem(bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        lopdf::content::Content::decode(&doc.get_page_content(page).unwrap()).unwrap().operations
+    }
+
+    fn number(object: &lopdf::Object) -> f64 {
+        object.as_float().map(f64::from).or_else(|_| object.as_i64().map(|v| v as f64)).unwrap()
+    }
+
+    /// Every `m`/`l` operand pair in the page content, in page points.
+    pub(crate) fn content_points(bytes: &[u8]) -> Vec<[f64; 2]> {
+        operations(bytes)
+            .iter()
+            .filter(|op| op.operator == "m" || op.operator == "l")
+            .map(|op| [number(&op.operands[0]), number(&op.operands[1])])
+            .collect()
+    }
+
     #[test]
     fn the_published_pdf_follows_the_page_convention_and_is_deterministic() {
         let scene = synthetic_dxf_scene();
         let transform = empty_survey_transform();
-        let first = model_pdf(&scene, transform).unwrap();
-        let second = model_pdf(&scene, transform).unwrap();
+        let (first, _) = publish(&scene, transform);
+        let (second, _) = publish(&scene, transform);
         assert_eq!(first.bytes, second.bytes, "identical bytes on a second run");
         assert_eq!(first.omitted_images, 0);
 
@@ -403,27 +560,11 @@ pub(crate) mod tests {
         assert_eq!(id[0].as_str().unwrap().len(), 16);
     }
 
-    /// Every `m`/`l` operand pair in the page content, in page points.
-    pub(crate) fn content_points(bytes: &[u8]) -> Vec<[f64; 2]> {
-        let doc = lopdf::Document::load_mem(bytes).unwrap();
-        let page = *doc.get_pages().values().next().unwrap();
-        let content = lopdf::content::Content::decode(&doc.get_page_content(page).unwrap()).unwrap();
-        content
-            .operations
-            .iter()
-            .filter(|op| op.operator == "m" || op.operator == "l")
-            .map(|op| {
-                let n = |o: &lopdf::Object| o.as_float().map(f64::from).or_else(|_| o.as_i64().map(|v| v as f64)).unwrap();
-                [n(&op.operands[0]), n(&op.operands[1])]
-            })
-            .collect()
-    }
-
     #[test]
     fn a_known_line_lands_where_the_placement_says() {
         let scene = synthetic_dxf_scene();
         let transform = empty_survey_transform();
-        let pdf = model_pdf(&scene, transform).unwrap();
+        let (pdf, _) = publish(&scene, transform);
         let points = content_points(&pdf.bytes);
         let r_pt = transform.placement.rounding_bound_mm / transform.placement.mm_per_pt;
         for cad in [[12345.6, 7890.1], [20000.0, 10000.0], [0.0, 18000.0], [30000.0, 0.0]] {
@@ -435,5 +576,81 @@ pub(crate) mod tests {
             // The operand is the f32 page value; the written decimal adds no error beyond it.
             assert!(nearest <= r_pt * std::f64::consts::SQRT_2 + 1e-6, "{cad:?}: nearest operand {nearest} pt");
         }
+    }
+
+    #[test]
+    fn published_curves_meet_the_chord_tolerance_and_ignore_the_viewport() {
+        let scene = synthetic_dxf_scene();
+        let transform = empty_survey_transform();
+        let (pdf, publication) = publish(&scene, transform);
+        let (cx, cy) = transform.apply(5000.0, 5000.0);
+        let radius_pt = 750.0 / transform.placement.mm_per_pt;
+        let tolerance_pt = transform.placement.chord_tolerance_mm / transform.placement.mm_per_pt;
+        let r_pt = transform.placement.rounding_bound_mm / transform.placement.mm_per_pt;
+        let points = content_points(&pdf.bytes);
+        let on_circle = |p: &[f64; 2]| ((p[0] - cx).hypot(p[1] - cy) - radius_pt).abs() < 0.05;
+        let mut chords = 0;
+        for pair in points.windows(2) {
+            if on_circle(&pair[0]) && on_circle(&pair[1]) && (pair[0][0] - pair[1][0]).hypot(pair[0][1] - pair[1][1]) < 50.0 {
+                let mid = [(pair[0][0] + pair[1][0]) / 2.0, (pair[0][1] + pair[1][1]) / 2.0];
+                let sagitta = radius_pt - (mid[0] - cx).hypot(mid[1] - cy);
+                assert!(sagitta <= tolerance_pt + 2.0 * r_pt, "chord error {sagitta} pt > {tolerance_pt} pt");
+                chords += 1;
+            }
+        }
+        // The editor's 48-segment circle would have a 1.6 mm chord error here.
+        assert!(chords > 48, "only {chords} chords on the circle");
+
+        // The PDF and the snap file draw the same polyline.
+        let snaps = crate::app::secureplan::snap::extract(&publication);
+        let circle_ends: Vec<[f32; 2]> = snaps
+            .segments
+            .iter()
+            .flat_map(|s| [[s[0], s[1]], [s[2], s[3]]])
+            .filter(|p| on_circle(&[p[0] as f64, p[1] as f64]))
+            .collect();
+        assert!(!circle_ends.is_empty());
+        for end in circle_ends {
+            assert!(points.iter().any(|p| (p[0] - end[0] as f64).abs() < 1e-3 && (p[1] - end[1] as f64).abs() < 1e-3), "{end:?} not drawn");
+        }
+
+        // Zooming the editor changes nothing in the published page.
+        for (width, height) in [(10.0, 10.0), (20000.0, 20000.0)] {
+            scene.set_render_pixel_scale(width, height);
+            assert_eq!(publish(&scene, transform).0.bytes, pdf.bytes, "viewport {width}x{height} changed the PDF");
+        }
+    }
+
+    #[test]
+    fn drawing_unit_lengths_follow_a_non_default_publication_scale() {
+        use acadrust::tables::LineType;
+        // A feet drawing at 5 mm per point: 60.96 points per drawing unit.
+        let mut doc = CadDocument::new();
+        doc.line_types.add(LineType::dashed()).unwrap();
+        let mut wide = LwPolyline::from_points(vec![Vector2::new(10.0, 10.0), Vector2::new(40.0, 10.0)]);
+        wide.constant_width = 2.0;
+        doc.add_entity(EntityType::LwPolyline(wide)).unwrap();
+        let mut dashed = Line::from_points(Vector3::new(10.0, 30.0, 0.0), Vector3::new(40.0, 30.0, 0.0));
+        dashed.common.linetype = "Dashed".into();
+        doc.add_entity(EntityType::Line(dashed)).unwrap();
+        let mut scene = crate::scene::Scene::new();
+        scene.document = doc;
+        scene.rebuild_derived_caches();
+        let mapping = Mapping { cad_origin: [0.0, 50.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 304.8, quarter_turns: 0 };
+        let placement = place_page([0.0, 0.0, 50.0, 50.0], &mapping, 5.0).unwrap();
+        let transform = PageTransform { mapping, placement };
+        let unit = transform.points_per_cad_unit();
+        assert!((unit - 60.96).abs() < 1e-9);
+        let (pdf, _) = publish(&scene, transform);
+        let ops = operations(&pdf.bytes);
+        let widths: Vec<f64> = ops.iter().filter(|op| op.operator == "w").map(|op| number(&op.operands[0])).collect();
+        assert!(widths.iter().any(|w| (w - 2.0 * unit).abs() < 0.01), "polyline width not scaled: {widths:?}");
+        let dashes: Vec<Vec<f64>> = ops
+            .iter()
+            .filter(|op| op.operator == "d")
+            .map(|op| op.operands[0].as_array().unwrap().iter().map(number).collect())
+            .filter(|dash: &Vec<f64>| !dash.is_empty())
+            .collect();
+        assert!(dashes.iter().any(|dash| dash == &vec![(0.5 * unit).round(), (0.25 * unit).round()]), "dashes not scaled: {dashes:?}");
     }
 }

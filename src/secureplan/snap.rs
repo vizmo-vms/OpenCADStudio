@@ -6,25 +6,27 @@
 //! `u32 uncompressedBodyBytes`; then `f32[2·pointCount]` endpoints and vertices
 //! and `f32[4·segmentCount]` segments, in CON-01 page points.
 //!
-//! Included: model geometry visible in the published view — lines,
-//! lightweight polylines (bulges tessellated), arcs and circles, and the same
-//! inside block references. Excluded: text, mtext, dimensions, hatches,
-//! images and paper space. Curves are tessellated within the placement's
-//! chord tolerance; everything is clipped to the page.
+//! Included: model geometry visible in the published view — lines and the
+//! polylines of the prepared publication ([`super::publish::Publication`]),
+//! which replaces every curve (arcs, circles, ellipses, splines, bulged or
+//! tilted polylines, legacy POLYLINEs) by the same polyline the PDF draws —
+//! inside block references too, walked with the renderer's transforms and
+//! visibility rules (invisible, off, frozen and non-plotting layers). Excluded:
+//! text, mtext, dimensions, tables, leaders, hatches, images and paper
+//! space. Everything is clipped to the page.
 
 use std::io::Write;
 
-use acadrust::{CadDocument, EntityType};
+use acadrust::types::{Transform, Vector3};
+use acadrust::EntityType;
 
-use super::publish::PageTransform;
+use super::publish::{PageTransform, Publication};
 
 pub const MAGIC: &[u8; 8] = b"SPSNAP01";
 pub const VERSION: u32 = 1;
 pub const FLAG_GZIP: u32 = 1;
 pub const HEADER_LEN: usize = 36;
 pub const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
-/// Block nesting beyond this is not followed (DSK-01 depth limit).
-const MAX_BLOCK_DEPTH: usize = 32;
 
 /// Snap geometry in page points.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -33,62 +35,21 @@ pub struct SnapGeometry {
     pub segments: Vec<[f32; 4]>,
 }
 
-/// A 2D affine map in CAD units: `(a·x + c·y + e, b·x + d·y + f)`.
-#[derive(Debug, Clone, Copy)]
-struct Affine([f64; 6]);
-
-impl Affine {
-    const IDENTITY: Affine = Affine([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-
-    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        let [a, b, c, d, e, f] = self.0;
-        (a * x + c * y + e, b * x + d * y + f)
-    }
-
-    /// `self ∘ other`: apply `other` first.
-    fn then_from(&self, other: &Affine) -> Affine {
-        let [a, b, c, d, e, f] = self.0;
-        let [a2, b2, c2, d2, e2, f2] = other.0;
-        Affine([
-            a * a2 + c * b2,
-            b * a2 + d * b2,
-            a * c2 + c * d2,
-            b * c2 + d * d2,
-            a * e2 + c * f2 + e,
-            b * e2 + d * f2 + f,
-        ])
-    }
-
-    /// The largest linear scale, for tessellating curves.
-    fn max_scale(&self) -> f64 {
-        let [a, b, c, d, _, _] = self.0;
-        (a * a + b * b).sqrt().max((c * c + d * d).sqrt())
-    }
-}
-
 struct Collector<'a> {
-    doc: &'a CadDocument,
     page: &'a PageTransform,
     width: f64,
     height: f64,
-    /// Chord tolerance in world mm.
-    chord_mm: f64,
     out: SnapGeometry,
 }
 
 impl Collector<'_> {
-    fn visible(&self, entity: &EntityType) -> bool {
-        let layer = &entity.common().layer;
-        self.doc.layers.get(layer).is_none_or(|layer| !layer.is_off() && !layer.is_frozen())
+    fn to_page(&self, transform: &Transform, [x, y, z]: [f64; 3]) -> (f64, f64) {
+        let world = transform.apply(Vector3::new(x, y, z));
+        self.page.apply(world.x, world.y)
     }
 
-    fn to_page(&self, affine: &Affine, x: f64, y: f64) -> (f64, f64) {
-        let (cx, cy) = affine.apply(x, y);
-        self.page.apply(cx, cy)
-    }
-
-    fn point(&mut self, affine: &Affine, x: f64, y: f64) {
-        let (px, py) = self.to_page(affine, x, y);
+    fn point(&mut self, transform: &Transform, p: [f64; 3]) {
+        let (px, py) = self.to_page(transform, p);
         if (0.0..=self.width).contains(&px) && (0.0..=self.height).contains(&py) {
             self.out.points.push([px as f32, py as f32]);
         }
@@ -122,134 +83,63 @@ impl Collector<'_> {
         }
     }
 
-    fn segment(&mut self, affine: &Affine, (x0, y0): (f64, f64), (x1, y1): (f64, f64)) {
-        let a = self.to_page(affine, x0, y0);
-        let b = self.to_page(affine, x1, y1);
+    fn segment(&mut self, transform: &Transform, a: [f64; 3], b: [f64; 3]) {
+        let a = self.to_page(transform, a);
+        let b = self.to_page(transform, b);
         self.page_segment(a, b);
     }
 
-    /// Tessellate an arc (CAD units, radians, counter-clockwise from `start`
-    /// through `sweep`) within the chord tolerance.
-    fn arc(&mut self, affine: &Affine, center: (f64, f64), radius: f64, start: f64, sweep: f64) {
-        if !(radius.is_finite() && radius > 0.0 && sweep.is_finite()) || sweep == 0.0 {
-            return;
-        }
-        let radius_mm = radius * affine.max_scale() * self.page.mapping.scale_mm_per_cad_unit;
-        let step = if self.chord_mm >= radius_mm {
-            std::f64::consts::FRAC_PI_2
-        } else {
-            (2.0 * (1.0 - self.chord_mm / radius_mm).acos()).min(std::f64::consts::FRAC_PI_2)
-        };
-        let count = ((sweep.abs() / step).ceil() as usize).clamp(1, 1 << 16);
-        let at = |i: usize| {
-            let angle = start + sweep * i as f64 / count as f64;
-            (center.0 + radius * angle.cos(), center.1 + radius * angle.sin())
-        };
-        for i in 0..count {
-            self.segment(affine, at(i), at(i + 1));
-        }
-    }
-
-    fn entity(&mut self, entity: &EntityType, affine: &Affine, depth: usize) {
-        if !self.visible(entity) {
-            return;
-        }
+    fn entity(&mut self, publication: &Publication, entity: &EntityType, transform: &Transform) {
         match entity {
             EntityType::Line(line) => {
-                let (a, b) = ((line.start.x, line.start.y), (line.end.x, line.end.y));
-                self.point(affine, a.0, a.1);
-                self.point(affine, b.0, b.1);
-                self.segment(affine, a, b);
+                let (a, b) = ([line.start.x, line.start.y, line.start.z], [line.end.x, line.end.y, line.end.z]);
+                self.point(transform, a);
+                self.point(transform, b);
+                self.segment(transform, a, b);
             }
+            // After preparation every polyline with a bulge or a tilted plane
+            // is a replaced curve in world XY; the rest are plain XY chains.
             EntityType::LwPolyline(polyline) => {
-                let vertices = &polyline.vertices;
-                for vertex in vertices {
-                    self.point(affine, vertex.location.x, vertex.location.y);
-                }
-                let count = if polyline.is_closed { vertices.len() } else { vertices.len().saturating_sub(1) };
-                for i in 0..count {
-                    let (from, to) = (&vertices[i], &vertices[(i + 1) % vertices.len()]);
-                    let (a, b) = ((from.location.x, from.location.y), (to.location.x, to.location.y));
-                    if from.bulge.abs() < 1e-12 {
-                        self.segment(affine, a, b);
-                        continue;
+                let z = polyline.elevation;
+                let vertices: Vec<[f64; 3]> = polyline.vertices.iter().map(|v| [v.location.x, v.location.y, z]).collect();
+                match publication.key_points(polyline.common.handle.value()) {
+                    Some(keys) => {
+                        for key in keys {
+                            self.point(transform, *key);
+                        }
                     }
-                    // bulge = tan(θ/4): radius and centre from the chord.
-                    let theta = 4.0 * from.bulge.atan();
-                    let chord = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-                    if chord == 0.0 {
-                        continue;
-                    }
-                    let radius = chord / (2.0 * (theta / 2.0).sin().abs());
-                    let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
-                    let sagitta_offset = radius * (theta / 2.0).cos() * theta.signum();
-                    let normal = (-(b.1 - a.1) / chord, (b.0 - a.0) / chord);
-                    let center = (mid.0 + normal.0 * sagitta_offset, mid.1 + normal.1 * sagitta_offset);
-                    let start = (a.1 - center.1).atan2(a.0 - center.0);
-                    self.arc(affine, center, radius, start, theta);
-                }
-            }
-            EntityType::Arc(arc) => {
-                let mut sweep = arc.end_angle - arc.start_angle;
-                if sweep <= 0.0 {
-                    sweep += std::f64::consts::TAU;
-                }
-                let center = (arc.center.x, arc.center.y);
-                let at = |angle: f64| (center.0 + arc.radius * angle.cos(), center.1 + arc.radius * angle.sin());
-                let (s, e) = (at(arc.start_angle), at(arc.end_angle));
-                self.point(affine, s.0, s.1);
-                self.point(affine, e.0, e.1);
-                self.arc(affine, center, arc.radius, arc.start_angle, sweep);
-            }
-            EntityType::Circle(circle) => {
-                self.arc(affine, (circle.center.x, circle.center.y), circle.radius, 0.0, std::f64::consts::TAU);
-            }
-            EntityType::Insert(insert) if depth < MAX_BLOCK_DEPTH => {
-                let (sin, cos) = insert.rotation.sin_cos();
-                let (sx, sy) = (insert.x_scale(), insert.y_scale());
-                let columns = insert.column_count.max(1);
-                let rows = insert.row_count.max(1);
-                for row in 0..rows {
-                    for column in 0..columns {
-                        let (ox, oy) = (column as f64 * insert.column_spacing, row as f64 * insert.row_spacing);
-                        // Block space → rotated, scaled, placed at the insertion point
-                        // (array offsets are along the rotated axes).
-                        let local = Affine([
-                            cos * sx,
-                            sin * sx,
-                            -sin * sy,
-                            cos * sy,
-                            insert.insert_point.x + cos * ox - sin * oy,
-                            insert.insert_point.y + sin * ox + cos * oy,
-                        ]);
-                        let combined = affine.then_from(&local);
-                        let block: Vec<&EntityType> = self.doc.entities_in_block(&insert.block_name).collect();
-                        for child in block {
-                            self.entity(child, &combined, depth + 1);
+                    None => {
+                        for vertex in &vertices {
+                            self.point(transform, *vertex);
                         }
                     }
                 }
+                for pair in vertices.windows(2) {
+                    self.segment(transform, pair[0], pair[1]);
+                }
+                if polyline.is_closed && vertices.len() > 2 {
+                    self.segment(transform, vertices[vertices.len() - 1], vertices[0]);
+                }
             }
-            // Text, mtext, dimensions, hatches, images and everything else
+            // Text, dimensions, hatches, images and every other kind
             // contribute no snaps (CON-05).
             _ => {}
         }
     }
 }
 
-/// Snap geometry for the model-space view of `doc` on the page `transform`.
-pub fn extract_model(doc: &CadDocument, transform: &PageTransform) -> SnapGeometry {
+/// Snap geometry for a prepared publication.
+pub fn extract(publication: &Publication) -> SnapGeometry {
+    let page = &publication.transform;
     let mut collector = Collector {
-        doc,
-        page: transform,
-        width: transform.placement.width_pt as f64,
-        height: transform.placement.height_pt as f64,
-        chord_mm: transform.placement.chord_tolerance_mm,
+        page,
+        width: page.placement.width_pt as f64,
+        height: page.placement.height_pt as f64,
         out: SnapGeometry::default(),
     };
-    for entity in doc.model_space_entities() {
-        collector.entity(entity, &Affine::IDENTITY, 0);
-    }
+    super::publish::walk_model(&publication.scene, true, |entity, context| {
+        collector.entity(publication, entity, &context.transform);
+    });
     collector.out
 }
 
@@ -281,6 +171,7 @@ pub fn write(geometry: &SnapGeometry, width_pt: u32, height_pt: u32) -> Vec<u8> 
 pub(crate) mod tests {
     use super::*;
     use crate::app::secureplan::publish::tests::{empty_survey_transform, synthetic_dxf_scene};
+    use acadrust::CadDocument;
     use crate::app::secureplan::vectors;
     use std::io::Read;
 
@@ -360,41 +251,146 @@ pub(crate) mod tests {
         }
     }
 
+    fn has_point(geometry: &SnapGeometry, (x, y): (f64, f64)) -> bool {
+        geometry.points.iter().any(|p| (p[0] as f64 - x).abs() < 1e-3 && (p[1] as f64 - y).abs() < 1e-3)
+    }
+
+    fn on_segments(geometry: &SnapGeometry, (x, y): (f64, f64)) -> bool {
+        geometry.segments.iter().any(|s| {
+            [[s[0], s[1]], [s[2], s[3]]].iter().any(|p| (p[0] as f64 - x).abs() < 1e-3 && (p[1] as f64 - y).abs() < 1e-3)
+        })
+    }
+
     #[test]
     fn written_snaps_are_accepted_deterministic_and_on_the_geometry() {
         let scene = synthetic_dxf_scene();
         let transform = empty_survey_transform();
-        let bytes = crate::app::secureplan::publish::model_snap(&scene.document, transform);
-        assert_eq!(bytes, crate::app::secureplan::publish::model_snap(&scene.document, transform), "deterministic");
+        let publication = crate::app::secureplan::publish::prepare_model(&scene, transform).unwrap();
+        let bytes = crate::app::secureplan::publish::model_snap(&publication);
+        assert_eq!(bytes, crate::app::secureplan::publish::model_snap(&publication), "deterministic");
         assert_eq!(&bytes[36 + 4..36 + 8], &[0, 0, 0, 0], "gzip MTIME is 0");
         let geometry = read(&bytes, (10_000, 6_000)).expect("the reader accepts the writer's output");
-        // Five lines (10 endpoints), the arc's two ends and four room vertices.
-        assert_eq!(geometry.points.len(), 16);
-        let (x, y) = transform.apply(12345.6, 7890.1);
-        assert!(geometry.points.iter().any(|p| (p[0] as f64 - x).abs() < 1e-3 && (p[1] as f64 - y).abs() < 1e-3));
-        // The circle (r = 750 mm, 250 pt) is tessellated within the chord tolerance.
-        let circle_segments = geometry
+        let at = |x: f64, y: f64| transform.apply(x, y);
+        // Line ends, arc ends, room corners and the legacy POLYLINE's vertices.
+        for point in [at(12345.6, 7890.1), at(26000.0, 5000.0), at(25000.0, 6000.0), at(8000.0, 16000.0), at(10000.0, 2000.0), at(12000.0, 2000.0), at(12000.0, 3000.0)] {
+            assert!(has_point(&geometry, point), "missing snap point {point:?}");
+        }
+        // The circle contributes segments but no end points.
+        let (cx, cy) = at(5000.0, 5000.0);
+        assert!(!geometry.points.iter().any(|p| ((p[0] as f64 - cx).hypot(p[1] as f64 - cy) - 250.0).abs() < 0.01));
+        // The POLYLINE's bulge is a half circle of radius 1000 below the chord,
+        // within the chord tolerance.
+        let (bx, by) = at(11000.0, 2000.0);
+        let tolerance_pt = transform.placement.chord_tolerance_mm / transform.placement.mm_per_pt;
+        let bulge: Vec<&[f32; 4]> = geometry
             .segments
             .iter()
             .filter(|s| {
-                let (cx, cy) = transform.apply(5000.0, 5000.0);
-                ((s[0] as f64 - cx).hypot(s[1] as f64 - cy) - 250.0).abs() < 0.01
+                [[s[0], s[1]], [s[2], s[3]]].iter().all(|p| ((p[0] as f64 - bx).hypot(p[1] as f64 - by) - 1000.0 / 3.0).abs() < 0.01)
             })
-            .count();
-        let tolerance_pt = transform.placement.chord_tolerance_mm / transform.placement.mm_per_pt;
-        let expected = (std::f64::consts::TAU / (2.0 * (1.0 - tolerance_pt / 250.0).acos())).ceil() as usize;
-        assert_eq!(circle_segments, expected);
+            .collect();
+        assert!(bulge.len() > 8, "bulge not tessellated: {}", bulge.len());
+        for s in bulge {
+            let mid = ((s[0] + s[2]) as f64 / 2.0, (s[1] + s[3]) as f64 / 2.0);
+            assert!(1000.0 / 3.0 - (mid.0 - bx).hypot(mid.1 - by) <= tolerance_pt + 1e-3);
+            // A positive bulge from left to right turns counter-clockwise: below the chord.
+            assert!(mid.1 <= by, "the bulge runs on the wrong side of its chord");
+        }
+    }
+
+    fn scene_of(doc: CadDocument) -> crate::scene::Scene {
+        let mut scene = crate::scene::Scene::new();
+        scene.document = doc;
+        scene.rebuild_derived_caches();
+        scene
+    }
+
+    fn unit_transform() -> PageTransform {
+        use crate::app::secureplan::publish::{place_page, Mapping};
+        let mapping = Mapping { cad_origin: [-300.0, 200.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
+        PageTransform { mapping, placement: place_page([-300.0, -100.0, 300.0, 200.0], &mapping, 1.0).unwrap() }
+    }
+
+    fn line(x0: f64, y0: f64, x1: f64, y1: f64) -> EntityType {
+        EntityType::Line(acadrust::entities::Line::from_points(Vector3::new(x0, y0, 0.0), Vector3::new(x1, y1, 0.0)))
+    }
+
+    fn block(doc: &mut CadDocument, name: &str, members: Vec<EntityType>) {
+        let mut record = acadrust::tables::BlockRecord::new(name);
+        record.handle = doc.allocate_handle();
+        let owner = record.handle;
+        doc.block_records.add(record).unwrap();
+        for mut member in members {
+            member.common_mut().owner_handle = owner;
+            doc.add_entity(member).unwrap();
+        }
+    }
+
+    #[test]
+    fn negative_z_normals_are_mirrored_like_the_renderer_draws_them() {
+        use acadrust::entities::{Arc, Circle, Insert};
+        let down = Vector3::new(0.0, 0.0, -1.0);
+        let mut doc = CadDocument::new();
+        let mut circle = Circle::new();
+        circle.center = Vector3::new(100.0, 50.0, 0.0);
+        circle.radius = 10.0;
+        circle.normal = down;
+        doc.add_entity(EntityType::Circle(circle)).unwrap();
+        let mut arc = Arc::new();
+        arc.radius = 100.0;
+        arc.start_angle = 0.0;
+        arc.end_angle = std::f64::consts::FRAC_PI_2;
+        arc.normal = down;
+        doc.add_entity(EntityType::Arc(arc)).unwrap();
+        block(&mut doc, "MIRRORED", vec![line(0.0, 0.0, 10.0, 0.0)]);
+        let mut insert = Insert::new("MIRRORED", Vector3::new(200.0, 0.0, 0.0));
+        insert.normal = down;
+        doc.add_entity(EntityType::Insert(insert)).unwrap();
+        let scene = scene_of(doc);
+        let transform = unit_transform();
+        let (pdf, publication) = crate::app::secureplan::publish::tests::publish(&scene, transform);
+        let geometry = extract(&publication);
+        let at = |x: f64, y: f64| transform.apply(x, y);
+        // OCS (x, y) with a -Z normal is WCS (-x, y).
+        let (cx, cy) = at(-100.0, 50.0);
+        let circle: Vec<_> = geometry.segments.iter().filter(|s| ((s[0] as f64 - cx).hypot(s[1] as f64 - cy) - 10.0).abs() < 0.01).collect();
+        assert!(circle.len() > 8, "the circle is not at its mirrored centre");
+        assert!(has_point(&geometry, at(-100.0, 0.0)) && has_point(&geometry, at(0.0, 100.0)), "arc ends not mirrored");
+        assert!(has_point(&geometry, at(-200.0, 0.0)) && has_point(&geometry, at(-210.0, 0.0)), "insert not mirrored");
+        // The PDF draws the same mirrored geometry.
+        let drawn = crate::app::secureplan::publish::tests::content_points(&pdf.bytes);
+        for point in [at(-200.0, 0.0), at(-210.0, 0.0), at(-100.0, 0.0), at(0.0, 100.0)] {
+            assert!(drawn.iter().any(|p| (p[0] - point.0).abs() < 1e-3 && (p[1] - point.1).abs() < 1e-3), "PDF misses {point:?}");
+        }
+    }
+
+    #[test]
+    fn invisible_members_and_non_plotting_layers_contribute_no_snaps() {
+        use acadrust::entities::Insert;
+        let mut doc = CadDocument::new();
+        let mut hidden = line(0.0, 0.0, 0.0, 50.0);
+        hidden.common_mut().invisible = true;
+        block(&mut doc, "PARTLY_HIDDEN", vec![line(0.0, 0.0, 50.0, 0.0), hidden]);
+        doc.add_entity(EntityType::Insert(Insert::new("PARTLY_HIDDEN", Vector3::new(0.0, 0.0, 0.0)))).unwrap();
+        let mut no_plot = acadrust::tables::Layer::new("NO_PLOT");
+        no_plot.is_plottable = false;
+        doc.layers.add(no_plot).unwrap();
+        let mut guide = line(-100.0, 100.0, 100.0, 100.0);
+        guide.common_mut().layer = "NO_PLOT".into();
+        doc.add_entity(guide).unwrap();
+        let transform = unit_transform();
+        let publication = crate::app::secureplan::publish::prepare_model(&scene_of(doc), transform).unwrap();
+        let geometry = extract(&publication);
+        let at = |x: f64, y: f64| transform.apply(x, y);
+        assert!(on_segments(&geometry, at(50.0, 0.0)), "the visible member is missing");
+        assert!(!on_segments(&geometry, at(0.0, 50.0)), "an invisible block member was included");
+        assert!(!on_segments(&geometry, at(100.0, 100.0)), "a non-plotting layer was included");
+        assert_eq!(geometry.segments.len(), 1);
     }
 
     #[test]
     fn segments_are_clipped_to_the_page_and_hidden_layers_are_skipped() {
         let mut doc = CadDocument::new();
-        let line = |x0: f64, y0: f64, x1: f64, y1: f64| {
-            EntityType::Line(acadrust::entities::Line::from_points(
-                acadrust::types::Vector3::new(x0, y0, 0.0),
-                acadrust::types::Vector3::new(x1, y1, 0.0),
-            ))
-        };
         doc.add_entity(line(-9000.0, 9000.0, 39000.0, 9000.0)).unwrap();
         let mut hidden = acadrust::tables::Layer::new("HIDDEN");
         hidden.flags.off = true;
@@ -403,7 +399,8 @@ pub(crate) mod tests {
         off.common_mut().layer = "HIDDEN".into();
         doc.add_entity(off).unwrap();
         let transform = empty_survey_transform();
-        let geometry = extract_model(&doc, &transform);
+        let publication = crate::app::secureplan::publish::prepare_model(&scene_of(doc), transform).unwrap();
+        let geometry = extract(&publication);
         assert_eq!(geometry.segments, vec![[0.0, 3000.0, 10000.0, 3000.0]]);
         assert!(geometry.points.is_empty(), "endpoints outside the page are dropped");
         read(&write(&geometry, 10_000, 6_000), (10_000, 6_000)).unwrap();

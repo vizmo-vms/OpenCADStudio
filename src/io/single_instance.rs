@@ -130,6 +130,12 @@ fn addr() -> SocketAddr {
 /// Binds loopback only — never `0.0.0.0`, which would raise a firewall prompt
 /// on Windows and expose the port to the network.
 pub fn claim() -> Claim {
+    // SecurePlan CAD has no unauthenticated file-open hand-off: nothing
+    // listens, and only SecurePlan links reach a running copy, over the
+    // authenticated per-user channel (DSK-04).
+    if cfg!(feature = "secureplan") {
+        return Claim::Primary;
+    }
     match TcpListener::bind(addr()) {
         Ok(l) => {
             *LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = Some(l);
@@ -147,6 +153,9 @@ pub fn claim() -> Claim {
 
 /// Reach an editor without claiming its port. Used by the macOS launcher.
 pub fn try_connect_existing() -> Option<TcpStream> {
+    if cfg!(feature = "secureplan") {
+        return None;
+    }
     TcpStream::connect_timeout(&addr(), IO_TIMEOUT).ok()
 }
 
@@ -244,6 +253,9 @@ pub fn handoff(stream: TcpStream, paths: &[PathBuf]) -> bool {
 /// Inert unless [`claim`] returned [`Claim::Primary`] in this process, so a
 /// window that lost the election simply never produces items.
 pub fn subscribe() -> iced::Subscription<PathBuf> {
+    if cfg!(feature = "secureplan") {
+        return iced::Subscription::none();
+    }
     // `worker` must stay a plain `fn` — `Subscription::run` keys the
     // subscription's identity off the function pointer, so turning this into a
     // closure would silently stop the listener with no error.
@@ -336,6 +348,18 @@ mod tests {
 
     #[cfg(feature = "secureplan")]
     #[test]
+    fn secureplan_runs_no_unauthenticated_hand_off() {
+        // No listener: another local process can neither open files nor
+        // deliver links through the single-instance port. (Links go only over
+        // the authenticated channel; see secureplan::handoff's tests.)
+        assert!(matches!(claim(), Claim::Primary));
+        assert!(LISTENER.lock().unwrap_or_else(|e| e.into_inner()).is_none(), "claim bound a listener");
+        assert!(TcpStream::connect_timeout(&addr(), IO_TIMEOUT).is_err(), "something serves the hand-off port");
+        assert!(try_connect_existing().is_none());
+    }
+
+    #[cfg(feature = "secureplan")]
+    #[test]
     fn secureplan_launch_urls_are_never_forwarded_over_this_port() {
         use std::io::Read;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -385,6 +409,9 @@ mod tests {
         );
     }
 
+    // SecurePlan CAD runs no single-instance listener at all; see
+    // `secureplan_runs_no_unauthenticated_hand_off`.
+    #[cfg(not(feature = "secureplan"))]
     #[test]
     fn claim_elects_exactly_one_owner() {
         // Hold the port the way a primary would, then prove a second claim in

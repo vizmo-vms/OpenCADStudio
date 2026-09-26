@@ -115,6 +115,15 @@ fn source_bytes(path: &str) -> Option<Arc<Vec<u8>>> {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // A SecurePlan build reads an underlay only when references are
+        // allowed and the file is local (DSK-02).
+        #[cfg(feature = "secureplan")]
+        if !crate::app::secureplan::guards::reference_allowed(
+            crate::app::secureplan::guards::ExternalResource::Image,
+            path,
+        ) {
+            return None;
+        }
         std::fs::read(path).ok().map(Arc::new)
     }
     #[cfg(target_arch = "wasm32")]

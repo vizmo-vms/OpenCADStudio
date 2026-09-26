@@ -50,6 +50,9 @@ pub enum PromptButton {
 #[derive(Debug)]
 pub struct Prompt {
     pub request: LaunchRequest,
+    /// When the launch arrived; its token expires 120 s later regardless of
+    /// how long the prompt stays open.
+    pub received: Instant,
     pub focus: PromptButton,
 }
 
@@ -80,23 +83,25 @@ impl Trust {
             // launch, so accepting pairs with the newest token.
             Some(prompt) if prompt.request.origin == request.origin => {
                 prompt.request = request;
+                prompt.received = now;
                 Decision::Prompt
             }
             Some(_) => Decision::Ignore,
             None => {
-                self.prompt = Some(Prompt { request, focus: PromptButton::default() });
+                self.prompt = Some(Prompt { request, received: now, focus: PromptButton::default() });
                 Decision::Prompt
             }
         }
     }
 
     /// The user's answer. Accepting trusts the origin in `settings` (the
-    /// caller saves them) and returns the launch to pair.
-    pub fn answer(&mut self, accept: bool, settings: &mut Settings, now: Instant) -> Option<LaunchRequest> {
+    /// caller saves them) and returns the launch to pair with the time it
+    /// arrived, so its token keeps its original expiry.
+    pub fn answer(&mut self, accept: bool, settings: &mut Settings, now: Instant) -> Option<(LaunchRequest, Instant)> {
         let prompt = self.prompt.take()?;
         if accept {
             settings.trust(&prompt.request.origin);
-            Some(prompt.request)
+            Some((prompt.request, prompt.received))
         } else {
             self.declined.insert(prompt.request.origin, now);
             None
@@ -142,14 +147,25 @@ mod tests {
         assert_eq!(trust.on_launch(launch("https://other.example", 2), &settings, now), Decision::Ignore);
         assert_eq!(trust.on_launch(launch(ORIGIN, 3), &settings, now), Decision::Prompt);
         assert_eq!(trust.prompt().unwrap().request.pairing.expose(), &[3; 16]);
-        let paired = trust.answer(true, &mut settings, now).expect("accepted");
+        let (paired, received) = trust.answer(true, &mut settings, now).expect("accepted");
         assert_eq!(paired.pairing.expose(), &[3; 16]);
+        assert_eq!(received, now);
         assert!(settings.is_trusted(ORIGIN));
         assert!(trust.prompt().is_none());
         assert!(matches!(trust.on_launch(launch(ORIGIN, 4), &settings, now), Decision::Pair(_)));
         // Revoking makes the origin ask again.
         settings.revoke(ORIGIN);
         assert_eq!(trust.on_launch(launch(ORIGIN, 5), &settings, now), Decision::Prompt);
+    }
+
+    #[test]
+    fn a_delayed_approval_keeps_the_launch_time() {
+        let launched = Instant::now();
+        let mut trust = Trust::default();
+        let mut settings = Settings::default();
+        assert_eq!(trust.on_launch(launch(ORIGIN, 1), &settings, launched), Decision::Prompt);
+        let (_, received) = trust.answer(true, &mut settings, launched + Duration::from_secs(90)).unwrap();
+        assert_eq!(received, launched, "approval must not restart the token's lifetime");
     }
 
     #[test]

@@ -3,8 +3,11 @@
 //! `transferStart{transferId, name, mediaType, byteLength, sha256}` is followed
 //! by chunks whose plaintext is `u32le transferId ‖ u32le seq ‖ payload`. The
 //! receiver checks the sequence, length and SHA-256 before handing the bytes
-//! over, holds at most [`MAX_IN_FLIGHT`] transfers, never accepts a reused id,
-//! and fails a transfer after [`NO_PROGRESS_TIMEOUT`] without progress.
+//! over, never accepts a reused id, and fails a transfer after
+//! [`NO_PROGRESS_TIMEOUT`] without progress. At most [`MAX_IN_FLIGHT`]
+//! transfers are in flight per session, both directions together: senders
+//! wait for a slot, and because two starts can cross on the wire a receiver
+//! refuses a start only when it would hold more than that many incoming.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -137,6 +140,11 @@ impl Incoming {
             return finish(partial).map(Some);
         }
         Ok(None)
+    }
+
+    /// Incoming transfers announced and not yet complete.
+    pub fn in_flight(&self) -> usize {
+        self.active.len()
     }
 
     /// `Err(Stalled)` when an active transfer made no progress for 30 s.

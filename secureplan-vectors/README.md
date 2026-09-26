@@ -39,7 +39,7 @@ Canonical synthetic vectors shared by the SecurePlan web app and the SecurePlan 
 
 ## Transfers (BRG-06)
 
-`transferStart` announces a transfer before the message that references it. Transfer ids are unique per session and direction and are never reused. Chunks carry `seq` 0, 1, 2, …; the transfer completes when the received length equals `byteLength` and the SHA-256 matches. A zero-length transfer completes on `transferStart`. At most three announced, incomplete transfers per direction; 30 s without progress fails the transfer. Limits: 52,428,800 bytes, or 8,388,608 bytes for the two `+json` payload media types. A transfer failure closes the session with `transferFailed`.
+`transferStart` announces a transfer before the message that references it. Transfer ids are unique per session and direction and are never reused. Chunks carry `seq` 0, 1, 2, …; the transfer completes when the received length equals `byteLength` and the SHA-256 matches. A zero-length transfer completes on `transferStart`. At most three transfers are in flight per session, counting both directions: a side starts a transfer only while fewer than three are in flight as it sees them (its unfinished outgoing plus unfinished incoming transfers), and otherwise waits for one to finish. Because two `transferStart` frames can cross on the wire, a receiver refuses a `transferStart` only when it would then hold more than three unfinished incoming transfers, which a conforming sender never causes. 30 s without progress fails the transfer. Limits: 52,428,800 bytes, or 8,388,608 bytes for the two `+json` payload media types. A transfer failure closes the session with `transferFailed`.
 
 ## Messages
 

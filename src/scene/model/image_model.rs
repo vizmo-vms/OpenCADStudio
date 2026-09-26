@@ -384,8 +384,9 @@ pub fn clear_image_cache() {
 /// without fetching twice.
 pub fn resolve_image(path: &str) -> Option<DecodedImage> {
     #[cfg(feature = "secureplan")]
-    if !crate::app::secureplan::guards::external_resource_allowed(
+    if !crate::app::secureplan::guards::reference_allowed(
         crate::app::secureplan::guards::ExternalResource::Image,
+        path,
     ) {
         return None;
     }

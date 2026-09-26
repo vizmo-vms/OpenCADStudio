@@ -11,8 +11,8 @@
 //!   the dialog layer above the in-canvas modals;
 //! - `src/ui/ribbon/mod.rs`: the SecurePlan ribbon tab;
 //! - `src/app/commands/mod.rs`: SecurePlan commands and the command guard;
-//! - `src/io/xref.rs`, `src/scene/model/image_model.rs`: the
-//!   external-resource guard.
+//! - `src/io/xref.rs`, `src/io/mod.rs`, `src/scene/model/image_model.rs`,
+//!   `src/scene/model/pdf_raster.rs`: the external-resource guard.
 
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -152,8 +152,24 @@ impl OpenCADStudio {
     fn secureplan_bridge(&mut self) -> Option<Arc<Bridge>> {
         if self.secureplan.bridge.is_none() {
             self.secureplan.bridge = bridge::global_arc();
+            self.secureplan_sync_trust();
         }
         self.secureplan.bridge.clone()
+    }
+
+    /// Tell the bridge which origins may pair now. Revoking an origin or
+    /// turning the developer setting off drops its pending pairings and
+    /// handshakes and closes its sessions (BRG-02).
+    fn secureplan_sync_trust(&self) {
+        let Some(bridge) = &self.secureplan.bridge else { return };
+        let settings = &self.secureplan.settings;
+        let allowed = settings
+            .trusted_origins
+            .iter()
+            .filter(|origin| super::trust::origin_eligible(origin, settings.developer_loopback_origins))
+            .cloned()
+            .collect();
+        bridge.set_trusted_origins(allowed);
     }
 
     fn secureplan_launch(&mut self, url: &str) {
@@ -161,17 +177,18 @@ impl OpenCADStudio {
             self.command_line.push_warning("SecurePlan: ignored an invalid SecurePlan CAD link.");
             return;
         };
-        match self.secureplan.trust.on_launch(request, &self.secureplan.settings, Instant::now()) {
-            Decision::Pair(request) => self.secureplan_pair(request),
+        let received = Instant::now();
+        match self.secureplan.trust.on_launch(request, &self.secureplan.settings, received) {
+            Decision::Pair(request) => self.secureplan_pair(request, received),
             Decision::Prompt | Decision::Ignore => {}
         }
     }
 
     fn secureplan_answer_trust(&mut self, accept: bool) {
         let settings = &mut self.secureplan.settings;
-        let Some(request) = self.secureplan.trust.answer(accept, settings, Instant::now()) else { return };
+        let Some((request, received)) = self.secureplan.trust.answer(accept, settings, Instant::now()) else { return };
         self.secureplan_save_settings();
-        self.secureplan_pair(request);
+        self.secureplan_pair(request, received);
     }
 
     fn secureplan_save_settings(&mut self) {
@@ -184,9 +201,12 @@ impl OpenCADStudio {
         }
     }
 
-    fn secureplan_pair(&mut self, request: LaunchRequest) {
+    fn secureplan_pair(&mut self, request: LaunchRequest, received: Instant) {
         match self.secureplan_bridge() {
-            Some(bridge) => bridge.add_pending(request),
+            Some(bridge) => {
+                self.secureplan_sync_trust();
+                bridge.add_pending_received(request, received);
+            }
             None => self.command_line.push_error(
                 "SecurePlan CAD could not listen on 127.0.0.1:47815–47819. Close other copies of SecurePlan CAD and try again.",
             ),
@@ -251,6 +271,7 @@ impl OpenCADStudio {
             "SECUREPLANREVOKE" => match argument {
                 Some(origin) if self.secureplan.settings.revoke(origin) => {
                     self.secureplan_save_settings();
+                    self.secureplan_sync_trust();
                     self.command_line.push_output(&format!("SecurePlan no longer trusts {origin}."));
                 }
                 _ => self.command_line.push_error("Usage: SECUREPLANREVOKE <trusted website origin>"),
@@ -259,6 +280,7 @@ impl OpenCADStudio {
                 Some(value @ ("ON" | "OFF")) => {
                     self.secureplan.settings.developer_loopback_origins = value == "ON";
                     self.secureplan_save_settings();
+                    self.secureplan_sync_trust();
                     self.command_line.push_output(&format!(
                         "Developer loopback origins (http://localhost, http://127.0.0.1): {}",
                         value.to_ascii_lowercase()
@@ -376,6 +398,20 @@ mod tests {
         assert!(!app.secureplan_dialog_open(), "Enter on the default button declines");
         assert!(!app.secureplan.settings.is_trusted(ORIGIN));
         assert!(connect_web(bridge.port(), &request).is_err());
+    }
+
+    #[test]
+    fn revoking_by_command_invalidates_a_pending_pairing() {
+        let mut app = app_with_drawing();
+        let bridge = Arc::new(test_bridge(bridge::PING_INTERVAL));
+        app.secureplan.bridge = Some(Arc::clone(&bridge));
+        app.secureplan.settings.trust(ORIGIN);
+        let request = launch(ORIGIN, 62);
+        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+        assert!(!app.secureplan_dialog_open(), "a trusted origin pairs silently");
+        let _ = app.dispatch_command(&format!("SECUREPLANREVOKE {ORIGIN}"));
+        assert!(connect_web(bridge.port(), &request).is_err(), "the pending pairing survived the revoke");
+        std::fs::remove_dir_all(app.secureplan.settings_path.clone().unwrap().parent().unwrap()).ok();
     }
 
     #[test]
