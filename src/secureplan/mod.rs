@@ -58,6 +58,60 @@ pub const VERSION: &str = "0.1.0";
 pub const PROTOCOL: u32 = 1;
 /// Release tags are `secureplan-cad-vX.Y.Z` (DSK-05).
 pub const RELEASE_TAG_PREFIX: &str = "secureplan-cad-v";
+/// The fork commit this build came from (DSK-05), sent with every Apply.
+/// All zeros when the build had no git checkout.
+pub const FORK_COMMIT: &str = match option_env!("OCS_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "0000000000000000000000000000000000000000",
+};
+
+/// A value moved once from a worker to the UI thread inside a `Message`,
+/// which must be `Clone` and `Debug` (drawings are neither cheap to clone
+/// nor safe to print).
+pub struct Carry<T>(std::sync::Arc<std::sync::Mutex<Option<T>>>);
+
+impl<T> Carry<T> {
+    pub fn new(value: T) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(value))))
+    }
+
+    /// The value, the first time only.
+    pub fn take(&self) -> Option<T> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl<T> Clone for Carry<T> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::fmt::Debug for Carry<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Carry(..)")
+    }
+}
+
+/// Report an event to the `secureplan-test` stdin driver's harness. Does
+/// nothing in other builds.
+pub(crate) fn testdriver_event(name: &str, detail: &str) {
+    #[cfg(feature = "secureplan-test")]
+    testdriver::event(name, detail);
+    #[cfg(not(feature = "secureplan-test"))]
+    let _ = (name, detail);
+}
+
+/// Whether SecurePlan may open native file dialogs: never in unit tests, nor
+/// while the `secureplan-test` driver runs the app.
+pub(crate) fn native_dialogs_allowed() -> bool {
+    #[cfg(test)]
+    return false;
+    #[cfg(all(not(test), feature = "secureplan-test"))]
+    return !testdriver::active();
+    #[cfg(all(not(test), not(feature = "secureplan-test")))]
+    true
+}
 
 /// Parse a `MAJOR.MINOR.PATCH` version with no leading zeros.
 pub fn parse_version(value: &str) -> Option<(u32, u32, u32)> {

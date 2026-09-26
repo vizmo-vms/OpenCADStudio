@@ -39,6 +39,12 @@ fn main() {
         revision
     };
     println!("cargo:rustc-env=OCS_GIT_REV={revision}");
+    // The full commit, which SecurePlan CAD reports with every Apply.
+    if let Some(full) = git_output(&["rev-parse", "HEAD"])
+        .filter(|full| full.len() == 40 && full.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    {
+        println!("cargo:rustc-env=OCS_GIT_COMMIT={full}");
+    }
 
     // Builds from the main branch report how far past the release tag they
     // are. Release tags are `v` + the display version (scripts/release.py),

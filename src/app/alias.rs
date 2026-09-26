@@ -35,6 +35,13 @@ const DEFAULT_ALIASES_PGP: &str = include_str!("../../assets/ocad.pgp");
 /// config base can't be resolved (headless, no `HOME`).
 #[cfg(not(target_arch = "wasm32"))]
 fn alias_file_path() -> Option<PathBuf> {
+    // Unit tests use the built-in table and never touch the user's file. Many
+    // tests construct the app at once; on a fresh config folder they all
+    // seeded `ocad.pgp` together, one read it truncated, "migrated" the empty
+    // table and wrote that back, and alias tests then failed at random.
+    if cfg!(test) {
+        return None;
+    }
     Some(crate::config::config_dir()?.join("ocad.pgp"))
 }
 

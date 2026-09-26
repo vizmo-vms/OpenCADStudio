@@ -545,6 +545,192 @@ pub fn model_snap(publication: &Publication) -> Vec<u8> {
     snap::write(&geometry, publication.transform.placement.width_pt, publication.transform.placement.height_pt)
 }
 
+// ── Apply outputs (PUB-03 model space, PUB-04) ─────────────────────────────
+
+/// The largest output SecurePlan stores (a managed file).
+pub const MAX_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
+/// The default window's margin around the visible extents, per side, as a
+/// fraction of the extents' width (x) and height (y).
+pub const WINDOW_MARGIN: f64 = 0.02;
+
+/// The extents of the model-space geometry the published view draws (what
+/// plots: off, frozen and non-plotting layers excluded), as `[x0, y0, x1, y1]`.
+pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
+    if scene.current_layout != "Model" {
+        let (min, max) = scene.model_space_extents()?;
+        return Some([min.x as f64, min.y as f64, max.x as f64, max.y as f64]);
+    }
+    let (wires, _) = scene.plot_wire_groups(None);
+    let mut extents = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for wire in wires.iter().filter(|wire| wire.plot_visible) {
+        for (index, [x, y, _]) in wire.points.iter().enumerate() {
+            let [lx, ly, _] = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
+            let (x, y) = (*x as f64 + lx as f64, *y as f64 + ly as f64);
+            if x.is_finite() && y.is_finite() {
+                extents = [extents[0].min(x), extents[1].min(y), extents[2].max(x), extents[3].max(y)];
+            }
+        }
+    }
+    extents.iter().all(|v| v.is_finite()).then_some(extents)
+}
+
+/// The default published window: the visible extents with a 2% margin on
+/// each side. A degenerate side gets a margin from the other.
+pub fn default_window([x0, y0, x1, y1]: [f64; 4]) -> [f64; 4] {
+    let size = (x1 - x0).max(y1 - y0).max(1.0);
+    let mx = if x1 > x0 { (x1 - x0) * WINDOW_MARGIN } else { size * WINDOW_MARGIN };
+    let my = if y1 > y0 { (y1 - y0) * WINDOW_MARGIN } else { size * WINDOW_MARGIN };
+    [x0 - mx, y0 - my, x1 + mx, y1 + my]
+}
+
+/// The publication scale: the smallest millimetres per point of the 1-2-5
+/// series (…, 1, 2, 5, 10, …) at which the page meets the CON-01 side and
+/// area limits. A larger page is a finer float32 grid (a smaller `r`).
+pub fn choose_mm_per_pt(window_cad: [f64; 4], mapping: &Mapping) -> Result<f64, PlacementError> {
+    let [x0, y0, x1, y1] = window_cad;
+    if !(window_cad.iter().all(|v| v.is_finite()) && x1 > x0 && y1 > y0) {
+        return Err(PlacementError::InvalidWindow);
+    }
+    let corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(|corner| mapping.cad_to_world(corner));
+    let span = |axis: usize| {
+        let values = corners.map(|c| c[axis]);
+        values.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - values.iter().cloned().fold(f64::INFINITY, f64::min)
+    };
+    let (width, height) = (span(0), span(1));
+    let least = (width / MAX_SIDE_PT as f64).max(height / MAX_SIDE_PT as f64).max((width * height / MAX_AREA_PT2 as f64).sqrt());
+    if !(least.is_finite() && least > 0.0) {
+        return Err(PlacementError::EmptyPage);
+    }
+    let mut decade = 10f64.powi(least.log10().floor() as i32 - 1);
+    for _ in 0..40 {
+        for step in [1.0, 2.0, 5.0] {
+            let candidate = step * decade;
+            if candidate >= least * (1.0 - 1e-12) && place_page(window_cad, mapping, candidate).is_ok() {
+                return Ok(candidate);
+            }
+        }
+        decade *= 10.0;
+    }
+    Err(PlacementError::InvalidScale)
+}
+
+/// What Apply publishes and how it maps: chosen in the Apply dialog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApplyPlan {
+    pub window_cad: [f64; 4],
+    pub mapping: Mapping,
+    pub mm_per_pt: f64,
+}
+
+impl ApplyPlan {
+    pub fn transform(&self) -> Result<PageTransform, PlacementError> {
+        Ok(PageTransform { mapping: self.mapping, placement: place_page(self.window_cad, &self.mapping, self.mm_per_pt)? })
+    }
+}
+
+/// The frozen drawing state an Apply is built from. Taken once, when Apply
+/// starts; later edits never reach it.
+#[derive(Clone)]
+pub struct Snapshot {
+    pub document: acadrust::CadDocument,
+    pub annotation_scale: f32,
+    /// The bytes the document was loaded from, sent verbatim when unmodified.
+    pub loaded: Option<super::session::Drawing>,
+    pub modified: bool,
+    pub pending_original: Option<super::session::Drawing>,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot").field("modified", &self.modified).finish_non_exhaustive()
+    }
+}
+
+/// Everything Apply sends, built in memory from one snapshot.
+#[derive(Debug, Clone)]
+pub struct ApplyOutputs {
+    pub drawing: super::session::Drawing,
+    pub original: Option<super::session::Drawing>,
+    pub pdf: Vec<u8>,
+    pub snap: Vec<u8>,
+    pub transform: PageTransform,
+    pub omitted_images: usize,
+}
+
+/// Why Apply stopped; nothing was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyError {
+    pub code: super::session::ErrorCode,
+    pub message: String,
+}
+
+impl ApplyError {
+    fn new(code: super::session::ErrorCode, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
+}
+
+/// Build the drawing, PDF and snap file from `snapshot` alone, in memory (no
+/// temporary files). Writer errors, known content loss and any output over
+/// 50 MiB stop Apply.
+pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutputs, ApplyError> {
+    use super::session::{Drawing, ErrorCode, Format};
+    let transform = plan.transform().map_err(|error| ApplyError::new(ErrorCode::Internal, format!("The published page does not fit: {error:?}.")))?;
+
+    let drawing = match (&snapshot.loaded, snapshot.modified) {
+        (Some(loaded), false) => loaded.clone(),
+        (loaded, _) => {
+            let (format, version, name) = match loaded {
+                Some(loaded) => (loaded.format, loaded.version(), loaded.name.expose().clone()),
+                None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
+            };
+            let is_dxf = format == Format::Dxf;
+            let dropped = crate::io::dropped_on_save_count(&snapshot.document, version, is_dxf);
+            if dropped > 0 {
+                return Err(ApplyError::new(
+                    ErrorCode::KnownLoss,
+                    format!("Writing the drawing as {} {} would drop {dropped} unsupported object(s).", format.ext().to_ascii_uppercase(), version.as_str()),
+                ));
+            }
+            let bytes = crate::io::save_to_bytes(&snapshot.document, format.ext(), version)
+                .map_err(|_| ApplyError::new(ErrorCode::WriterError, "The drawing could not be written."))?;
+            let stem = std::path::Path::new(&name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "drawing".into());
+            Drawing {
+                bytes: std::sync::Arc::new(bytes),
+                name: super::session::file_name(&format!("{stem}.{}", format.ext())).into(),
+                format,
+                format_version: version.as_str().to_string(),
+            }
+        }
+    };
+
+    // The published view comes from the same snapshot.
+    let mut scene = crate::scene::Scene::new();
+    scene.document = snapshot.document.clone();
+    scene.annotation_scale = snapshot.annotation_scale;
+    scene.rebuild_derived_caches();
+    let publication = prepare_model(&scene, transform).map_err(|message| ApplyError::new(ErrorCode::Internal, message))?;
+    let pdf = model_pdf(&publication).map_err(|_| ApplyError::new(ErrorCode::WriterError, "The published PDF could not be written."))?;
+    let snap = model_snap(&publication);
+
+    let outputs = ApplyOutputs { drawing, original: snapshot.pending_original.clone(), pdf: pdf.bytes, snap, transform, omitted_images: pdf.omitted_images };
+    let sizes = [
+        ("drawing", outputs.drawing.bytes.len()),
+        ("original drawing", outputs.original.as_ref().map_or(0, |o| o.bytes.len())),
+        ("published PDF", outputs.pdf.len()),
+        ("snap file", outputs.snap.len()),
+    ];
+    for (what, size) in sizes {
+        if size > MAX_OUTPUT_BYTES {
+            return Err(ApplyError::new(
+                ErrorCode::OutputTooLarge,
+                format!("The {what} is {:.1} MiB; SecurePlan stores files up to 50 MiB.", size as f64 / 1048576.0),
+            ));
+        }
+    }
+    Ok(outputs)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -680,6 +866,43 @@ pub(crate) mod tests {
         scene.document = crate::io::load_bytes("synthetic.dxf", bytes).unwrap();
         scene.rebuild_derived_caches();
         scene
+    }
+
+    /// The images a plain (not SecurePlan) scene of `doc` decodes.
+    pub(crate) fn scene_images(doc: CadDocument) -> Vec<acadrust::types::Handle> {
+        crate::app::secureplan::snap::tests::scene_of(doc).images.keys().copied().collect()
+    }
+
+    #[test]
+    fn the_default_window_is_the_visible_extents_plus_two_percent() {
+        let scene = synthetic_dxf_scene();
+        let extents = visible_extents(&scene).expect("extents");
+        for (got, want) in extents.iter().zip([0.0, 0.0, 30000.0, 18000.0]) {
+            assert!((got - want).abs() < 0.01, "{extents:?}");
+        }
+        assert_eq!(default_window([0.0, 0.0, 100.0, 50.0]), [-2.0, -1.0, 102.0, 51.0]);
+        // A hidden layer's geometry does not count.
+        let mut doc = scene.document.clone();
+        let mut far = Line::from_points(Vector3::new(1.0e6, 1.0e6, 0.0), Vector3::new(1.0e6 + 1.0, 1.0e6, 0.0));
+        far.common.layer = "HIDDEN".into();
+        let mut hidden = acadrust::tables::Layer::new("HIDDEN");
+        hidden.flags.off = true;
+        doc.layers.add(hidden).unwrap();
+        doc.add_entity(EntityType::Line(far)).unwrap();
+        let hidden_extents = visible_extents(&crate::app::secureplan::snap::tests::scene_of(doc)).unwrap();
+        assert!(hidden_extents[2] < 31000.0, "{hidden_extents:?}");
+    }
+
+    #[test]
+    fn the_scale_is_the_smallest_1_2_5_step_that_fits_the_page_limits() {
+        let window = [0.0, 0.0, 30000.0, 18000.0];
+        let mapping = Mapping { cad_origin: [0.0, 18000.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
+        // 30 × 18 m needs at least √(540e6 / 64e6) ≈ 2.9 mm per point: 5.
+        assert_eq!(choose_mm_per_pt(window, &mapping), Ok(5.0));
+        let small = [0.0, 0.0, 300.0, 180.0];
+        assert_eq!(choose_mm_per_pt(small, &mapping), Ok(0.05));
+        assert!(place_page(small, &mapping, 0.05).is_ok());
+        assert_eq!(choose_mm_per_pt([0.0, 0.0, 0.0, 1.0], &mapping), Err(PlacementError::InvalidWindow));
     }
 
     pub(crate) fn empty_survey_transform() -> PageTransform {

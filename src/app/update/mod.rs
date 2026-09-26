@@ -304,6 +304,12 @@ impl OpenCADStudio {
         {
             return Task::none();
         }
+        // Save, Save As, plotting, printing and exports refuse a SecurePlan
+        // drawing (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_blocks_message(&msg) {
+            return Task::none();
+        }
         if self.active_modal.is_some() {
             if matches!(msg, Message::CommandEscape)
                 || matches!(&msg, Message::ShortcutPressed(key) if key.rsplit('+').next() == Some("ESCAPE"))

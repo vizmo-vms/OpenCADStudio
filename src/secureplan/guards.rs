@@ -93,14 +93,32 @@ fn flag(kind: ExternalResource) -> &'static AtomicBool {
     }
 }
 
+// Unit tests run in parallel threads of one process, and many upstream tests
+// resolve images and Xrefs: a test that binds a SecurePlan document must not
+// refuse them for every other test. So in tests the setting is per thread.
+#[cfg(test)]
+thread_local! {
+    static TEST_REFUSED: std::cell::Cell<[bool; 2]> = const { std::cell::Cell::new([false, false]) };
+}
+
 /// Refuse (or allow again) every resolution of `kind`.
 pub fn set_external_resource_refused(kind: ExternalResource, refused: bool) {
+    #[cfg(test)]
+    TEST_REFUSED.with(|cell| {
+        let mut flags = cell.get();
+        flags[kind as usize] = refused;
+        cell.set(flags);
+    });
+    #[cfg(not(test))]
     flag(kind).store(refused, Ordering::SeqCst);
 }
 
 /// Whether a reference of `kind` may be resolved. Consulted before any disk
 /// read or network request for it.
 pub fn external_resource_allowed(kind: ExternalResource) -> bool {
+    #[cfg(test)]
+    return !TEST_REFUSED.with(|cell| cell.get()[kind as usize]) && !flag(kind).load(Ordering::SeqCst);
+    #[cfg(not(test))]
     !flag(kind).load(Ordering::SeqCst)
 }
 

@@ -86,7 +86,7 @@ pub enum BridgeEvent {
 /// What the application asks a session to send.
 enum Outbound {
     Message(Value),
-    Transfer { name: String, media_type: String, bytes: Arc<Vec<u8>> },
+    Transfer { id: u32, name: String, media_type: String, bytes: Arc<Vec<u8>> },
     Close(&'static str),
     Confirmed,
 }
@@ -95,6 +95,9 @@ struct SessionEntry {
     origin: String,
     survey: String,
     confirmed: bool,
+    /// The next desktop-to-web transfer id; ids are assigned when a transfer
+    /// is queued so the message that references it can name it.
+    next_transfer: u32,
     outbound: mpsc::Sender<Outbound>,
 }
 
@@ -228,12 +231,17 @@ impl Bridge {
         self.outbound(session, Outbound::Message(message))
     }
 
-    /// Send bytes as an announced transfer.
-    pub fn send_transfer(&self, session: SessionId, name: &str, media_type: &str, bytes: Arc<Vec<u8>>) -> bool {
-        self.outbound(
-            session,
-            Outbound::Transfer { name: name.to_string(), media_type: media_type.to_string(), bytes },
-        )
+    /// Send bytes as an announced transfer. Returns its transfer id, which a
+    /// later message can reference: transfers and messages are sent in the
+    /// order they are queued, so the transfer always precedes that message.
+    pub fn send_transfer(&self, session: SessionId, name: &str, media_type: &str, bytes: Arc<Vec<u8>>) -> Option<u32> {
+        let mut sessions = lock(&self.shared.sessions);
+        let entry = sessions.get_mut(&session)?;
+        let id = entry.next_transfer;
+        let transfer = Outbound::Transfer { id, name: name.to_string(), media_type: media_type.to_string(), bytes };
+        entry.outbound.send(transfer).ok()?;
+        entry.next_transfer = id.checked_add(1)?;
+        Some(id)
     }
 
     /// End a session with `close{reason}`.
@@ -447,7 +455,7 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
     let needs_confirmation = lock(&shared.open_documents).contains(&(origin.clone(), survey.clone()));
     lock(&shared.sessions).insert(
         session,
-        SessionEntry { origin: origin.clone(), survey, confirmed: !needs_confirmation, outbound: outbound_sender.clone() },
+        SessionEntry { origin: origin.clone(), survey, confirmed: !needs_confirmation, next_transfer: 1, outbound: outbound_sender.clone() },
     );
     // Trust revoked between the handshake and registration: end it at once.
     if !shared.origin_allowed(&origin) {
@@ -467,7 +475,6 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
     let mut confirmed = !needs_confirmation;
     let mut held: Vec<BridgeEvent> = Vec::new();
     let mut incoming = Incoming::default();
-    let mut next_transfer: u32 = 1;
     let mut last_ping = shared.now();
     let mut queued: std::collections::VecDeque<Outbound> = std::collections::VecDeque::new();
     let end = loop {
@@ -485,9 +492,7 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
         while let Some(item) = queued.pop_front() {
             let result = match item {
                 Outbound::Message(message) => send_control(&mut socket, &mut established.sealer, &message),
-                Outbound::Transfer { name, media_type, bytes } => {
-                    let id = next_transfer;
-                    next_transfer += 1;
+                Outbound::Transfer { id, name, media_type, bytes } => {
                     let start = protocol::transfer_start(&next_request_id(&mut established.request_ids), id, &name, &media_type, &bytes);
                     send_control(&mut socket, &mut established.sealer, &start).and_then(|()| {
                         transfer::chunks(id, &bytes).try_for_each(|chunk| {
@@ -935,8 +940,9 @@ pub(crate) mod tests {
         assert_eq!(transfer.bytes.expose(), &bytes);
 
         // Desktop-to-web transfer: transferStart, then sealed chunks.
-        assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())));
+        assert_eq!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())), Some(1));
         let start = web.receive_non_ping().unwrap();
+        assert_eq!(start["transferId"], 1);
         assert_eq!(start["type"], "transferStart");
         assert_eq!(start["byteLength"], 8);
     }
@@ -974,7 +980,7 @@ pub(crate) mod tests {
         // Both sides start at the same moment: the web its full share of two,
         // the desktop its one. Nobody waits and nothing is refused.
         let payload = start_incomplete(&mut web, 1..=2);
-        assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())));
+        assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())).is_some());
         assert!(bridge.send(session, protocol::session_state("s1", true, json!(null), json!(null), json!(null))));
         assert_eq!(web.receive_non_ping().unwrap()["type"], "transferStart");
         assert_eq!(web.receive_non_ping().unwrap()["type"], "sessionState");
@@ -992,7 +998,7 @@ pub(crate) mod tests {
         let busy = |bridge: &Bridge, web: &mut Web, session: SessionId| {
             start_incomplete(web, 1..=2);
             std::thread::sleep(Duration::from_millis(100));
-            assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(vec![7; 3 * transfer::MAX_CHUNK_PAYLOAD])));
+            assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(vec![7; 3 * transfer::MAX_CHUNK_PAYLOAD])).is_some());
             assert!(bridge.send(session, protocol::session_state("s1", true, json!(null), json!(null), json!(null))));
         };
         let closed_with = |web: &mut Web| loop {

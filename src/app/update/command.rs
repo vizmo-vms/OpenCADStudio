@@ -80,7 +80,7 @@ pub(super) fn begin_tab_close_queue(&mut self, tab_ids: Vec<u64>) -> Task<Messag
     /// Close queued drawings until a dirty tab requires confirmation. Queue
     /// entries use stable document ids because removing an earlier tab changes
     /// every later vector index.
-    pub(super) fn continue_tab_close_queue(&mut self) -> Task<Message> {
+    pub(in crate::app) fn continue_tab_close_queue(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
         while let Some(tab_id) = self.pending_tab_closes.pop_front() {
             let Some(idx) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
@@ -88,6 +88,12 @@ pub(super) fn begin_tab_close_queue(&mut self, tab_ids: Vec<u64>) -> Task<Messag
             };
             if self.tabs[idx].is_start {
                 continue;
+            }
+            // A SecurePlan drawing asks Apply / Discard / Keep instead.
+            #[cfg(feature = "secureplan")]
+            if self.secureplan_has_unapplied(idx) {
+                tasks.push(self.on_tab_close(idx));
+                break;
             }
             if self.tabs[idx].dirty {
                 self.pending_close = Some(crate::app::PendingClose::Tab(idx));
@@ -99,10 +105,16 @@ pub(super) fn begin_tab_close_queue(&mut self, tab_ids: Vec<u64>) -> Task<Messag
         Task::batch(tasks)
     }
 
-pub(super) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
+pub(in crate::app) fn on_tab_close(&mut self, idx: usize) -> Task<Message> {
                 // Start tab is fixed — close requests on it are no-ops.
                 if self.tabs.get(idx).map_or(false, |t| t.is_start) {
                     return Task::none();
+                }
+                // A SecurePlan drawing with unapplied work asks Apply /
+                // Discard / Keep; closing one ends its session.
+                #[cfg(feature = "secureplan")]
+                if let Some(task) = self.secureplan_tab_closing(idx) {
+                    return task;
                 }
                 // Closing a tab shifts indices / the active tab. The attribute
                 // editor holds a document-local handle into one tab, so drop it

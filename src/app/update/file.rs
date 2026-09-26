@@ -2157,6 +2157,11 @@ impl OpenCADStudio {
         set_current_path: bool,
         check_external_change: bool,
     ) -> Task<Message> {
+        // A SecurePlan drawing is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(i) {
+            return Task::none();
+        }
         let tab_id = self.tabs[i].id;
         if self
             .pending_native_thumbnail_save
@@ -2852,6 +2857,11 @@ impl OpenCADStudio {
     /// Used by plain Save (QSAVE) on an as-yet-unsaved drawing and by the
     /// save-before-close flow — the version picker is reserved for Save As.
     pub(in crate::app) fn save_with_default_format(&mut self, tab_idx: usize) -> Task<Message> {
+        // A SecurePlan drawing is never written to a file (DSK-03).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(tab_idx) {
+            return Task::none();
+        }
         self.active_tab = tab_idx;
         self.save_dialog_format = if self.tabs[tab_idx].recovery_save_as_required {
             let document = &self.tabs[tab_idx].scene.document;
@@ -3084,8 +3094,15 @@ impl OpenCADStudio {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn on_autosave(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
+        // SecurePlan drawings keep a user-only recovery copy instead (DSK-03).
+        #[cfg(feature = "secureplan")]
+        self.secureplan_autosave();
         for i in 0..self.tabs.len() {
             if !self.tabs[i].dirty || self.active_save_jobs.contains_key(&self.tabs[i].id) {
+                continue;
+            }
+            #[cfg(feature = "secureplan")]
+            if self.secureplan_is_bound(i) {
                 continue;
             }
             self.prepare_native_save(i);
@@ -3120,6 +3137,9 @@ impl OpenCADStudio {
 
     /// Remove the autosave recovery files, then quit the application.
     pub(in crate::app) fn exit_app(&self) -> Task<Message> {
+        // Unapplied SecurePlan work is kept as recovery copies.
+        #[cfg(feature = "secureplan")]
+        self.secureplan_keep_all_recovery();
         self.cleanup_autosaves();
         iced::exit()
     }

@@ -758,6 +758,9 @@ pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
                 .map_err(|e| e.to_string())?;
             fix_viewport_status_flags(&mut doc);
             fix_current_style_names(&mut doc);
+            // SecurePlan CAD refuses a drawing over its entity limit (DSK-01).
+            #[cfg(feature = "secureplan")]
+            crate::app::secureplan::import::admit(&doc)?;
             Ok(doc)
         }
         "dxf" => {
@@ -769,6 +772,8 @@ pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
             fix_dxf_layout_plot_settings(&mut doc);
             fix_viewport_status_flags(&mut doc);
             fix_current_style_names(&mut doc);
+            #[cfg(feature = "secureplan")]
+            crate::app::secureplan::import::admit(&doc)?;
             Ok(doc)
         }
         _ => Err(format!("Unsupported file format: .{ext}")),
@@ -1034,6 +1039,9 @@ fn finalize_loaded_outcome(
     }
     fix_viewport_status_flags(doc);
     fix_current_style_names(doc);
+    // SecurePlan CAD refuses a drawing over its entity limit (DSK-01).
+    #[cfg(feature = "secureplan")]
+    crate::app::secureplan::import::admit(doc)?;
     resolve_raster_image_paths(doc, path.parent());
     doc.source_path = Some(path.to_string_lossy().into_owned());
     Ok(outcome)

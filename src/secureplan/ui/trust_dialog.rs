@@ -6,60 +6,52 @@
 //! and the focused button has a thick outline and a "›" marker, so focus is
 //! visible without relying on colour.
 
-use iced::widget::{button, column, container, row, text};
-use iced::{Background, Border, Element, Font, Length, Theme, Vector};
+use iced::widget::{column, container, row, text};
+use iced::{Element, Font, Length, Vector};
 
 use crate::app::secureplan::trust::{Prompt, PromptButton};
 use crate::app::secureplan::Msg;
 use crate::app::Message;
 
-/// Keys the prompt understands; everything else is swallowed while it shows.
+/// Keys the SecurePlan dialogs understand; everything else is swallowed
+/// while one shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogKey {
     Next,
     Previous,
+    Left,
+    Right,
     Activate,
+    Space,
     Cancel,
+    Char(char),
+    Backspace,
 }
 
 impl DialogKey {
-    /// Map a key press to a prompt action.
+    /// Map a key press to a dialog action.
     pub fn from_key(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Self> {
         use iced::keyboard::key::Named;
         match key.as_ref() {
             iced::keyboard::Key::Named(Named::Tab) if modifiers.shift() => Some(DialogKey::Previous),
-            iced::keyboard::Key::Named(Named::Tab | Named::ArrowRight | Named::ArrowDown) => Some(DialogKey::Next),
-            iced::keyboard::Key::Named(Named::ArrowLeft | Named::ArrowUp) => Some(DialogKey::Previous),
-            iced::keyboard::Key::Named(Named::Enter | Named::Space) => Some(DialogKey::Activate),
+            iced::keyboard::Key::Named(Named::Tab | Named::ArrowDown) => Some(DialogKey::Next),
+            iced::keyboard::Key::Named(Named::ArrowUp) => Some(DialogKey::Previous),
+            iced::keyboard::Key::Named(Named::ArrowLeft) => Some(DialogKey::Left),
+            iced::keyboard::Key::Named(Named::ArrowRight) => Some(DialogKey::Right),
+            iced::keyboard::Key::Named(Named::Enter) => Some(DialogKey::Activate),
+            iced::keyboard::Key::Named(Named::Space) => Some(DialogKey::Space),
             iced::keyboard::Key::Named(Named::Escape) => Some(DialogKey::Cancel),
+            iced::keyboard::Key::Named(Named::Backspace) => Some(DialogKey::Backspace),
+            iced::keyboard::Key::Character(c) if !(modifiers.control() || modifiers.alt() || modifiers.logo()) => {
+                c.chars().next().map(DialogKey::Char)
+            }
             _ => None,
         }
     }
 }
 
 fn prompt_button(label: &str, focused: bool, message: Message) -> Element<'static, Message> {
-    let label = if focused { format!("› {label}") } else { format!("  {label}") };
-    button(text(label).size(14))
-        .padding([8, 16])
-        .on_press(message)
-        .style(move |theme: &Theme, status| {
-            let palette = theme.palette();
-            let pair = match status {
-                button::Status::Hovered | button::Status::Pressed => palette.background.weak,
-                _ => palette.background.weakest,
-            };
-            button::Style {
-                background: Some(Background::Color(pair.color)),
-                text_color: pair.text,
-                border: Border {
-                    color: if focused { palette.primary.base.color } else { palette.background.strong.color },
-                    width: if focused { 3.0 } else { 1.0 },
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
-        })
-        .into()
+    super::dialog_button(label, focused, message)
 }
 
 /// The prompt, stacked over `base` as a modal.
@@ -71,7 +63,7 @@ pub fn view<'a>(base: Element<'a, Message>, prompt: &'a Prompt) -> Element<'a, M
         text(
             "Trust it only if this is your organisation's SecurePlan address. A trusted \
              website can open drawings in SecurePlan CAD when you choose Edit or View in \
-             desktop there. You can revoke it later with SECUREPLANREVOKE.",
+             desktop there. You can revoke it later with Revoke trust on the SecurePlan ribbon tab.",
         )
         .size(13)
         .width(Length::Fixed(420.0)),
