@@ -47,4 +47,4 @@ Every control message has `type` and `requestId`. Responses (`applyProgress`, `a
 
 ## Page placement and SPSNAP
 
-See the `description` fields of `placement.json` and `snap/cases.json`. The SPSNAP reader rejects each rule listed in `snap/cases.json`; reserved flag bits (all but bit 0) must be zero.
+See the `description` fields of `placement.json` and `snap/cases.json`. The SPSNAP reader rejects each rule listed in `snap/cases.json`; reserved flag bits (all but bit 0) must be zero. A gzip body is exactly one gzip member whose deflate stream ends at the file's final 8-byte CRC-32/ISIZE trailer; a second member or trailing data is a `counts` rejection, even where a platform's gzip decoder would accept it. A published PDF page has no `/UserUnit` (or `/UserUnit 1`).

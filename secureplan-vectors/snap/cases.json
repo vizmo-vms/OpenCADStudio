@@ -1,5 +1,5 @@
 {
-  "description": "SPSNAP v1: 36-byte little-endian header (magic SPSNAP01, u32 version=1, u32 flags, u32 pageWidthPt, u32 pageHeightPt, u32 pointCount, u32 segmentCount, u32 uncompressedBodyBytes), then the body: f32le[2*pointCount] then f32le[4*segmentCount], gzip-compressed when flags bit 0 is set. Flag bits other than bit 0 must be zero. uncompressedBodyBytes must equal 8*pointCount + 16*segmentCount and the (inflated) body length, and must not exceed 134217728. Coordinates must be finite and within [-1, width+1] x [-1, height+1]. pdfPage is the page size of the PDF the snap file is bound to.",
+  "description": "SPSNAP v1: 36-byte little-endian header (magic SPSNAP01, u32 version=1, u32 flags, u32 pageWidthPt, u32 pageHeightPt, u32 pointCount, u32 segmentCount, u32 uncompressedBodyBytes), then the body: f32le[2*pointCount] then f32le[4*segmentCount], compressed as exactly one gzip member (RFC 1952) when flags bit 0 is set: its deflate stream ends exactly at the final 8-byte CRC-32/ISIZE trailer, and a second member or any trailing data is a counts rejection. Flag bits other than bit 0 must be zero. uncompressedBodyBytes must equal 8*pointCount + 16*segmentCount and the (inflated) body length, and must not exceed 134217728. Coordinates must be finite and within [-1, width+1] x [-1, height+1]. pdfPage is the page size of the PDF the snap file is bound to.",
   "maxBodyBytes": 134217728,
   "rules": [
     "header",
@@ -350,6 +350,28 @@
         "heightPt": 400
       },
       "rule": "counts"
+    },
+    {
+      "name": "gzip-two-members",
+      "path": "snap/invalid-gzip-two-members.spsnap",
+      "sha256": "5c05250d516c399b38459fdb253411c3dd95c7f017f4a405a8882b795bed04d3",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts",
+      "note": "Two gzip members that together inflate to the declared body; the body must be exactly one member."
+    },
+    {
+      "name": "gzip-trailing-data",
+      "path": "snap/invalid-gzip-trailing-data.spsnap",
+      "sha256": "629296c5f76e6e2b90112d362d5865e1aa48cd2808549db4b6568ceb2c009250",
+      "pdfPage": {
+        "widthPt": 600,
+        "heightPt": 400
+      },
+      "rule": "counts",
+      "note": "A valid member followed by a copy of its own 8-byte trailer, so the file still ends in a matching trailer; the deflate stream must end exactly at the final trailer."
     },
     {
       "name": "body-over-128mib",

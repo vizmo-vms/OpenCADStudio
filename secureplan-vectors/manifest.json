@@ -5,8 +5,8 @@
   "files": [
     {
       "path": "README.md",
-      "bytes": 5700,
-      "sha256": "9ea44eb634c6dbff1db7866d3f64fcc1a2814348125b7317a1290dee8290032f"
+      "bytes": 5986,
+      "sha256": "577a4bdd7c4fcb563a66dff6f44b99e9371b684456c590c84d55f5fa35275962"
     },
     {
       "path": "base-identity.json",
@@ -80,8 +80,8 @@
     },
     {
       "path": "snap/cases.json",
-      "bytes": 8938,
-      "sha256": "53e207490265dbcfd6d9a97a3a8c36f132f65e2810773f5d522567882db91559"
+      "bytes": 9978,
+      "sha256": "534733840b7c4d07f821999f6e5c60ee3c74465fd94e0f1ed199e06bb12520c4"
     },
     {
       "path": "snap/invalid-bad-magic.spsnap",
@@ -117,6 +117,16 @@
       "path": "snap/invalid-gzip-corrupt.spsnap",
       "bytes": 53,
       "sha256": "d74161ef3f7618c8c04df33df1a64238e79a27362808969a60f498314cb2a30e"
+    },
+    {
+      "path": "snap/invalid-gzip-trailing-data.spsnap",
+      "bytes": 97,
+      "sha256": "629296c5f76e6e2b90112d362d5865e1aa48cd2808549db4b6568ceb2c009250"
+    },
+    {
+      "path": "snap/invalid-gzip-two-members.spsnap",
+      "bytes": 131,
+      "sha256": "5c05250d516c399b38459fdb253411c3dd95c7f017f4a405a8882b795bed04d3"
     },
     {
       "path": "snap/invalid-infinite-segment.spsnap",
