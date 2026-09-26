@@ -65,6 +65,11 @@ pub fn load_cached() -> Vec<VideoEntry> {
 /// keeps whatever [`load_cached`] provided.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_playlist() -> Result<Vec<VideoEntry>, String> {
+    // SecurePlan CAD makes no request here (DSK-02); the text matches
+    // `secureplan::hardening::DISABLED`, which this build may not contain.
+    if cfg!(feature = "secureplan") {
+        return Err("This feature is not available in SecurePlan CAD.".into());
+    }
     let agent = crate::network::agent(std::time::Duration::from_secs(15));
     let page = agent
         .get(PLAYLIST_URL)

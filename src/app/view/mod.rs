@@ -1249,6 +1249,10 @@ bg={bg_ms:.1}ms n={view_count}"
             if let Some(pivot) = self.spacemouse_pivot_overlay() {
                 viewport_stack = viewport_stack.push(pivot);
             }
+            #[cfg(feature = "secureplan")]
+            if let Some(layer) = self.secureplan_viewport_overlay() {
+                viewport_stack = viewport_stack.push(layer);
+            }
             // Per-pane input pane_grid goes ABOVE the crosshair overlay so it
             // receives mouse events (the overlay's `Hidden` cursor would otherwise
             // starve any layer beneath it). The controls bar is pushed on top of it.
@@ -2350,6 +2354,8 @@ bg={bg_ms:.1}ms n={view_count}"
             }
             None => modal_underlay,
         };
+        #[cfg(feature = "secureplan")]
+        let base = self.secureplan_view_layer(base);
         // Shared CAD colour picker. Indexed ACI colours use OpenCADStudio's own
         // dialog; True Color keeps the existing iced_aw gradient picker.
         // Which part of the widget tree the frame went into. Reported as a
@@ -2733,6 +2739,8 @@ impl OpenCADStudio {
             single_instance,
             hatch_pattern_keys,
             keyboard_events,
+            #[cfg(feature = "secureplan")]
+            self.secureplan_subscription(),
         ])
     }
 

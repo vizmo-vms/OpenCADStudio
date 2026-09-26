@@ -1,0 +1,292 @@
+{
+  "description": "Valid transfer payloads and conversion candidates.",
+  "samples": [
+    {
+      "name": "overlay",
+      "schema": "overlay.schema.json",
+      "value": {
+        "schemaVersion": 1,
+        "walls": [
+          {
+            "id": "wall-1",
+            "material": "solid",
+            "start": [
+              0,
+              0
+            ],
+            "end": [
+              12000,
+              0
+            ]
+          }
+        ],
+        "doors": [
+          {
+            "id": "door-1",
+            "start": [
+              3000,
+              0
+            ],
+            "end": [
+              3900,
+              0
+            ]
+          }
+        ],
+        "routes": [
+          {
+            "id": "route-1",
+            "points": [
+              [
+                1000,
+                1000
+              ],
+              [
+                5000,
+                1000
+              ],
+              [
+                5000,
+                4000
+              ]
+            ]
+          }
+        ],
+        "devices": [
+          {
+            "id": "camera-1",
+            "kind": "camera",
+            "symbolKey": "camera-dome",
+            "name": "Synthetic dome camera",
+            "color": "#2f80ed",
+            "position": [
+              6000,
+              3000
+            ],
+            "rotationDeg": 45
+          }
+        ],
+        "coverage": [
+          {
+            "elementId": "camera-1",
+            "polygon": [
+              [
+                6000,
+                3000
+              ],
+              [
+                9000,
+                3000
+              ],
+              [
+                9000,
+                6000
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "overlay-empty",
+      "schema": "overlay.schema.json",
+      "value": {
+        "schemaVersion": 1,
+        "walls": [],
+        "doors": [],
+        "routes": [],
+        "devices": [],
+        "coverage": []
+      }
+    },
+    {
+      "name": "export",
+      "schema": "export-payload.schema.json",
+      "value": {
+        "schemaVersion": 1,
+        "snapshot": {
+          "version": 12,
+          "documentHash": "2b69620a5a625907df23f2bd30c3276da97753912d6460d22d778a7b0208f56a"
+        },
+        "options": {
+          "includeNotes": true,
+          "includeCoverage": false
+        },
+        "walls": [
+          {
+            "id": "wall-1",
+            "material": "glass",
+            "status": "Proposed",
+            "start": [
+              0,
+              0
+            ],
+            "end": [
+              12000,
+              0
+            ]
+          }
+        ],
+        "doors": [
+          {
+            "id": "door-1",
+            "status": "In Place",
+            "start": [
+              3000,
+              0
+            ],
+            "end": [
+              3900,
+              0
+            ]
+          }
+        ],
+        "routes": [
+          {
+            "id": "route-1",
+            "cableType": "Cat6",
+            "label": "C-01",
+            "status": "Proposed",
+            "points": [
+              [
+                1000,
+                1000
+              ],
+              [
+                5000,
+                1000
+              ]
+            ]
+          }
+        ],
+        "devices": [
+          {
+            "id": "camera-1",
+            "kind": "camera",
+            "name": "Synthetic dome camera",
+            "iconKey": "camera-dome",
+            "customIcon": false,
+            "color": "#2f80ed",
+            "label": "CAM-01",
+            "status": "Proposed",
+            "position": [
+              6000,
+              3000
+            ],
+            "rotationDeg": 45
+          }
+        ],
+        "targets": [
+          {
+            "id": "target-1",
+            "label": "Entry face",
+            "position": [
+              7000,
+              3500
+            ],
+            "rotationDeg": 0,
+            "requiredPpm": 250
+          }
+        ],
+        "drawings": [
+          {
+            "id": "drawing-1",
+            "drawingType": "arrow",
+            "label": "",
+            "points": [
+              [
+                100,
+                100
+              ],
+              [
+                900,
+                100
+              ]
+            ]
+          }
+        ],
+        "labels": [
+          {
+            "elementId": "camera-1",
+            "text": "CAM-01",
+            "position": [
+              6200,
+              3200
+            ]
+          }
+        ],
+        "notes": [
+          {
+            "id": "note-1",
+            "text": "Synthetic note",
+            "position": [
+              500,
+              500
+            ]
+          }
+        ],
+        "coverage": []
+      }
+    },
+    {
+      "name": "convert-walls",
+      "schema": "convert-candidates.schema.json",
+      "value": {
+        "kind": "walls",
+        "walls": [
+          {
+            "start": [
+              0,
+              0
+            ],
+            "end": [
+              5000,
+              0
+            ]
+          },
+          {
+            "start": [
+              5000,
+              0
+            ],
+            "end": [
+              5000,
+              3000
+            ]
+          }
+        ],
+        "rejected": [
+          {
+            "reason": "tooShort",
+            "atMm": [
+              100,
+              100
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "convert-route",
+      "schema": "convert-candidates.schema.json",
+      "value": {
+        "kind": "route",
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            2000,
+            0
+          ],
+          [
+            2000,
+            1500
+          ]
+        ],
+        "rejected": []
+      }
+    }
+  ]
+}

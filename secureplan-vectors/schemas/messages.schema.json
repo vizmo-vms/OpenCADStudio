@@ -1,0 +1,382 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "messages.schema.json",
+  "title": "SecurePlan CAD bridge protocol v1: control messages (BRG-07)",
+  "description": "Every control message is a JSON object with type and requestId. Unknown types or fields are rejected. hello, challenge and prove are plaintext text frames; every later frame is sealed (see README.md).",
+  "$defs": {
+    "hello": {
+      "description": "web -> desktop, plaintext. BRG-04 step 1.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "pairing", "nonceW", "webVersion", "minDesktopVersion", "protocols"],
+      "properties": {
+        "type": { "const": "hello" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "pairing": { "$ref": "common.schema.json#/$defs/pairingId" },
+        "nonceW": { "$ref": "common.schema.json#/$defs/bytes32" },
+        "webVersion": { "$ref": "common.schema.json#/$defs/semver" },
+        "minDesktopVersion": { "$ref": "common.schema.json#/$defs/semver" },
+        "protocols": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 255 }, "minItems": 1, "maxItems": 8, "uniqueItems": true }
+      }
+    },
+    "challenge": {
+      "description": "desktop -> web, plaintext. BRG-04 step 2.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "nonceD", "proofD"],
+      "properties": {
+        "type": { "const": "challenge" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "nonceD": { "$ref": "common.schema.json#/$defs/bytes32" },
+        "proofD": { "$ref": "common.schema.json#/$defs/bytes32" }
+      }
+    },
+    "prove": {
+      "description": "web -> desktop, plaintext. BRG-04 step 3.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "proofW"],
+      "properties": {
+        "type": { "const": "prove" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "proofW": { "$ref": "common.schema.json#/$defs/bytes32" }
+      }
+    },
+    "welcome": {
+      "description": "desktop -> web, the first sealed frame (counter 0). BRG-04 step 4.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "desktopVersion", "protocol", "capabilities"],
+      "properties": {
+        "type": { "const": "welcome" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "desktopVersion": { "$ref": "common.schema.json#/$defs/semver" },
+        "protocol": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "capabilities": { "type": "array", "items": { "enum": ["overlay", "import", "apply", "layoutView", "convert", "export"] }, "maxItems": 6, "uniqueItems": true }
+      }
+    },
+    "ping": {
+      "description": "desktop -> web every 30 s (BRG-05).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId"],
+      "properties": {
+        "type": { "const": "ping" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" }
+      }
+    },
+    "close": {
+      "description": "Either direction. The sender closes the socket after sending it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "reason"],
+      "properties": {
+        "type": { "const": "close" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "reason": { "enum": ["superseded", "surveyChanged", "pageClosed", "userCancelled", "pingTimeout", "protocolError", "unsupportedVersion", "transferFailed", "documentClosed", "desktopExiting"] }
+      }
+    },
+    "transferStart": {
+      "description": "Either direction. Announces a transfer (BRG-06). JSON payload media types are limited to 8388608 bytes; the others to 52428800.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "transferId", "name", "mediaType", "byteLength", "sha256"],
+      "properties": {
+        "type": { "const": "transferStart" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "transferId": { "$ref": "common.schema.json#/$defs/transferId" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001f\\u007f/\\\\]+$" },
+        "mediaType": { "enum": ["image/vnd.dwg", "image/vnd.dxf", "application/pdf", "application/vnd.secureplan.snap", "application/vnd.secureplan.overlay+json", "application/vnd.secureplan.export+json"] },
+        "byteLength": { "type": "integer", "minimum": 0, "maximum": 52428800 },
+        "sha256": { "$ref": "common.schema.json#/$defs/sha256" }
+      }
+    },
+    "openSession": {
+      "description": "web -> desktop. Referenced transfers are announced before this message.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "intent", "mode", "surveyLabel", "cadPlan", "placement", "baseIdentity", "drawingTransferId", "overlayTransferId"],
+      "properties": {
+        "type": { "const": "openSession" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "intent": { "enum": ["edit", "view", "import", "export"] },
+        "mode": { "enum": ["edit", "view"] },
+        "surveyLabel": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "cadPlan": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/cadPlan" }] },
+        "placement": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/placement" }] },
+        "baseIdentity": { "$ref": "common.schema.json#/$defs/baseIdentity" },
+        "drawingTransferId": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/transferId" }] },
+        "overlayTransferId": { "$ref": "common.schema.json#/$defs/transferId" }
+      }
+    },
+    "planUpdate": {
+      "description": "web -> desktop. The survey's plan changed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "reason", "cadPlan", "placement", "baseIdentity", "drawingTransferId"],
+      "properties": {
+        "type": { "const": "planUpdate" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "reason": { "enum": ["applied", "restored", "replaced", "removed", "changed"] },
+        "cadPlan": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/cadPlan" }] },
+        "placement": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/placement" }] },
+        "baseIdentity": { "$ref": "common.schema.json#/$defs/baseIdentity" },
+        "drawingTransferId": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/transferId" }] }
+      }
+    },
+    "sessionMode": {
+      "description": "web -> desktop. Driven by lease ownership and role only (BRG-08).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "mode", "reason"],
+      "properties": {
+        "type": { "const": "sessionMode" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "mode": { "enum": ["edit", "view"] },
+        "reason": { "enum": ["leaseAcquired", "leaseLost", "roleChanged", "surveyReadOnly"] }
+      }
+    },
+    "sessionState": {
+      "description": "desktop -> web.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "dirty", "activeView", "busy", "error"],
+      "properties": {
+        "type": { "const": "sessionState" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "dirty": { "type": "boolean" },
+        "activeView": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "model" } } },
+            { "type": "object", "additionalProperties": false, "required": ["kind", "layoutName"], "properties": { "kind": { "const": "layout" }, "layoutName": { "type": "string", "minLength": 1, "maxLength": 255 } } }
+          ]
+        },
+        "busy": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["operation", "progress"],
+              "properties": {
+                "operation": { "enum": ["loading", "import", "apply", "convert", "export"] },
+                "progress": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": 0, "maximum": 1 }] }
+              }
+            }
+          ]
+        },
+        "error": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["code"],
+              "properties": { "code": { "enum": ["IMPORT_FAILED", "ENTITY_LIMIT", "KNOWN_LOSS", "WRITER_ERROR", "OUTPUT_TOO_LARGE", "TRANSFER_FAILED", "INTERNAL"] } }
+            }
+          ]
+        }
+      }
+    },
+    "applyRequest": {
+      "description": "desktop -> web (PUB-04). Transfers are announced before this message; names and media types come from their transferStart.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "baseIdentity", "view", "cadUnits", "mapping", "realigned", "placement", "roundingBoundMm", "chordToleranceMm", "drawing", "original", "pdfTransferId", "snapTransferId", "desktopVersion", "forkCommit"],
+      "properties": {
+        "type": { "const": "applyRequest" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "baseIdentity": { "$ref": "common.schema.json#/$defs/baseIdentity" },
+        "view": { "$ref": "common.schema.json#/$defs/view" },
+        "cadUnits": { "$ref": "common.schema.json#/$defs/cadUnits" },
+        "mapping": { "$ref": "common.schema.json#/$defs/mapping" },
+        "realigned": { "type": "boolean" },
+        "placement": { "$ref": "common.schema.json#/$defs/placement" },
+        "roundingBoundMm": { "type": "number", "minimum": 0, "maximum": 1000000 },
+        "chordToleranceMm": { "type": "number", "minimum": 0.01, "maximum": 0.1 },
+        "drawing": { "$ref": "#/$defs/drawingOutput" },
+        "original": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/drawingOutput" }] },
+        "pdfTransferId": { "$ref": "common.schema.json#/$defs/transferId" },
+        "snapTransferId": { "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/transferId" }] },
+        "desktopVersion": { "$ref": "common.schema.json#/$defs/semver" },
+        "forkCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "drawingOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transferId", "formatVersion"],
+      "properties": {
+        "transferId": { "$ref": "common.schema.json#/$defs/transferId" },
+        "formatVersion": { "type": "string", "minLength": 1, "maxLength": 16 }
+      }
+    },
+    "applyProgress": {
+      "description": "web -> desktop. requestId is the applyRequest's.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "step", "progress"],
+      "properties": {
+        "type": { "const": "applyProgress" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "step": { "enum": ["savingDraft", "creatingRevision", "uploading", "committing"] },
+        "progress": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": 0, "maximum": 1 }] }
+      }
+    },
+    "applyResult": {
+      "description": "web -> desktop. requestId is the applyRequest's. The desktop stays dirty on error.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status", "planVersion", "baseIdentity"],
+          "properties": {
+            "type": { "const": "applyResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "committed" },
+            "planVersion": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "baseIdentity": { "$ref": "common.schema.json#/$defs/sha256" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status", "code", "detail"],
+          "properties": {
+            "type": { "const": "applyResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "error" },
+            "code": { "enum": ["PLAN_CHANGED", "LEASE_LOST", "NOT_EDIT_MODE", "QUOTA", "INVALID", "SAVE_FAILED", "CANCELLED"] },
+            "detail": { "oneOf": [{ "type": "null" }, { "type": "string", "maxLength": 500 }] }
+          }
+        }
+      ]
+    },
+    "convertRequest": {
+      "description": "desktop -> web (CNV-02).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "baseIdentity", "candidates"],
+      "properties": {
+        "type": { "const": "convertRequest" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "baseIdentity": { "$ref": "common.schema.json#/$defs/sha256" },
+        "candidates": { "$ref": "convert-candidates.schema.json" }
+      }
+    },
+    "convertResult": {
+      "description": "web -> desktop. requestId is the convertRequest's; a retry with the same requestId returns the original result.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status", "elementIds"],
+          "properties": {
+            "type": { "const": "convertResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "added" },
+            "elementIds": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/elementId" }, "minItems": 1, "maxItems": 10000 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status"],
+          "properties": {
+            "type": { "const": "convertResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "cancelled" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status", "code"],
+          "properties": {
+            "type": { "const": "convertResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "error" },
+            "code": { "enum": ["PLAN_CHANGED", "LEASE_LOST", "NOT_EDIT_MODE", "LIMIT", "INVALID"] }
+          }
+        }
+      ]
+    },
+    "overlayUpdate": {
+      "description": "web -> desktop (OVL-02). The desktop replaces the overlay.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "overlayTransferId"],
+      "properties": {
+        "type": { "const": "overlayUpdate" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "overlayTransferId": { "$ref": "common.schema.json#/$defs/transferId" }
+      }
+    },
+    "exportRequest": {
+      "description": "web -> desktop (EXP-01).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "requestId", "snapshot", "drawingTransferId", "payloadTransferId"],
+      "properties": {
+        "type": { "const": "exportRequest" },
+        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+        "snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "documentHash"],
+          "properties": {
+            "version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "documentHash": { "$ref": "common.schema.json#/$defs/sha256" }
+          }
+        },
+        "drawingTransferId": { "$ref": "common.schema.json#/$defs/transferId" },
+        "payloadTransferId": { "$ref": "common.schema.json#/$defs/transferId" }
+      }
+    },
+    "exportResult": {
+      "description": "desktop -> web. requestId is the exportRequest's. No bytes.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status", "fileName", "format", "formatVersion"],
+          "properties": {
+            "type": { "const": "exportResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "written" },
+            "fileName": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^\\u0000-\\u001f\\u007f/\\\\]+$" },
+            "format": { "enum": ["dwg", "dxf"] },
+            "formatVersion": { "type": "string", "minLength": 1, "maxLength": 16 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status"],
+          "properties": {
+            "type": { "const": "exportResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "cancelled" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "status", "code"],
+          "properties": {
+            "type": { "const": "exportResult" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "status": { "const": "error" },
+            "code": { "enum": ["INVALID", "TRANSFER_FAILED", "WRITER_ERROR", "HEADER_MISMATCH"] }
+          }
+        }
+      ]
+    }
+  },
+  "x-directions": {
+    "webToDesktop": ["hello", "prove", "close", "transferStart", "openSession", "planUpdate", "sessionMode", "applyProgress", "applyResult", "convertResult", "overlayUpdate", "exportRequest"],
+    "desktopToWeb": ["challenge", "welcome", "ping", "close", "transferStart", "sessionState", "applyRequest", "convertRequest", "exportResult"],
+    "plaintext": ["hello", "challenge", "prove"]
+  }
+}

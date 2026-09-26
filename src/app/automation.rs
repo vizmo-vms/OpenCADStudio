@@ -27,6 +27,10 @@ use super::OpenCADStudio;
 /// a time (the document session persists across reconnects).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve() {
+    // SecurePlan CAD exposes no automation surface (DSK-02).
+    if cfg!(feature = "secureplan") {
+        return;
+    }
     let mut app = OpenCADStudio::new();
     match port_arg() {
         Some(port) => serve_socket(&mut app, port),

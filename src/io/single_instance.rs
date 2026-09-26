@@ -38,7 +38,12 @@ use serde_json::{json, Value};
 /// Protocol tag. Bump the suffix on any wire-format change so a running older
 /// editor is recognised as a stranger and both processes degrade cleanly
 /// instead of misreading each other.
+#[cfg(not(feature = "secureplan"))]
 const MAGIC: &str = "OpenCADStudio/si/2";
+/// SecurePlan CAD elects its own single instance: a different tag gives it a
+/// different port and identity, so it never hands a launch to Open CAD Studio.
+#[cfg(feature = "secureplan")]
+const MAGIC: &str = "SecurePlanCAD/si/1";
 
 /// Neither end blocks forever. Long enough to cover a busy primary's accept
 /// backlog, short enough that a wedged peer costs a visible pause and not a
@@ -184,6 +189,18 @@ pub fn handoff(stream: TcpStream, paths: &[PathBuf]) -> bool {
     // would demand the file exist (we want the editor's own error message, not
     // a silent boot) and on Windows yields a `\\?\` verbatim path that would
     // land verbatim in the recents list.
+    // SecurePlan launch URLs carry pairing data and go only over the per-user
+    // channel (DSK-04), never through this unauthenticated port.
+    #[cfg(feature = "secureplan")]
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| !p.to_str().is_some_and(crate::app::secureplan::handoff::is_launch_url))
+        .cloned()
+        .collect();
+    #[cfg(feature = "secureplan")]
+    if paths.is_empty() {
+        return false;
+    }
     let abs: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -296,6 +313,11 @@ fn serve_one(out: &mut PathSender, stream: TcpStream) {
                     Some(a) => a
                         .iter()
                         .filter_map(|p| p.as_str())
+                        // Pairing URLs never arrive this way in SecurePlan CAD.
+                        .filter(|p| {
+                            !cfg!(feature = "secureplan")
+                                || !p.get(..15).is_some_and(|s| s.eq_ignore_ascii_case("secureplan-cad:"))
+                        })
                         .all(|p| out.try_send(PathBuf::from(p)).is_ok()),
                     None => false,
                 };
@@ -311,6 +333,33 @@ fn serve_one(out: &mut PathSender, stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "secureplan")]
+    #[test]
+    fn secureplan_launch_urls_are_never_forwarded_over_this_port() {
+        use std::io::Read;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            let mut all = String::new();
+            let _ = BufReader::new(s).read_to_string(&mut all);
+            all
+        });
+        let s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let url = PathBuf::from("secureplan-cad://pair?v=1&token=c2VjcmV0");
+        assert!(!handoff(s, &[url]), "a launch URL was handed off");
+        let seen = t.join().unwrap();
+        assert!(!seen.contains("token"), "{seen:?}");
+    }
+
+    #[cfg(feature = "secureplan")]
+    #[test]
+    fn secureplan_single_instance_key_differs_from_upstream() {
+        assert_ne!(MAGIC, "OpenCADStudio/si/2");
+        assert!(MAGIC.starts_with("SecurePlanCAD/"));
+    }
 
     #[test]
     fn port_is_deterministic_and_in_the_reserved_window() {

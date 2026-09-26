@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+; SecurePlan CAD development registration (Windows): registers the
+; secureplan-cad: link scheme for the current user only (HKCU), pointing at
+; %LOCALAPPDATA%\SecurePlanCAD-dev\OpenCADStudio.exe (a debug build from the
+; SecurePlan CI artifacts). Copy the executable there, then double-click this
+; file. The installer registers the scheme itself in release builds.
+; Command (REG_EXPAND_SZ): "%LOCALAPPDATA%\SecurePlanCAD-dev\OpenCADStudio.exe" "%1"
+
+[HKEY_CURRENT_USER\Software\Classes\secureplan-cad]
+@="URL:SecurePlan CAD (development)"
+"URL Protocol"=""
+
+[HKEY_CURRENT_USER\Software\Classes\secureplan-cad\shell\open\command]
+@=hex(2):22,00,25,00,4c,00,4f,00,43,00,41,00,4c,00,41,00,50,00,50,00,44,00,\
+  41,00,54,00,41,00,25,00,5c,00,53,00,65,00,63,00,75,00,72,00,65,00,50,00,\
+  6c,00,61,00,6e,00,43,00,41,00,44,00,2d,00,64,00,65,00,76,00,5c,00,4f,00,\
+  70,00,65,00,6e,00,43,00,41,00,44,00,53,00,74,00,75,00,64,00,69,00,6f,00,\
+  2e,00,65,00,78,00,65,00,22,00,20,00,22,00,25,00,31,00,22,00,00,00

@@ -72,6 +72,10 @@ impl OpenCADStudio {
         };
         let resolved = self.resolve_alias(cmd);
         let cmd = resolved.as_deref().unwrap_or(cmd);
+        #[cfg(feature = "secureplan")]
+        if let Some(task) = self.secureplan_dispatch(cmd) {
+            return task;
+        }
         if is_spacemouse_command(cmd) {
             return self.run_action(cmd);
         }

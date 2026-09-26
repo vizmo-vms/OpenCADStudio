@@ -1,0 +1,241 @@
+{
+  "description": "PUB-06 base identity: lowercase hex SHA-256 of the UTF-8 canonical JSON of design.cadPlan (object keys sorted by UTF-16 code units at every level, arrays in order, no whitespace, numbers as JSON.stringify writes them), or the string \"none\" when the key is absent.",
+  "absent": "none",
+  "cases": [
+    {
+      "name": "model-view",
+      "cadPlan": {
+        "schemaVersion": 1,
+        "original": {
+          "fileId": "file-original",
+          "kind": "floor_plan",
+          "name": "synthetic-original.dxf",
+          "mimeType": "image/vnd.dxf",
+          "formatVersion": "AC1027",
+          "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+        },
+        "drawing": {
+          "fileId": "file-original",
+          "kind": "floor_plan",
+          "name": "synthetic-original.dxf",
+          "mimeType": "image/vnd.dxf",
+          "formatVersion": "AC1027",
+          "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+        },
+        "snap": {
+          "fileId": "file-snap",
+          "kind": "floor_plan",
+          "name": "synthetic.spsnap",
+          "mimeType": "application/vnd.secureplan.snap",
+          "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+        },
+        "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
+        "version": {
+          "number": 1,
+          "publishedAt": "2026-09-26T00:00:00.000Z",
+          "desktopVersion": "1.0.0",
+          "protocol": 1,
+          "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+        }
+      },
+      "canonicalJson": "{\"cadUnits\":\"mm\",\"drawing\":{\"fileId\":\"file-original\",\"formatVersion\":\"AC1027\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dxf\",\"name\":\"synthetic-original.dxf\",\"sha256\":\"d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54\"},\"mapping\":{\"anchorMm\":[0,0],\"cadOrigin\":[0,18000],\"quarterTurns\":0,\"scaleMmPerCadUnit\":1},\"original\":{\"fileId\":\"file-original\",\"formatVersion\":\"AC1027\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dxf\",\"name\":\"synthetic-original.dxf\",\"sha256\":\"d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54\"},\"pdfSha256\":\"8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3\",\"schemaVersion\":1,\"snap\":{\"fileId\":\"file-snap\",\"kind\":\"floor_plan\",\"mimeType\":\"application/vnd.secureplan.snap\",\"name\":\"synthetic.spsnap\",\"sha256\":\"f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf\"},\"version\":{\"desktopVersion\":\"1.0.0\",\"forkCommit\":\"0d023d267bc5b7afeca3b54e98875b0efd4f3926\",\"number\":1,\"protocol\":1,\"publishedAt\":\"2026-09-26T00:00:00.000Z\"},\"view\":{\"kind\":\"model\",\"windowCad\":[0,0,30000,18000]}}",
+      "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9"
+    },
+    {
+      "name": "layout-view-no-snap",
+      "cadPlan": {
+        "schemaVersion": 1,
+        "original": {
+          "fileId": "file-original-dwg",
+          "kind": "floor_plan",
+          "name": "synthetic-original-dwg.dwg",
+          "mimeType": "image/vnd.dwg",
+          "formatVersion": "AC1032",
+          "sha256": "6d0df658a470d76ab856e437c28a2b3bf4353d662a1a430fd83cdf201085b01c"
+        },
+        "drawing": {
+          "fileId": "file-drawing-2",
+          "kind": "floor_plan",
+          "name": "synthetic-drawing-2.dwg",
+          "mimeType": "image/vnd.dwg",
+          "formatVersion": "AC1032",
+          "sha256": "fbf36ea9475ba8fe2342e202068f4fddef33ee58066fe8e06ed3078f3bb1dde1"
+        },
+        "snap": null,
+        "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+        "view": {
+          "kind": "layout",
+          "layoutName": "Sheet A1 – Ground floor",
+          "viewportHandle": "2F"
+        },
+        "cadUnits": "ft",
+        "mapping": {
+          "cadOrigin": [
+            -10.5,
+            65.25
+          ],
+          "anchorMm": [
+            30000,
+            2000
+          ],
+          "scaleMmPerCadUnit": 304.8,
+          "quarterTurns": 1
+        },
+        "version": {
+          "number": 7,
+          "publishedAt": "2026-09-26T12:34:56.789Z",
+          "desktopVersion": "1.0.0",
+          "protocol": 1,
+          "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+        }
+      },
+      "canonicalJson": "{\"cadUnits\":\"ft\",\"drawing\":{\"fileId\":\"file-drawing-2\",\"formatVersion\":\"AC1032\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dwg\",\"name\":\"synthetic-drawing-2.dwg\",\"sha256\":\"fbf36ea9475ba8fe2342e202068f4fddef33ee58066fe8e06ed3078f3bb1dde1\"},\"mapping\":{\"anchorMm\":[30000,2000],\"cadOrigin\":[-10.5,65.25],\"quarterTurns\":1,\"scaleMmPerCadUnit\":304.8},\"original\":{\"fileId\":\"file-original-dwg\",\"formatVersion\":\"AC1032\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dwg\",\"name\":\"synthetic-original-dwg.dwg\",\"sha256\":\"6d0df658a470d76ab856e437c28a2b3bf4353d662a1a430fd83cdf201085b01c\"},\"pdfSha256\":\"8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3\",\"schemaVersion\":1,\"snap\":null,\"version\":{\"desktopVersion\":\"1.0.0\",\"forkCommit\":\"0d023d267bc5b7afeca3b54e98875b0efd4f3926\",\"number\":7,\"protocol\":1,\"publishedAt\":\"2026-09-26T12:34:56.789Z\"},\"view\":{\"kind\":\"layout\",\"layoutName\":\"Sheet A1 – Ground floor\",\"viewportHandle\":\"2F\"}}",
+      "baseIdentity": "0ea39092a9499eb868d9651bd0aaffc87bfcdebe7ddbeb676a14cad96486f920"
+    },
+    {
+      "name": "key-order-independent",
+      "note": "Same plan as model-view with keys inserted in reverse order.",
+      "cadPlan": {
+        "version": {
+          "number": 1,
+          "publishedAt": "2026-09-26T00:00:00.000Z",
+          "desktopVersion": "1.0.0",
+          "protocol": 1,
+          "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+        },
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
+        "cadUnits": "mm",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+        "snap": {
+          "fileId": "file-snap",
+          "kind": "floor_plan",
+          "name": "synthetic.spsnap",
+          "mimeType": "application/vnd.secureplan.snap",
+          "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+        },
+        "drawing": {
+          "fileId": "file-original",
+          "kind": "floor_plan",
+          "name": "synthetic-original.dxf",
+          "mimeType": "image/vnd.dxf",
+          "formatVersion": "AC1027",
+          "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+        },
+        "original": {
+          "fileId": "file-original",
+          "kind": "floor_plan",
+          "name": "synthetic-original.dxf",
+          "mimeType": "image/vnd.dxf",
+          "formatVersion": "AC1027",
+          "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+        },
+        "schemaVersion": 1
+      },
+      "canonicalJson": "{\"cadUnits\":\"mm\",\"drawing\":{\"fileId\":\"file-original\",\"formatVersion\":\"AC1027\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dxf\",\"name\":\"synthetic-original.dxf\",\"sha256\":\"d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54\"},\"mapping\":{\"anchorMm\":[0,0],\"cadOrigin\":[0,18000],\"quarterTurns\":0,\"scaleMmPerCadUnit\":1},\"original\":{\"fileId\":\"file-original\",\"formatVersion\":\"AC1027\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dxf\",\"name\":\"synthetic-original.dxf\",\"sha256\":\"d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54\"},\"pdfSha256\":\"8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3\",\"schemaVersion\":1,\"snap\":{\"fileId\":\"file-snap\",\"kind\":\"floor_plan\",\"mimeType\":\"application/vnd.secureplan.snap\",\"name\":\"synthetic.spsnap\",\"sha256\":\"f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf\"},\"version\":{\"desktopVersion\":\"1.0.0\",\"forkCommit\":\"0d023d267bc5b7afeca3b54e98875b0efd4f3926\",\"number\":1,\"protocol\":1,\"publishedAt\":\"2026-09-26T00:00:00.000Z\"},\"view\":{\"kind\":\"model\",\"windowCad\":[0,0,30000,18000]}}",
+      "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9"
+    },
+    {
+      "name": "version-bump",
+      "cadPlan": {
+        "schemaVersion": 1,
+        "original": {
+          "fileId": "file-original",
+          "kind": "floor_plan",
+          "name": "synthetic-original.dxf",
+          "mimeType": "image/vnd.dxf",
+          "formatVersion": "AC1027",
+          "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+        },
+        "drawing": {
+          "fileId": "file-original",
+          "kind": "floor_plan",
+          "name": "synthetic-original.dxf",
+          "mimeType": "image/vnd.dxf",
+          "formatVersion": "AC1027",
+          "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+        },
+        "snap": {
+          "fileId": "file-snap",
+          "kind": "floor_plan",
+          "name": "synthetic.spsnap",
+          "mimeType": "application/vnd.secureplan.snap",
+          "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+        },
+        "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+        "view": {
+          "kind": "model",
+          "windowCad": [
+            0,
+            0,
+            30000,
+            18000
+          ]
+        },
+        "cadUnits": "mm",
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
+        "version": {
+          "number": 2,
+          "publishedAt": "2026-09-26T00:00:00.000Z",
+          "desktopVersion": "1.0.0",
+          "protocol": 1,
+          "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+        }
+      },
+      "canonicalJson": "{\"cadUnits\":\"mm\",\"drawing\":{\"fileId\":\"file-original\",\"formatVersion\":\"AC1027\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dxf\",\"name\":\"synthetic-original.dxf\",\"sha256\":\"d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54\"},\"mapping\":{\"anchorMm\":[0,0],\"cadOrigin\":[0,18000],\"quarterTurns\":0,\"scaleMmPerCadUnit\":1},\"original\":{\"fileId\":\"file-original\",\"formatVersion\":\"AC1027\",\"kind\":\"floor_plan\",\"mimeType\":\"image/vnd.dxf\",\"name\":\"synthetic-original.dxf\",\"sha256\":\"d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54\"},\"pdfSha256\":\"8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3\",\"schemaVersion\":1,\"snap\":{\"fileId\":\"file-snap\",\"kind\":\"floor_plan\",\"mimeType\":\"application/vnd.secureplan.snap\",\"name\":\"synthetic.spsnap\",\"sha256\":\"f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf\"},\"version\":{\"desktopVersion\":\"1.0.0\",\"forkCommit\":\"0d023d267bc5b7afeca3b54e98875b0efd4f3926\",\"number\":2,\"protocol\":1,\"publishedAt\":\"2026-09-26T00:00:00.000Z\"},\"view\":{\"kind\":\"model\",\"windowCad\":[0,0,30000,18000]}}",
+      "baseIdentity": "b985db04b05c12df029d064b6533a90424069f2ed3d4e15e45daeee7e1d979e6"
+    }
+  ]
+}

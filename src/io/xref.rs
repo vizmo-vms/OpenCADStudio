@@ -308,6 +308,12 @@ fn resolve_xrefs_with_filter(
 /// Try to build an absolute path from a raw xref path string.
 /// Handles absolute paths, relative paths, and Windows-style separators.
 fn resolve_path(raw: &str, base_dir: &Path) -> Option<PathBuf> {
+    #[cfg(feature = "secureplan")]
+    if !crate::app::secureplan::guards::external_resource_allowed(
+        crate::app::secureplan::guards::ExternalResource::Xref,
+    ) {
+        return None;
+    }
     let normalised = raw.replace('\\', "/");
     let p = PathBuf::from(&normalised);
 

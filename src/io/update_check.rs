@@ -38,6 +38,10 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch_latest_if_outdated() -> Option<UpdateInfo> {
+    // SecurePlan CAD checks its own releases instead (DSK-07).
+    if cfg!(feature = "secureplan") {
+        return None;
+    }
     let agent = crate::network::agent(std::time::Duration::from_secs(5));
     let body = agent
         .get(RELEASES_API)

@@ -27,8 +27,22 @@ pub fn config_dir() -> Option<PathBuf> {
         p
     };
     let mut p = base;
+    #[cfg(not(feature = "secureplan"))]
     p.push("OpenCADStudio");
+    // SecurePlan CAD keeps its own settings, never sharing upstream's.
+    #[cfg(feature = "secureplan")]
+    p.push(crate::app::secureplan::CONFIG_DIR_NAME);
     Some(p)
+}
+
+#[cfg(all(test, feature = "secureplan", not(target_arch = "wasm32")))]
+mod secureplan_tests {
+    #[test]
+    fn config_dir_differs_from_upstream() {
+        let dir = super::config_dir().expect("config dir");
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("SecurePlanCAD"));
+        assert!(!dir.ends_with("OpenCADStudio"));
+    }
 }
 
 // ── Last file-dialog directory ───────────────────────────────────────────────

@@ -152,6 +152,11 @@ pub fn download_fonts(
     missing: &[String],
     source: &FontSource,
 ) -> Result<Vec<(String, PathBuf)>, String> {
+    // SecurePlan CAD makes no request here (DSK-02); the text matches
+    // `secureplan::hardening::DISABLED`, which this build may not contain.
+    if cfg!(feature = "secureplan") {
+        return Err("This feature is not available in SecurePlan CAD.".into());
+    }
     if missing.is_empty() {
         return Ok(Vec::new());
     }

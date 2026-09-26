@@ -7,6 +7,11 @@ pub(crate) fn automation_action_names() -> &'static [&'static str] {
 pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub use automation::{export_headless, serve};
+// SecurePlan CAD integration. Declared here, rather than at the crate root, so
+// its hooks can reach the application state; the files live in src/secureplan.
+#[cfg(feature = "secureplan")]
+#[path = "../secureplan/mod.rs"]
+pub mod secureplan;
 mod annotation_data;
 mod command_driver;
 pub(crate) mod commands;
@@ -373,6 +378,8 @@ pub(crate) fn delobj_deletes_auxiliary(value: i16, creates_surface: bool) -> boo
 pub(super) struct OpenCADStudio {
     start: Instant,
     control: control::State,
+    #[cfg(feature = "secureplan")]
+    secureplan: secureplan::State,
     tabs: Vec<DocumentTab>,
     active_tab: usize,
     hovered_doc_tab: Option<usize>,
@@ -2008,6 +2015,8 @@ pub enum Message {
     SpaceMouseDriverSettings,
     SpaceMouseDetails,
     ControlRequest(control::Envelope),
+    #[cfg(feature = "secureplan")]
+    SecurePlan(secureplan::Msg),
     PollWebControl,
     ControlStep(String, Box<Message>),
     ControlTaskDone(String),
@@ -3820,6 +3829,8 @@ impl OpenCADStudio {
         let start_tab = DocumentTab::new_start();
         let mut app = Self {
             control: control::State::new(),
+            #[cfg(feature = "secureplan")]
+            secureplan: secureplan::State::default(),
             start: Instant::now(),
             tabs: vec![start_tab],
             active_tab: 0,
@@ -4469,19 +4480,20 @@ impl OpenCADStudio {
         };
         s.queue_startup_prompts();
         // Fetch the Patreon supporters list once at boot for the Start page.
-        #[cfg(not(target_arch = "wasm32"))]
+        // SecurePlan CAD starts none of the Start-page feeds (DSK-02).
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "secureplan")))]
         let patrons_fetch = Task::perform(
             async { crate::patreon::fetch_patrons() },
             Message::PatronsFetched,
         );
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", feature = "secureplan"))]
         let patrons_fetch = Task::none();
         // Tutorial videos: show the on-disk cache instantly, refresh from the
         // live playlist in the background. Nothing ships in the binary. The
         // fetch runs on its own OS thread — its several sequential HTTP
         // requests would otherwise sit on the async executor and hold up the
         // rest of the boot tasks (the Start page waited on it).
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "secureplan")))]
         let videos_fetch = {
             s.set_videos(crate::videos::load_cached());
             s.videos_loading = true;
@@ -4497,11 +4509,11 @@ impl OpenCADStudio {
                 Message::VideosFetched,
             )
         };
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", feature = "secureplan"))]
         let videos_fetch = Task::none();
         // GitHub Discussions: seed from the last successful fetch, then refresh
         // the public feed and pinned section on a background thread.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "secureplan")))]
         let discussions_fetch = {
             s.discussions = crate::discussions::load_cached();
             s.discussions_loading = true;
@@ -4517,7 +4529,7 @@ impl OpenCADStudio {
                 Message::DiscussionsFetched,
             )
         };
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", feature = "secureplan"))]
         let discussions_fetch = Task::none();
         // Recent-file thumbnails: decoded off-thread — parsing every recent
         // DWG's preview on the boot path held the first frame back.
@@ -4587,7 +4599,10 @@ pub fn run() -> iced::Result {
     .subscription(OpenCADStudio::subscription)
     .title(|state: &OpenCADStudio, window_id: window::Id| {
         let _ = window_id; // all dialogs are in-canvas modals now
-        if let Some(tab) = state.tabs.get(state.active_tab) {
+        #[cfg(feature = "secureplan")]
+        let title = state.secureplan_window_title();
+        #[cfg(not(feature = "secureplan"))]
+        let title = if let Some(tab) = state.tabs.get(state.active_tab) {
             let dot = if tab.dirty { "● " } else { "" };
             let name = tab.tab_display_name();
             format!(
@@ -4598,7 +4613,8 @@ pub fn run() -> iced::Result {
             )
         } else {
             concat!("Open CAD Studio ", env!("OCS_APP_VERSION")).to_string()
-        }
+        };
+        title
     })
     .theme(|state: &OpenCADStudio, _| state.active_theme.clone())
     .font(iced_aw::ICED_AW_FONT_BYTES)

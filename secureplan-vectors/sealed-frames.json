@@ -1,0 +1,159 @@
+{
+  "description": "AES-256-GCM sealing after the handshake. nonce = 4 zero bytes || u64 big-endian per-direction frame counter starting at 0. AAD = one byte: 0x01 control message, 0x02 transfer chunk. Control messages travel as WebSocket text frames holding base64url (no padding) of ciphertext||tag; chunks travel as binary frames holding ciphertext||tag. Chunk plaintext = u32le transferId || u32le seq || payload.",
+  "keys": {
+    "webToDesktopHex": "2e431e03a0077117e2cea2275c127868d9b82fc82912d8d7e977b0b01cc1ce4d",
+    "desktopToWebHex": "a1739141c2d7cc4ebbfcf93f6acb6612375db346ef9c737224ed55d4e07856d3"
+  },
+  "frames": [
+    {
+      "direction": "desktopToWeb",
+      "counter": 0,
+      "kind": "control",
+      "plaintext": "{\"type\":\"welcome\",\"requestId\":\"w1\",\"desktopVersion\":\"1.0.0\",\"protocol\":1,\"capabilities\":[\"overlay\",\"import\",\"apply\"]}",
+      "nonceHex": "000000000000000000000000",
+      "aadHex": "01",
+      "sealedHex": "fb3ce49fc8268c176cd10eebe9d63ca12b4907d3de9a65adbfc6cc68903ae1988448d97b77513b376c162f3d312927e6615d0c2f76e2530b66f7c88b36b0e485e117be17aa55c79b0968db9c41813b8255581b6a58d8660febe4cddc1e03859185c4ebf8d838342b1fb37768d6bfe99c82ce7f0ac381e6417c7c479d74b7652f5c3da1e529",
+      "wire": {
+        "opcode": "text",
+        "data": "-zzkn8gmjBds0Q7r6dY8oStJB9PemmWtv8bMaJA64ZiESNl7d1E7N2wWLz0xKSfmYV0ML3biUwtm98iLNrDkheEXvheqVcebCWjbnEGBO4JVWBtqWNhmD-vkzdweA4WRhcTr-Ng4NCsfs3do1r_pnILOfwrDgeZBfHxHnXS3ZS9cPaHlKQ"
+      }
+    },
+    {
+      "direction": "desktopToWeb",
+      "counter": 1,
+      "kind": "control",
+      "plaintext": "{\"type\":\"ping\",\"requestId\":\"g1\"}",
+      "nonceHex": "000000000000000000000001",
+      "aadHex": "01",
+      "sealedHex": "07849b0095291ff2d6d34e96db1210f71ca439e9cb6efbd2fe23347ee79d20150af70a2050c149bec7338ba1a099a9ab",
+      "wire": {
+        "opcode": "text",
+        "data": "B4SbAJUpH_LW006W2xIQ9xykOenLbvvS_iM0fuedIBUK9wogUMFJvsczi6Ggmamr"
+      }
+    },
+    {
+      "direction": "desktopToWeb",
+      "counter": 2,
+      "kind": "control",
+      "plaintext": "{\"type\":\"ping\",\"requestId\":\"g2\"}",
+      "nonceHex": "000000000000000000000002",
+      "aadHex": "01",
+      "sealedHex": "0effbc190c560b1812cd967204f51a1698405e032cadf7403411d30ec00df8469803713291cc69f16598466f094099ba",
+      "wire": {
+        "opcode": "text",
+        "data": "Dv-8GQxWCxgSzZZyBPUaFphAXgMsrfdANBHTDsAN-EaYA3Eykcxp8WWYRm8JQJm6"
+      }
+    },
+    {
+      "direction": "webToDesktop",
+      "counter": 0,
+      "kind": "control",
+      "plaintext": "{\"type\":\"transferStart\",\"requestId\":\"t1\",\"transferId\":7,\"name\":\"synthetic.dxf\",\"mediaType\":\"image/vnd.dxf\",\"byteLength\":13,\"sha256\":\"cde1143fc29e8d7e1bd0e46e84cd4697a8272e2988bcf29f31d09ee920ed5201\"}",
+      "nonceHex": "000000000000000000000000",
+      "aadHex": "01",
+      "sealedHex": "f1fe1ad7135d848cc8ccd2f5af7b16fc11f4c1f613bb7f3e71801853452a00c7773477998c6dcea496536482b4ae32264aad9a0eb1e2b9301dee44fd164ff81683c3f086a95a7b293337847b2d587466689d914c96f5a270aa19e2cacce07f84cb010d8860c3cb6bbceb79c8dc2ce048f84b26f5c07c437a781e16cb7e993264e0e6df6653d806753933097db49bbb500325c5187ac3a20cbd252ec5dbd2e81ea892422a6806687ef1d9befa94967e4152d347952bb1edbd221f1330d9c6987830fb547de27bcc48338e77c5740725bee96110b2ecb32c",
+      "wire": {
+        "opcode": "text",
+        "data": "8f4a1xNdhIzIzNL1r3sW_BH0wfYTu38-cYAYU0UqAMd3NHeZjG3OpJZTZIK0rjImSq2aDrHiuTAd7kT9Fk_4FoPD8IapWnspMzeEey1YdGZonZFMlvWicKoZ4srM4H-EywENiGDDy2u863nI3CzgSPhLJvXAfEN6eB4Wy36ZMmTg5t9mU9gGdTkzCX20m7tQAyXFGHrDogy9JS7F29LoHqiSQipoBmh-8dm--pSWfkFS00eVK7HtvSIfEzDZxph4MPtUfeJ7zEgzjnfFdAclvulhELLssyw"
+      }
+    },
+    {
+      "direction": "webToDesktop",
+      "counter": 1,
+      "kind": "chunk",
+      "plaintextHex": "070000000000000053594e5448455449432d445846",
+      "nonceHex": "000000000000000000000001",
+      "aadHex": "02",
+      "sealedHex": "e83ba2aa22808773b9be32019f97a9a4e6b10f844c29d24ca5a6e5509f4089cc50c15c9891",
+      "wire": {
+        "opcode": "binary",
+        "dataHex": "e83ba2aa22808773b9be32019f97a9a4e6b10f844c29d24ca5a6e5509f4089cc50c15c9891"
+      }
+    }
+  ],
+  "rejections": [
+    {
+      "name": "tampered-ciphertext",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "text",
+        "data": "BoSbAJUpH_LW006W2xIQ9xykOenLbvvS_iM0fuedIBUK9wogUMFJvsczi6Ggmamr"
+      }
+    },
+    {
+      "name": "tampered-tag",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "text",
+        "data": "B4SbAJUpH_LW006W2xIQ9xykOenLbvvS_iM0fuedIBUK9wogUMFJvsczi6Ggmamq"
+      }
+    },
+    {
+      "name": "replayed-frame",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "text",
+        "data": "-zzkn8gmjBds0Q7r6dY8oStJB9PemmWtv8bMaJA64ZiESNl7d1E7N2wWLz0xKSfmYV0ML3biUwtm98iLNrDkheEXvheqVcebCWjbnEGBO4JVWBtqWNhmD-vkzdweA4WRhcTr-Ng4NCsfs3do1r_pnILOfwrDgeZBfHxHnXS3ZS9cPaHlKQ"
+      }
+    },
+    {
+      "name": "out-of-order-frame",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "text",
+        "data": "Dv-8GQxWCxgSzZZyBPUaFphAXgMsrfdANBHTDsAN-EaYA3Eykcxp8WWYRm8JQJm6"
+      }
+    },
+    {
+      "name": "reflected-frame",
+      "receiver": "web",
+      "expectedCounter": 0,
+      "note": "A web-to-desktop frame fed back to the web.",
+      "wire": {
+        "opcode": "text",
+        "data": "8f4a1xNdhIzIzNL1r3sW_BH0wfYTu38-cYAYU0UqAMd3NHeZjG3OpJZTZIK0rjImSq2aDrHiuTAd7kT9Fk_4FoPD8IapWnspMzeEey1YdGZonZFMlvWicKoZ4srM4H-EywENiGDDy2u863nI3CzgSPhLJvXAfEN6eB4Wy36ZMmTg5t9mU9gGdTkzCX20m7tQAyXFGHrDogy9JS7F29LoHqiSQipoBmh-8dm--pSWfkFS00eVK7HtvSIfEzDZxph4MPtUfeJ7zEgzjnfFdAclvulhELLssyw"
+      }
+    },
+    {
+      "name": "kind-mismatch",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "note": "A sealed control frame delivered as a binary frame.",
+      "wire": {
+        "opcode": "binary",
+        "dataHex": "07849b0095291ff2d6d34e96db1210f71ca439e9cb6efbd2fe23347ee79d20150af70a2050c149bec7338ba1a099a9ab"
+      }
+    },
+    {
+      "name": "truncated",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "text",
+        "data": "B4SbAJUpH_LW006W2xIQ"
+      }
+    },
+    {
+      "name": "plaintext-after-handshake",
+      "receiver": "web",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "text",
+        "data": "{\"type\":\"ping\",\"requestId\":\"g1\"}"
+      }
+    },
+    {
+      "name": "chunk-tampered",
+      "receiver": "desktop",
+      "expectedCounter": 1,
+      "wire": {
+        "opcode": "binary",
+        "dataHex": "e83ba2ab22808773b9be32019f97a9a4e6b10f844c29d24ca5a6e5509f4089cc50c15c9891"
+      }
+    }
+  ]
+}

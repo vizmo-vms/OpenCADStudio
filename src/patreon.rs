@@ -50,6 +50,11 @@ const UA: &str = concat!("OpenCADStudio/", env!("OCS_APP_VERSION"));
 /// when no token is configured or an API call fails.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_patrons() -> Result<Vec<(String, i64)>, String> {
+    // SecurePlan CAD makes no request here (DSK-02); the text matches
+    // `secureplan::hardening::DISABLED`, which this build may not contain.
+    if cfg!(feature = "secureplan") {
+        return Err("This feature is not available in SecurePlan CAD.".into());
+    }
     let token = option_env!("OCS_PATREON_TOKEN")
         .filter(|t| !t.is_empty())
         .ok_or("no Patreon token configured")?;

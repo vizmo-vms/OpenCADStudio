@@ -13,11 +13,17 @@ pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
     let tls = TlsConfig::builder()
         .root_certs(RootCerts::PlatformVerifier)
         .build();
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
-        .tls_config(tls)
-        .build()
-        .into()
+        .tls_config(tls);
+    // SecurePlan CAD may reach only its own GitHub Releases, and follows no
+    // redirect it has not checked itself (DSK-02).
+    #[cfg(feature = "secureplan")]
+    let config = config
+        .https_only(true)
+        .max_redirects(0)
+        .middleware(crate::app::secureplan::hardening::enforce_allowlist);
+    config.build().into()
 }
 
 #[cfg(test)]

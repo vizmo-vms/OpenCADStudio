@@ -298,6 +298,12 @@ impl OpenCADStudio {
         // closes it and every other keystroke-derived message is swallowed;
         // the modal's own text fields keep working because they emit their own
         // (non-blocked) messages. (#126)
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_dialog_open()
+            && (is_modal_blocked_key_msg(&msg) || matches!(msg, Message::CommandEscape))
+        {
+            return Task::none();
+        }
         if self.active_modal.is_some() {
             if matches!(msg, Message::CommandEscape)
                 || matches!(&msg, Message::ShortcutPressed(key) if key.rsplit('+').next() == Some("ESCAPE"))
@@ -8639,6 +8645,8 @@ impl OpenCADStudio {
             }
 
             Message::Noop => Task::none(),
+            #[cfg(feature = "secureplan")]
+            Message::SecurePlan(msg) => self.secureplan_update(msg),
             Message::StatusMenuTooltipHidden(hidden) => {
                 self.status_menu_tooltip_hidden = hidden;
                 if hidden {

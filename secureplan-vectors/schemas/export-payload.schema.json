@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "export-payload.schema.json",
+  "title": "SecurePlan CAD bridge protocol v1: CAD export payload (EXP-01, EXP-02)",
+  "description": "Transferred as application/vnd.secureplan.export+json (UTF-8, at most 8388608 bytes). Built from one captured saved snapshot, in world millimetres, with live catalog display data. Comments, photos, contacts and pricing are never included. notes is empty unless includeNotes; coverage is empty unless includeCoverage.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "snapshot", "options", "walls", "doors", "routes", "devices", "targets", "drawings", "labels", "notes", "coverage"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "documentHash"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "documentHash": { "$ref": "common.schema.json#/$defs/sha256" }
+      }
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["includeNotes", "includeCoverage"],
+      "properties": {
+        "includeNotes": { "type": "boolean" },
+        "includeCoverage": { "type": "boolean" }
+      }
+    },
+    "walls": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "material", "status", "start", "end"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "material": { "$ref": "common.schema.json#/$defs/wallMaterial" },
+          "status": { "$ref": "common.schema.json#/$defs/status" },
+          "start": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "end": { "$ref": "common.schema.json#/$defs/pointMm" }
+        }
+      }
+    },
+    "doors": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "start", "end"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "status": { "$ref": "common.schema.json#/$defs/status" },
+          "start": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "end": { "$ref": "common.schema.json#/$defs/pointMm" }
+        }
+      }
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "cableType", "label", "status", "points"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "cableType": { "$ref": "common.schema.json#/$defs/label" },
+          "label": { "$ref": "common.schema.json#/$defs/label" },
+          "status": { "$ref": "common.schema.json#/$defs/status" },
+          "points": { "type": "array", "minItems": 2, "maxItems": 10000, "items": { "$ref": "common.schema.json#/$defs/pointMm" } }
+        }
+      }
+    },
+    "devices": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "name", "iconKey", "customIcon", "color", "label", "status", "position", "rotationDeg"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "kind": { "enum": ["camera", "equipment", "asset"] },
+          "name": { "$ref": "common.schema.json#/$defs/label" },
+          "iconKey": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+          "customIcon": { "description": "true when the catalog item uses a custom raster icon; the desktop then draws the disclosed standard vector symbol for iconKey.", "type": "boolean" },
+          "color": { "$ref": "common.schema.json#/$defs/color" },
+          "label": { "$ref": "common.schema.json#/$defs/label" },
+          "status": { "$ref": "common.schema.json#/$defs/status" },
+          "position": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" }
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "label", "position", "rotationDeg", "requiredPpm"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "label": { "$ref": "common.schema.json#/$defs/label" },
+          "position": { "$ref": "common.schema.json#/$defs/pointMm" },
+          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" },
+          "requiredPpm": { "type": "number", "exclusiveMinimum": 0, "maximum": 100000 }
+        }
+      }
+    },
+    "drawings": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "drawingType", "label", "points"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "drawingType": { "enum": ["freehand", "arrow", "rectangle", "ellipse", "line"] },
+          "label": { "$ref": "common.schema.json#/$defs/label" },
+          "points": { "type": "array", "minItems": 2, "maxItems": 10000, "items": { "$ref": "common.schema.json#/$defs/pointMm" } }
+        }
+      }
+    },
+    "labels": {
+      "description": "Engineering labels as text.",
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["elementId", "text", "position"],
+        "properties": {
+          "elementId": { "$ref": "common.schema.json#/$defs/elementId" },
+          "text": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "position": { "$ref": "common.schema.json#/$defs/pointMm" }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "text", "position"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/elementId" },
+          "text": { "type": "string", "maxLength": 10000 },
+          "position": { "$ref": "common.schema.json#/$defs/pointMm" }
+        }
+      }
+    },
+    "coverage": { "$ref": "overlay.schema.json#/$defs/coverage" }
+  }
+}

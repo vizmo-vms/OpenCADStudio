@@ -1,0 +1,206 @@
+name: SecurePlan CI
+
+# Checks for the SecurePlan CAD companion build (`--features secureplan`):
+# the upstream default-feature build, the SecurePlan tests and clippy, the
+# protocol-vector copy, and per-target debug artifacts for manual checkpoints.
+# This workflow never publishes anything.
+
+on:
+  push:
+    branches: [secureplan]
+  pull_request:
+    branches: [secureplan]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secureplan-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux checks and debug build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev
+
+      - name: Upstream build (default features)
+        run: cargo build --locked
+
+      - name: Protocol vectors match the pinned manifest
+        run: cargo test --locked --features secureplan --lib secureplan::vectors
+
+      - name: SecurePlan tests
+        run: cargo test --locked --features secureplan,secureplan-test --lib --test secureplan_listeners secureplan
+
+      - name: No other workflow enables secureplan-test
+        run: |
+          if grep -rln "secureplan-test" .github/workflows | grep -v "^.github/workflows/secureplan-ci.yml$"; then
+            echo "::error::only SecurePlan CI may build with secureplan-test"
+            exit 1
+          fi
+
+      # The test driver answers stdin commands only in secureplan-test builds.
+      # With no display the GUI then fails to start, which ends each run.
+      - name: Test build answers stdin commands (positive control)
+        run: |
+          cargo build --locked --features secureplan,secureplan-test
+          printf 'pair secureplan-cad://pair?v=1\n' \
+            | env -u DISPLAY -u WAYLAND_DISPLAY timeout 60 target/debug/OpenCADStudio --new-instance > test-build.log 2>&1 || true
+          grep -q "secureplan-test: driver ready" test-build.log
+
+      - name: Release build ignores stdin commands
+        run: |
+          cargo build --locked --release --features secureplan
+          printf 'pair secureplan-cad://pair?v=1\n' \
+            | env -u DISPLAY -u WAYLAND_DISPLAY timeout 60 target/release/OpenCADStudio --new-instance > release-build.log 2>&1 || true
+          if grep -q "secureplan-test" release-build.log; then
+            echo "::error::the release binary answered a stdin test command"
+            exit 1
+          fi
+
+      - name: Clippy (warnings are denied inside src/secureplan)
+        run: cargo clippy --locked --features secureplan --all-targets
+
+      - name: Debug build (secureplan)
+        run: cargo build --locked --features secureplan
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-debug-linux-x64
+          path: |
+            target/debug/OpenCADStudio
+            packaging/dev/secureplan-cad.desktop
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS ${{ matrix.arch }} debug build
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Debug build (secureplan)
+        run: cargo build --locked --features secureplan --target ${{ matrix.target }}
+
+      - name: Assemble the development app bundle
+        run: |
+          packaging/dev/make-dev-app.sh "target/${{ matrix.target }}/debug" "SecurePlan CAD Dev.app"
+          ditto -c -k --keepParent "SecurePlan CAD Dev.app" secureplan-cad-dev.app.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-debug-macos-${{ matrix.arch }}
+          path: secureplan-cad-dev.app.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64 debug build and MSI
+    # windows-2022 ships WiX Toolset 3 (the WIX environment variable), which
+    # packaging/windows/*.wxs targets.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Debug build (secureplan)
+        run: cargo build --locked --features secureplan
+
+      - name: Build the per-user MSI (structure check)
+        shell: pwsh
+        run: |
+          magick assets/logo.svg -define icon:auto-resize=16,24,32,48,64,128,256 packaging/windows/AppIcon.ico
+          $candle = Join-Path $env:WIX "bin\candle.exe"
+          $light  = Join-Path $env:WIX "bin\light.exe"
+          $objDir = Join-Path $PWD "packaging\windows\"
+          & $candle -arch x64 "-dVersion=0.1.0" `
+            "-dSource=$((Resolve-Path target\debug\OpenCADStudio.exe).Path)" `
+            "-dIcon=$((Resolve-Path packaging\windows\AppIcon.ico).Path)" `
+            "-dLicense=$((Resolve-Path packaging\windows\License.rtf).Path)" `
+            packaging\windows\main.wxs packaging\windows\ui.wxs -out $objDir
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+          & $light (Join-Path $objDir "main.wixobj") (Join-Path $objDir "ui.wixobj") `
+            -ext WixUIExtension -cultures:en-us -loc packaging/windows/strings.en-US.wxl `
+            -out SecurePlanCAD-debug.msi
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+
+      - name: Check the MSI is per-user with no file associations
+        shell: pwsh
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $installer, @((Resolve-Path SecurePlanCAD-debug.msi).Path, 0))
+          function Query($sql) {
+            $view = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @($sql))
+            $view.GetType().InvokeMember("Execute", "InvokeMethod", $null, $view, $null)
+            $rows = @()
+            while ($record = $view.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $view, $null)) {
+              $rows += $record.GetType().InvokeMember("StringData", "GetProperty", $null, $record, 1)
+            }
+            $rows
+          }
+          $allUsers = Query "SELECT Value FROM Property WHERE Property='ALLUSERS'"
+          if ($allUsers) { throw "ALLUSERS is set ($allUsers): the MSI is not per-user" }
+          # Summary-information word count bit 3: elevation is not required.
+          $summary = $db.GetType().InvokeMember("SummaryInformation", "GetProperty", $null, $db, @(0))
+          $wordCount = $summary.GetType().InvokeMember("Property", "GetProperty", $null, $summary, @(15))
+          if (($wordCount -band 8) -eq 0) { throw "the MSI requires elevation" }
+          $upgrade = Query "SELECT Value FROM Property WHERE Property='UpgradeCode'"
+          if ($upgrade -eq "{BD6BCEAB-6C7A-4CE2-A62D-6EF06A92F8B1}") { throw "upstream UpgradeCode" }
+          foreach ($table in "Extension", "ProgId", "Verb", "MIME") {
+            $tables = Query "SELECT Name FROM _Tables WHERE Name='$table'"
+            if ($tables) { throw "the MSI has a $table table (file association)" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-debug-windows-x64
+          path: |
+            target/debug/OpenCADStudio.exe
+            SecurePlanCAD-debug.msi
+            packaging/dev/secureplan-cad.reg
+          if-no-files-found: error
+          retention-days: 14

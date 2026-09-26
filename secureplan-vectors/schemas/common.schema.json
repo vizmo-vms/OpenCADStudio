@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "title": "SecurePlan CAD bridge protocol v1: shared definitions",
+  "$defs": {
+    "requestId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+    "pairingId": { "description": "16 random bytes, base64url without padding.", "type": "string", "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$" },
+    "bytes32": { "description": "32 random bytes or an HMAC-SHA256 output, base64url without padding.", "type": "string", "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "baseIdentity": { "description": "SHA-256 of the canonical JSON of the survey's current cadPlan, or \"none\" (PUB-06).", "type": "string", "pattern": "^(none|[0-9a-f]{64})$" },
+    "semver": { "type": "string", "maxLength": 32, "pattern": "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$" },
+    "transferId": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "elementId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "label": { "type": "string", "maxLength": 200 },
+    "coordinateMm": { "description": "World millimetres; finite and bounded like comment positions.", "type": "number", "minimum": -10000000, "maximum": 10000000 },
+    "pointMm": { "type": "array", "items": { "$ref": "#/$defs/coordinateMm" }, "minItems": 2, "maxItems": 2 },
+    "cadCoordinate": { "type": "number", "minimum": -1e15, "maximum": 1e15 },
+    "cadPoint": { "type": "array", "items": { "$ref": "#/$defs/cadCoordinate" }, "minItems": 2, "maxItems": 2 },
+    "color": { "type": "string", "pattern": "^#[0-9a-f]{6}$" },
+    "rotationDeg": { "type": "number", "minimum": -360, "maximum": 360 },
+    "cadUnits": { "enum": ["mm", "cm", "m", "in", "ft", "unitless"] },
+    "wallMaterial": { "enum": ["solid", "glass", "fence", "opening"] },
+    "status": { "enum": ["Proposed", "In Place", "To Be Replaced", "To Be Upgraded", "To Be Removed"] },
+    "mapping": {
+      "description": "CAD model to world mm. d = ((cx - ox) * s, -(cy - oy) * s); world = anchorMm + rot(quarterTurns, d).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cadOrigin", "anchorMm", "scaleMmPerCadUnit", "quarterTurns"],
+      "properties": {
+        "cadOrigin": { "$ref": "#/$defs/cadPoint" },
+        "anchorMm": { "$ref": "#/$defs/pointMm" },
+        "scaleMmPerCadUnit": { "type": "number", "exclusiveMinimum": 0, "maximum": 1000000 },
+        "quarterTurns": { "enum": [0, 1, 2, 3] }
+      }
+    },
+    "view": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "windowCad"],
+          "properties": {
+            "kind": { "const": "model" },
+            "windowCad": { "type": "array", "items": { "$ref": "#/$defs/cadCoordinate" }, "minItems": 4, "maxItems": 4 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "layoutName", "viewportHandle"],
+          "properties": {
+            "kind": { "const": "layout" },
+            "layoutName": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "viewportHandle": { "type": "string", "pattern": "^[0-9A-Fa-f]{1,16}$" }
+          }
+        }
+      ]
+    },
+    "placement": {
+      "description": "Published page placement (CON-01). widthPt * heightPt must not exceed 64000000; heightMm = heightPt * widthMm / widthPt within 1e-6 relative.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["widthPt", "heightPt", "centerX", "centerY", "widthMm", "heightMm"],
+      "properties": {
+        "widthPt": { "type": "integer", "minimum": 1, "maximum": 14400 },
+        "heightPt": { "type": "integer", "minimum": 1, "maximum": 14400 },
+        "centerX": { "$ref": "#/$defs/coordinateMm" },
+        "centerY": { "$ref": "#/$defs/coordinateMm" },
+        "widthMm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20000000 },
+        "heightMm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20000000 }
+      }
+    },
+    "cadFileRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileId", "kind", "name", "mimeType", "formatVersion", "sha256"],
+      "properties": {
+        "fileId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kind": { "const": "floor_plan" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "mimeType": { "enum": ["image/vnd.dwg", "image/vnd.dxf"] },
+        "formatVersion": { "type": "string", "minLength": 1, "maxLength": 16 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "cadPlan": {
+      "description": "ManagedCadPlan (CON-02).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "original", "drawing", "snap", "pdfSha256", "view", "cadUnits", "mapping", "version"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "original": { "$ref": "#/$defs/cadFileRef" },
+        "drawing": { "$ref": "#/$defs/cadFileRef" },
+        "snap": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fileId", "kind", "name", "mimeType", "sha256"],
+              "properties": {
+                "fileId": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "kind": { "const": "floor_plan" },
+                "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+                "mimeType": { "const": "application/vnd.secureplan.snap" },
+                "sha256": { "$ref": "#/$defs/sha256" }
+              }
+            }
+          ]
+        },
+        "pdfSha256": { "$ref": "#/$defs/sha256" },
+        "view": { "$ref": "#/$defs/view" },
+        "cadUnits": { "$ref": "#/$defs/cadUnits" },
+        "mapping": { "$ref": "#/$defs/mapping" },
+        "version": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["number", "publishedAt", "desktopVersion", "protocol", "forkCommit"],
+          "properties": {
+            "number": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "publishedAt": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+            "desktopVersion": { "$ref": "#/$defs/semver" },
+            "protocol": { "const": 1 },
+            "forkCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+          }
+        }
+      }
+    }
+  }
+}
