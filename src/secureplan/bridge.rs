@@ -442,6 +442,7 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
     let session = shared.next_session.fetch_add(1, Ordering::SeqCst);
     let (outbound_sender, outbound) = mpsc::channel();
     let origin = established.launch.origin.clone();
+    let trusted_origin = origin.clone();
     let survey = established.launch.survey.expose().clone();
     let needs_confirmation = lock(&shared.open_documents).contains(&(origin.clone(), survey.clone()));
     lock(&shared.sessions).insert(
@@ -470,18 +471,18 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
     let mut last_ping = shared.now();
     let mut queued: std::collections::VecDeque<Outbound> = std::collections::VecDeque::new();
     let end = loop {
-        // Frames the application queued, in order. A transfer waits while
-        // the session already has 3 in flight (both directions together;
-        // ours complete as they are sent, so only incoming ones count), and
-        // everything queued after it waits too, so no message ever precedes
-        // the transfer it references (BRG-06).
+        // A close ends the session at once, ahead of anything still queued,
+        // whatever the transfers are doing (revocation, supersede, explicit).
         let mut local_end = None;
         queued.extend(outbound.try_iter());
+        if let Some(reason) = queued.iter().find_map(|item| if let Outbound::Close(reason) = item { Some(*reason) } else { None }) {
+            break End::Local(reason);
+        }
+        // Then the application's frames, in order. Each transfer is sent
+        // whole before the next, which keeps the desktop's share of in-flight
+        // transfers (BRG-06) without waiting on incoming ones, and no message
+        // ever precedes the transfer it references.
         while let Some(item) = queued.pop_front() {
-            if matches!(item, Outbound::Transfer { .. }) && incoming.in_flight() >= transfer::MAX_IN_FLIGHT {
-                queued.push_front(item);
-                break;
-            }
             let result = match item {
                 Outbound::Message(message) => send_control(&mut socket, &mut established.sealer, &message),
                 Outbound::Transfer { name, media_type, bytes } => {
@@ -497,6 +498,10 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
                 }
                 Outbound::Close(reason) => {
                     local_end = Some(End::Local(reason));
+                    Ok(())
+                }
+                Outbound::Confirmed if !shared.origin_allowed(&trusted_origin) => {
+                    local_end = Some(End::Local("userCancelled"));
                     Ok(())
                 }
                 Outbound::Confirmed => {
@@ -558,6 +563,11 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
             Err(_) => break End::Remote("socket closed".into()),
         };
         if let Some(event) = event {
+            // Trust may have been revoked while this frame was read: nothing
+            // more from the origin reaches the application.
+            if !shared.origin_allowed(&trusted_origin) {
+                break End::Local("userCancelled");
+            }
             if confirmed {
                 shared.emit(event);
             } else if held.len() < MAX_HELD_EVENTS {
@@ -931,34 +941,117 @@ pub(crate) mod tests {
         assert_eq!(start["byteLength"], 8);
     }
 
-    #[test]
-    fn transfers_wait_while_three_are_in_flight_in_either_direction() {
-        let bridge = test_bridge(PING_INTERVAL);
-        let events = bridge.take_events().unwrap();
-        let request = launch(ORIGIN, 80);
-        bridge.add_pending(request.clone());
-        let mut web = connect_web(bridge.port(), &request).unwrap();
-        let BridgeEvent::Opened { session, .. } = next_event(&events) else { panic!() };
-        // Three incoming transfers stay incomplete.
+    /// Announce `count` incoming transfers from the web that stay incomplete.
+    fn start_incomplete(web: &mut Web, ids: std::ops::RangeInclusive<u32>) -> Vec<u8> {
         let payload = b"0123456789".to_vec();
-        for id in 1..=3u32 {
+        for id in ids {
             web.send(&json!({ "type": "transferStart", "requestId": format!("t{id}"), "transferId": id, "name": "synthetic.dxf", "mediaType": "image/vnd.dxf", "byteLength": payload.len(), "sha256": sha256_hex(&payload) }));
         }
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())));
-        assert!(bridge.send(session, protocol::session_state("s1", true, json!(null), json!(null), json!(null))));
-        web.socket.get_mut().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        assert!(web.receive_non_ping().is_none(), "the desktop started a fourth transfer");
-        // One incoming transfer completes: the outgoing one starts, then the message.
-        let mut chunk = 1u32.to_le_bytes().to_vec();
+        payload
+    }
+
+    fn complete_chunk(web: &mut Web, id: u32, payload: &[u8]) {
+        let mut chunk = id.to_le_bytes().to_vec();
         chunk.extend_from_slice(&0u32.to_le_bytes());
-        chunk.extend_from_slice(&payload);
+        chunk.extend_from_slice(payload);
         let sealed = web.sealer.seal(FrameKind::Chunk, &chunk).unwrap();
         web.send_raw(Message::binary(sealed));
-        assert!(matches!(next_event(&events), BridgeEvent::Transfer { .. }));
-        web.socket.get_mut().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    }
+
+    fn open_session(bridge: &Bridge, events: &mpsc::Receiver<BridgeEvent>, pairing: u8) -> (Web, SessionId) {
+        let request = launch(ORIGIN, pairing);
+        bridge.add_pending(request.clone());
+        let web = connect_web(bridge.port(), &request).unwrap();
+        let BridgeEvent::Opened { session, .. } = next_event(events) else { panic!("no session") };
+        (web, session)
+    }
+
+    #[test]
+    fn the_desktop_sends_while_the_web_has_its_two_in_flight_and_a_third_is_refused() {
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        let (mut web, session) = open_session(&bridge, &events, 80);
+        // Both sides start at the same moment: the web its full share of two,
+        // the desktop its one. Nobody waits and nothing is refused.
+        let payload = start_incomplete(&mut web, 1..=2);
+        assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(b"%PDF-1.7".to_vec())));
+        assert!(bridge.send(session, protocol::session_state("s1", true, json!(null), json!(null), json!(null))));
         assert_eq!(web.receive_non_ping().unwrap()["type"], "transferStart");
         assert_eq!(web.receive_non_ping().unwrap()["type"], "sessionState");
+        complete_chunk(&mut web, 1, &payload);
+        assert!(matches!(next_event(&events), BridgeEvent::Transfer { .. }));
+        // One of the web's is still in flight; a third beyond the share of two is refused.
+        start_incomplete(&mut web, 3..=4);
+        assert_eq!(web.receive_non_ping().unwrap()["reason"], "transferFailed");
+    }
+
+    #[test]
+    fn closing_takes_priority_under_transfer_pressure() {
+        // The web has its two transfers in flight and the desktop has a
+        // transfer and a message queued when the session is told to close.
+        let busy = |bridge: &Bridge, web: &mut Web, session: SessionId| {
+            start_incomplete(web, 1..=2);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(bridge.send_transfer(session, "synthetic.pdf", "application/pdf", Arc::new(vec![7; 3 * transfer::MAX_CHUNK_PAYLOAD])));
+            assert!(bridge.send(session, protocol::session_state("s1", true, json!(null), json!(null), json!(null))));
+        };
+        let closed_with = |web: &mut Web| loop {
+            let message = web.receive_non_ping().expect("a close");
+            if message["type"] == "close" {
+                return message["reason"].as_str().unwrap().to_string();
+            }
+        };
+
+        // An explicit close.
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        let (mut web, session) = open_session(&bridge, &events, 81);
+        busy(&bridge, &mut web, session);
+        assert!(bridge.close(session, "documentClosed"));
+        assert_eq!(closed_with(&mut web), "documentClosed");
+
+        // Superseded by a second pairing for the same survey.
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        let (mut web, session) = open_session(&bridge, &events, 82);
+        busy(&bridge, &mut web, session);
+        let second = launch(ORIGIN, 83);
+        bridge.add_pending(second.clone());
+        let _second = connect_web(bridge.port(), &second).unwrap();
+        assert_eq!(closed_with(&mut web), "superseded");
+
+        // Trust revoked.
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        bridge.set_trusted_origins([ORIGIN.to_string()].into());
+        let (mut web, session) = open_session(&bridge, &events, 84);
+        busy(&bridge, &mut web, session);
+        bridge.set_trusted_origins(HashSet::new());
+        assert_eq!(closed_with(&mut web), "userCancelled");
+    }
+
+    #[test]
+    fn nothing_from_a_revoked_origin_reaches_the_application() {
+        let bridge = test_bridge(PING_INTERVAL);
+        let events = bridge.take_events().unwrap();
+        let (mut web, _) = open_session(&bridge, &events, 85);
+        let payload = start_incomplete(&mut web, 1..=2);
+        std::thread::sleep(Duration::from_millis(100));
+        // Revoked while the session thread is between frames, before its
+        // close is queued: the next frame must still not be dispatched.
+        *lock(&bridge.shared.trusted) = Some(HashSet::new());
+        complete_chunk(&mut web, 1, &payload);
+        web.send(&json!({ "type": "sessionMode", "requestId": "m1", "mode": "view", "reason": "leaseLost" }));
+        loop {
+            match next_event(&events) {
+                BridgeEvent::Closed { reason, .. } => {
+                    assert_eq!(reason, "userCancelled");
+                    break;
+                }
+                BridgeEvent::Transfer { .. } | BridgeEvent::Message { .. } => panic!("dispatched after revocation"),
+                _ => {}
+            }
+        }
     }
 
     #[test]

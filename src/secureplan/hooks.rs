@@ -3,20 +3,32 @@
 //! editor exactly as upstream draws and runs it.
 //!
 //! Hook points in upstream files:
+//! - `src/main.rs`: a process started by links alone decides before any
+//!   window whether to start, and then starts without the editor window;
 //! - `src/app/mod.rs`: the `Message::SecurePlan` variant, the `secureplan`
-//!   state field and the window title;
-//! - `src/app/update/mod.rs`: `Message::SecurePlan` dispatch, and keyboard
-//!   capture while a SecurePlan dialog is open;
-//! - `src/app/view/mod.rs`: the subscription, the viewport overlay layer and
-//!   the dialog layer above the in-canvas modals;
+//!   state field, the window title, and booting without the editor window;
+//! - `src/app/update/mod.rs`: `Message::SecurePlan` dispatch, keyboard
+//!   capture while a SecurePlan dialog is open, and the prompt window's close
+//!   button;
+//! - `src/app/view/mod.rs`: the subscription, the prompt-only window, the
+//!   viewport overlay layer and the dialog layer above the in-canvas modals;
+//! - `src/app/startup.rs`, `src/ui/window/options.rs`,
+//!   `src/io/file_association.rs`: no file-association prompt, control or
+//!   registration;
 //! - `src/ui/ribbon/mod.rs`: the SecurePlan ribbon tab;
 //! - `src/app/commands/mod.rs`: SecurePlan commands and the command guard;
 //! - `src/io/xref.rs`, `src/io/mod.rs`, `src/scene/model/image_model.rs`,
-//!   `src/scene/model/pdf_raster.rs`: the external-resource guard.
+//!   `src/scene/model/pdf_raster.rs`, `src/scene/text/font_face.rs`,
+//!   `src/scene/text/shx.rs`, `src/scene/view/render.rs`,
+//!   `src/scene/model/material_model.rs`, `src/scene/centerline.rs`,
+//!   `src/app/annotation_data.rs`: the external-resource guard;
+//! - `src/io/mod.rs`, `src/app/automation.rs`, `src/main.rs`: diagnostics
+//!   without file paths.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::{Element, Subscription, Task};
 
@@ -37,6 +49,8 @@ pub enum Msg {
     Bridge(BridgeEvent),
     TrustAnswer(bool),
     DialogKey(DialogKey),
+    /// A link-started process has waited as long as its pairings can live.
+    ColdStartExpired,
 }
 
 /// SecurePlan state held by the application.
@@ -51,6 +65,11 @@ pub struct State {
     pub trust: Trust,
     /// The listener; the process-wide one unless a test supplies its own.
     pub bridge: Option<Arc<Bridge>>,
+    /// Started by a `secureplan-cad:` link alone: no editor window until a
+    /// session opens.
+    pub cold_start: bool,
+    /// The window showing only the trust prompt while there is no editor window.
+    pub prompt_window: Option<iced::window::Id>,
 }
 
 impl Default for State {
@@ -62,8 +81,60 @@ impl Default for State {
             settings_path,
             trust: Trust::default(),
             bridge: None,
+            cold_start: COLD_START.load(Ordering::SeqCst),
+            prompt_window: None,
         }
     }
+}
+
+// ── Starting from a link ────────────────────────────────────────────────────
+
+static COLD_START: AtomicBool = AtomicBool::new(false);
+
+/// How long a link-started process waits for a session: a pairing's lifetime
+/// plus a handshake begun just before it expired.
+pub const COLD_START_WAIT: Duration = Duration::from_secs(pairing::TOKEN_TTL.as_secs() + bridge::HANDSHAKE_TIMEOUT.as_secs());
+
+/// What a process started only by `secureplan-cad:` links does, decided
+/// before any window exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdStart {
+    /// Every link is invalid or from a website that may never pair: open nothing.
+    Exit,
+    /// Start without the editor window: a trusted website pairs silently and
+    /// the editor appears when its session opens; a new one shows only the
+    /// trust prompt.
+    Windowless,
+}
+
+pub fn cold_start(urls: &[String], settings: &Settings) -> ColdStart {
+    let eligible = urls
+        .iter()
+        .filter_map(|url| pairing::parse_launch_url(url).ok())
+        .any(|request| super::trust::origin_eligible(&request.origin, settings.developer_loopback_origins));
+    if eligible {
+        ColdStart::Windowless
+    } else {
+        ColdStart::Exit
+    }
+}
+
+/// For `main`, when the process was started by links alone: whether to start
+/// at all. Starting, the application boots without the editor window.
+pub fn begin_cold_start(urls: &[String]) -> bool {
+    let settings = settings::path().as_deref().map(Settings::load_from).unwrap_or_default();
+    let start = cold_start(urls, &settings) == ColdStart::Windowless;
+    COLD_START.store(start, Ordering::SeqCst);
+    start
+}
+
+fn after(wait: Duration, message: Message) -> Task<Message> {
+    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(wait);
+        let _ = sender.send(());
+    });
+    Task::perform(async move { receiver.await.ok() }, move |_| message.clone())
 }
 
 // ── Launch inbox ────────────────────────────────────────────────────────────
@@ -135,18 +206,64 @@ impl OpenCADStudio {
             Msg::DialogKey(key) => match key {
                 DialogKey::Next | DialogKey::Previous => {
                     self.secureplan.trust.move_focus();
+                    Task::none()
                 }
                 DialogKey::Activate => {
                     let accept = self.secureplan.trust.prompt().is_some_and(|p| p.focus == PromptButton::Trust);
-                    self.secureplan_answer_trust(accept);
+                    self.secureplan_answer_trust(accept)
                 }
-                DialogKey::Cancel => {
-                    self.secureplan_answer_trust(false);
-                }
+                DialogKey::Cancel => self.secureplan_answer_trust(false),
             },
             Msg::Bridge(event) => self.secureplan_bridge_event(event),
+            // Nothing opened in time: leave without ever showing the editor.
+            Msg::ColdStartExpired if self.main_window.is_none() => self.exit_app(),
+            Msg::ColdStartExpired => Task::none(),
         }
-        Task::none()
+    }
+
+    /// Whether the editor window is still waiting for a session.
+    fn secureplan_windowless(&self) -> bool {
+        self.secureplan.cold_start && self.main_window.is_none()
+    }
+
+    /// The small window that shows only the trust prompt.
+    fn secureplan_open_prompt_window(&mut self) -> Task<Message> {
+        if self.secureplan.prompt_window.is_some() {
+            return Task::none();
+        }
+        let (id, open) = iced::window::open(iced::window::Settings {
+            size: iced::Size::new(560.0, 320.0),
+            position: iced::window::Position::Centered,
+            resizable: false,
+            exit_on_close_request: false,
+            ..Default::default()
+        });
+        self.secureplan.prompt_window = Some(id);
+        Task::batch([open.map(|_| Message::Noop), iced::window::gain_focus(id)])
+    }
+
+    fn secureplan_close_prompt_window(&mut self) -> Task<Message> {
+        match self.secureplan.prompt_window.take() {
+            Some(id) => iced::window::close(id),
+            None => Task::none(),
+        }
+    }
+
+    /// The prompt-only window's close button declines, like Escape.
+    pub(crate) fn secureplan_window_close_requested(&mut self, id: iced::window::Id) -> Option<Task<Message>> {
+        (self.secureplan.prompt_window == Some(id)).then(|| self.secureplan_answer_trust(false))
+    }
+
+    /// The view of a SecurePlan-owned window, if `id` is one.
+    pub(crate) fn secureplan_window_view(&self, id: iced::window::Id) -> Option<Element<'_, Message>> {
+        if self.secureplan.prompt_window != Some(id) {
+            return None;
+        }
+        let base: Element<'_, Message> = iced::widget::Space::new().width(iced::Length::Fill).height(iced::Length::Fill).into();
+        Some(match self.secureplan.trust.prompt() {
+            Some(prompt) => trust_dialog::view(base, prompt),
+            None => base,
+        })
     }
 
     fn secureplan_bridge(&mut self) -> Option<Arc<Bridge>> {
@@ -172,23 +289,47 @@ impl OpenCADStudio {
         bridge.set_trusted_origins(allowed);
     }
 
-    fn secureplan_launch(&mut self, url: &str) {
+    fn secureplan_launch(&mut self, url: &str) -> Task<Message> {
+        let windowless = self.secureplan_windowless();
         let Ok(request) = pairing::parse_launch_url(url) else {
             self.command_line.push_warning("SecurePlan: ignored an invalid SecurePlan CAD link.");
-            return;
+            return Task::none();
         };
         let received = Instant::now();
-        match self.secureplan.trust.on_launch(request, &self.secureplan.settings, received) {
-            Decision::Pair(request) => self.secureplan_pair(request, received),
-            Decision::Prompt | Decision::Ignore => {}
+        let decision = self.secureplan.trust.on_launch(request, &self.secureplan.settings, received);
+        if !windowless {
+            if let Decision::Pair(request) = decision {
+                self.secureplan_pair(request, received);
+            }
+            return Task::none();
         }
+        // No editor yet: a trusted website pairs silently, a new one gets the
+        // prompt on its own; either way the process leaves if no session
+        // opens while the pairing can live.
+        let shown = match decision {
+            Decision::Pair(request) => {
+                self.secureplan_pair(request, received);
+                Task::none()
+            }
+            Decision::Prompt => self.secureplan_open_prompt_window(),
+            Decision::Ignore => Task::none(),
+        };
+        Task::batch([shown, after(COLD_START_WAIT, Message::SecurePlan(Msg::ColdStartExpired))])
     }
 
-    fn secureplan_answer_trust(&mut self, accept: bool) {
+    fn secureplan_answer_trust(&mut self, accept: bool) -> Task<Message> {
+        let closed = self.secureplan_close_prompt_window();
         let settings = &mut self.secureplan.settings;
-        let Some((request, received)) = self.secureplan.trust.answer(accept, settings, Instant::now()) else { return };
+        let Some((request, received)) = self.secureplan.trust.answer(accept, settings, Instant::now()) else {
+            // Declined with no editor open: nothing more will happen.
+            if self.secureplan_windowless() {
+                return Task::batch([closed, self.exit_app()]);
+            }
+            return closed;
+        };
         self.secureplan_save_settings();
         self.secureplan_pair(request, received);
+        closed
     }
 
     fn secureplan_save_settings(&mut self) {
@@ -213,15 +354,20 @@ impl OpenCADStudio {
         }
     }
 
-    fn secureplan_bridge_event(&mut self, event: BridgeEvent) {
+    fn secureplan_bridge_event(&mut self, event: BridgeEvent) -> Task<Message> {
         match event {
             BridgeEvent::Opened { origin, .. } => {
                 self.command_line.push_info(&format!("SecurePlan: connected to {origin}."));
+                // The editor appears once there is a session to work in.
+                if self.secureplan_windowless() {
+                    return Task::batch([self.open_main_window(), self.focus_cmd_input()]);
+                }
             }
             BridgeEvent::Closed { .. } => self.command_line.push_info("SecurePlan: disconnected."),
             // Session messages and transfers are handled by the session tasks.
             BridgeEvent::Message { .. } | BridgeEvent::Transfer { .. } => {}
         }
+        Task::none()
     }
 
     pub(crate) fn secureplan_subscription(&self) -> Subscription<Message> {
@@ -261,6 +407,8 @@ impl OpenCADStudio {
         }
         let argument = command.split_whitespace().nth(1);
         match command_verb(command).as_str() {
+            // Registration as the .dwg/.dxf opener is not part of SecurePlan CAD (DSK-05).
+            "FILEASSOC" => self.command_line.push_error("FILEASSOC is not available in SecurePlan CAD."),
             "SECUREPLANTRUST" => {
                 let origins = &self.secureplan.settings.trusted_origins;
                 let listing = if origins.is_empty() { "none".to_string() } else { origins.join(", ") };
@@ -359,6 +507,26 @@ mod tests {
     }
 
     #[test]
+    fn file_associations_can_never_be_registered_or_removed() {
+        let mut app = app_with_drawing();
+        assert!(!app.pending_startup_modals.contains(&crate::app::ModalKind::AssocPrompt), "startup queued the association prompt");
+        app.queue_startup_prompts();
+        assert!(!app.pending_startup_modals.contains(&crate::app::ModalKind::AssocPrompt));
+        assert_ne!(app.active_modal, Some(crate::app::ModalKind::AssocPrompt));
+        let before = app.file_assoc_enabled;
+        for command in ["FILEASSOC", "FILEASSOC 1", "FILEASSOC 0", "_fileassoc 0"] {
+            let _ = app.dispatch_command(command);
+            assert_eq!(active_command(&app), None, "{command} started a prompt");
+            assert_eq!(app.file_assoc_enabled, before, "{command} changed the setting");
+        }
+        // The platform calls themselves refuse, so no other path can register,
+        // unregister or install thumbnails either.
+        assert!(crate::io::file_association::register_as_handler().is_err());
+        assert!(crate::io::file_association::unregister_handler().is_err());
+        assert!(pollster::block_on(crate::io::file_association::set_default_app()).is_err());
+    }
+
+    #[test]
     fn title_names_the_secureplan_product() {
         let app = app_with_drawing();
         assert!(app.secureplan_window_title().contains("SecurePlan CAD 0.1.0"));
@@ -424,6 +592,74 @@ mod tests {
         assert!(!app.secureplan.settings.is_trusted(ORIGIN));
         let saved = Settings::load_from(app.secureplan.settings_path.as_ref().unwrap());
         assert!(saved.developer_loopback_origins && !saved.is_trusted(ORIGIN));
+        std::fs::remove_dir_all(app.secureplan.settings_path.clone().unwrap().parent().unwrap()).ok();
+    }
+    #[test]
+    fn a_link_start_decides_before_any_window() {
+        let mut settings = Settings::default();
+        let url = |origin: &str| launch_url(&launch(origin, 90));
+        assert_eq!(cold_start(&[url(ORIGIN)], &settings), ColdStart::Windowless);
+        // A website that may never pair, or no valid link at all: nothing opens.
+        assert_eq!(cold_start(&[url("http://secureplan.example")], &settings), ColdStart::Exit);
+        assert_eq!(cold_start(&[url("http://localhost:5173")], &settings), ColdStart::Exit);
+        assert_eq!(cold_start(&["secureplan-cad://pair?v=1".to_string()], &settings), ColdStart::Exit);
+        assert_eq!(cold_start(&[], &settings), ColdStart::Exit);
+        settings.developer_loopback_origins = true;
+        assert_eq!(cold_start(&[url("http://localhost:5173")], &settings), ColdStart::Windowless);
+    }
+
+    fn link_started_app(pairing: u8) -> (OpenCADStudio, Arc<Bridge>, mpsc::Receiver<BridgeEvent>, LaunchRequest) {
+        let mut app = app_with_drawing();
+        app.secureplan.cold_start = true;
+        let bridge = Arc::new(test_bridge(bridge::PING_INTERVAL));
+        let events = bridge.take_events().unwrap();
+        app.secureplan.bridge = Some(Arc::clone(&bridge));
+        (app, bridge, events, launch(ORIGIN, pairing))
+    }
+
+    #[test]
+    fn a_trusted_link_start_shows_the_editor_only_when_the_session_opens() {
+        let (mut app, bridge, events, request) = link_started_app(91);
+        app.secureplan.settings.trust(ORIGIN);
+        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+        assert_eq!(app.main_window, None, "the editor opened before the session");
+        assert_eq!(app.secureplan.prompt_window, None, "a trusted website was prompted for");
+        let _web = connect_web(bridge.port(), &request).expect("the link pairs silently");
+        let opened = next_event(&events);
+        assert!(matches!(opened, BridgeEvent::Opened { .. }));
+        let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
+        assert!(app.main_window.is_some(), "the editor opens with the session");
+    }
+
+    #[test]
+    fn a_new_website_link_start_shows_only_the_trust_prompt() {
+        // Declined, by button or by closing the prompt's window: nothing else appears.
+        for decline in [Message::SecurePlan(Msg::TrustAnswer(false)), Message::WindowCloseRequested(iced::window::Id::unique())] {
+            let (mut app, bridge, _events, request) = link_started_app(92);
+            let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+            let prompt = app.secureplan.prompt_window.expect("the prompt has its own window");
+            assert_eq!(app.main_window, None, "the editor opened behind the prompt");
+            assert!(app.secureplan_window_view(prompt).is_some());
+            let decline = match decline {
+                Message::WindowCloseRequested(_) => Message::WindowCloseRequested(prompt),
+                other => other,
+            };
+            let _ = app.update(decline);
+            assert_eq!(app.secureplan.prompt_window, None);
+            assert_eq!(app.main_window, None);
+            assert!(!app.secureplan.settings.is_trusted(ORIGIN));
+            assert!(connect_web(bridge.port(), &request).is_err());
+        }
+        // Accepted: the prompt goes, and the editor waits for the session.
+        let (mut app, bridge, events, request) = link_started_app(93);
+        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+        let _ = app.update(Message::SecurePlan(Msg::TrustAnswer(true)));
+        assert_eq!(app.secureplan.prompt_window, None);
+        assert_eq!(app.main_window, None);
+        let _web = connect_web(bridge.port(), &request).expect("the accepted link pairs");
+        let opened = next_event(&events);
+        let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
+        assert!(app.main_window.is_some());
         std::fs::remove_dir_all(app.secureplan.settings_path.clone().unwrap().parent().unwrap()).ok();
     }
 }

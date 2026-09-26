@@ -38,17 +38,6 @@ pub fn serve() {
     }
 }
 
-/// A path as diagnostics show it: SecurePlan CAD never writes file paths to
-/// its output (DSK-02).
-#[cfg(not(target_arch = "wasm32"))]
-fn shown_path(path: &std::path::Path) -> String {
-    if cfg!(feature = "secureplan") {
-        "[redacted]".to_string()
-    } else {
-        path.display().to_string()
-    }
-}
-
 /// Headless one-shot format conversion (`--export IN OUT`). Loads `input`,
 /// writes `output` (format chosen from `output`'s extension), and returns a
 /// process exit code (0 on success). No window is created.
@@ -57,17 +46,19 @@ pub fn export_headless(input: &std::path::Path, output: &std::path::Path) -> i32
     let doc = match crate::io::load_file(input) {
         Ok(doc) => doc,
         Err(e) => {
-            eprintln!("export: cannot read {}: {e}", shown_path(input));
+            let e = crate::io::scrub_paths(&e, &[input, output]);
+            eprintln!("export: cannot read {}: {e}", crate::io::diagnostic_path(input));
             return 1;
         }
     };
     match crate::io::save(&doc, output) {
         Ok(()) => {
-            println!("Exported {} → {}", shown_path(input), shown_path(output));
+            println!("Exported {} → {}", crate::io::diagnostic_path(input), crate::io::diagnostic_path(output));
             0
         }
         Err(e) => {
-            eprintln!("export: cannot write {}: {e}", shown_path(output));
+            let e = crate::io::scrub_paths(&e, &[input, output]);
+            eprintln!("export: cannot write {}: {e}", crate::io::diagnostic_path(output));
             1
         }
     }

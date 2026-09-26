@@ -4,10 +4,11 @@
 //! by chunks whose plaintext is `u32le transferId ‖ u32le seq ‖ payload`. The
 //! receiver checks the sequence, length and SHA-256 before handing the bytes
 //! over, never accepts a reused id, and fails a transfer after
-//! [`NO_PROGRESS_TIMEOUT`] without progress. At most [`MAX_IN_FLIGHT`]
-//! transfers are in flight per session, both directions together: senders
-//! wait for a slot, and because two starts can cross on the wire a receiver
-//! refuses a start only when it would hold more than that many incoming.
+//! [`NO_PROGRESS_TIMEOUT`] without progress. The session's 3 in flight are
+//! split by direction so that starts crossing on the wire cannot exceed it:
+//! the web sends at most [`MAX_INCOMING_IN_FLIGHT`] at a time and a start
+//! beyond that is refused; the desktop's one (`MAX_OUTGOING_IN_FLIGHT`) is
+//! kept by sending each transfer whole before the next.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -18,7 +19,10 @@ use super::protocol::{TransferStart, JSON_PAYLOAD_MEDIA_TYPES, MAX_JSON_PAYLOAD_
 use super::redact::Redacted;
 
 pub const MAX_CHUNK_PAYLOAD: usize = 1024 * 1024;
-pub const MAX_IN_FLIGHT: usize = 3;
+/// Web → desktop share of the session's 3 in flight.
+pub const MAX_INCOMING_IN_FLIGHT: usize = 2;
+/// Desktop → web share.
+pub const MAX_OUTGOING_IN_FLIGHT: usize = 1;
 pub const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_LEN: usize = 8;
 
@@ -101,7 +105,7 @@ impl Incoming {
         if !self.seen.insert(start.transfer_id) {
             return Err(TransferError::ReusedId);
         }
-        if self.active.len() >= MAX_IN_FLIGHT {
+        if self.active.len() >= MAX_INCOMING_IN_FLIGHT {
             return Err(TransferError::TooManyInFlight);
         }
         let partial = Partial {
@@ -235,7 +239,13 @@ mod tests {
     #[test]
     fn transfer_vectors() {
         let transfers = vectors::json("transfers.json");
-        for case in transfers["valid"].as_array().unwrap() {
+        // The desktop is the receiver here; cases for the web's receiver are skipped.
+        let for_desktop = |case: &&Value| case.get("receiver").is_none_or(|receiver| receiver == "desktop");
+        let limits = &transfers["limits"];
+        assert_eq!(limits["maxInFlightWebToDesktop"].as_u64(), Some(MAX_INCOMING_IN_FLIGHT as u64));
+        assert_eq!(limits["maxInFlightDesktopToWeb"].as_u64(), Some(MAX_OUTGOING_IN_FLIGHT as u64));
+        assert_eq!(limits["maxInFlightPerSession"].as_u64(), Some((MAX_INCOMING_IN_FLIGHT + MAX_OUTGOING_IN_FLIGHT) as u64));
+        for case in transfers["valid"].as_array().unwrap().iter().filter(for_desktop) {
             let done = replay(case["events"].as_array().unwrap()).unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
             let ids: Vec<u64> = done.iter().map(|c| c.transfer_id as u64).collect();
             let expected: Vec<u64> = case["expect"]["complete"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
@@ -244,7 +254,7 @@ mod tests {
                 assert_eq!(done[0].bytes.expose(), &hex(bytes), "{}", case["name"]);
             }
         }
-        for case in transfers["invalid"].as_array().unwrap() {
+        for case in transfers["invalid"].as_array().unwrap().iter().filter(for_desktop) {
             assert!(replay(case["events"].as_array().unwrap()).is_err(), "{}", case["name"]);
         }
     }

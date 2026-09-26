@@ -328,7 +328,7 @@ async fn open_path_with_phase_attempt(
                         Some(32) | Some(33) => format!(
                             "\"{}\" is in use by another program. Close the file there and \
                              reopen it here, or open a copy of the file.",
-                            path2.display()
+                            diagnostic_path(&path2)
                         ),
                         _ => format!("failed to open drawing: {error}"),
                     };
@@ -1493,7 +1493,7 @@ impl SaveFailure {
 
     fn replacing(path: &Path, error: std::io::Error) -> Self {
         Self {
-            message: format!("replace {}: {error}", path.display()),
+            message: format!("replace {}: {error}", diagnostic_path(path)),
             file_in_use: replace_error_is_file_in_use(&error),
             externally_modified: false,
         }
@@ -1504,7 +1504,7 @@ impl SaveFailure {
         Self {
             message: format!(
                 "{} changed on disk after it was opened",
-                path.display()
+                diagnostic_path(path)
             ),
             file_in_use: false,
             externally_modified: true,
@@ -1845,10 +1845,68 @@ where
             write_started.elapsed().as_secs_f64() * 1000.0,
             doc.entities().count(),
             doc.objects.len(),
-            path.display(),
+            diagnostic_path(path),
         );
     }
     Ok(())
+}
+
+/// Whether a drawing-controlled file reference may be looked up on disk: in
+/// SecurePlan builds never when it names another machine (UNC path or URL),
+/// since even a stat can reach the network (DSK-02). Always true otherwise.
+pub fn reference_is_local(reference: &str) -> bool {
+    #[cfg(feature = "secureplan")]
+    {
+        !crate::app::secureplan::guards::is_remote_reference(reference)
+    }
+    #[cfg(not(feature = "secureplan"))]
+    {
+        let _ = reference;
+        true
+    }
+}
+
+/// [`reference_is_local`] for a path.
+pub fn path_is_local(path: &Path) -> bool {
+    reference_is_local(&path.to_string_lossy())
+}
+
+/// A path as diagnostics, errors and performance traces show it. SecurePlan
+/// CAD never writes file paths there (DSK-02).
+pub fn diagnostic_path(path: &Path) -> String {
+    if cfg!(feature = "secureplan") {
+        "[redacted]".to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// Remove every trace of `paths` (the full path, its folder and its file
+/// name) from a diagnostic in SecurePlan builds, whatever produced it.
+pub fn scrub_paths(message: &str, paths: &[&Path]) -> String {
+    if !cfg!(feature = "secureplan") {
+        return message.to_string();
+    }
+    let mut pieces: Vec<String> = Vec::new();
+    for path in paths {
+        pieces.push(path.display().to_string());
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            pieces.push(parent.display().to_string());
+        }
+        if let Some(name) = path.file_name() {
+            pieces.push(name.to_string_lossy().into_owned());
+        }
+        if let Some(stem) = path.file_stem() {
+            pieces.push(stem.to_string_lossy().into_owned());
+        }
+    }
+    // Longest first, so a folder never leaves part of a full path behind.
+    pieces.sort_by_key(|piece| std::cmp::Reverse(piece.len()));
+    let mut scrubbed = message.to_string();
+    for piece in pieces.iter().filter(|piece| piece.len() > 1) {
+        scrubbed = scrubbed.replace(piece.as_str(), "[redacted]");
+    }
+    scrubbed
 }
 
 fn save_temp_path(path: &Path) -> PathBuf {

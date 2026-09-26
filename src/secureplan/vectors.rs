@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 /// SHA-256 of `secureplan-vectors/manifest.json`.
 pub(crate) const MANIFEST_SHA256: &str =
-    "6401f4b640ddb5f41e573accf7cda35e05a7521239f9a3881587ebb271a04c83";
+    "f981e2811a54c0f5076ef6136f6b3cbce672a72daee03e7b0197495139cc2f78";
 
 pub(crate) fn path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

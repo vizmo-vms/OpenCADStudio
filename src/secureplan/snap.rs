@@ -8,9 +8,9 @@
 //!
 //! Included: model geometry visible in the published view — lines and the
 //! polylines of the prepared publication ([`super::publish::Publication`]),
-//! which replaces every curve (arcs, circles, ellipses, splines, bulged or
-//! tilted polylines, legacy POLYLINEs) by the same polyline the PDF draws —
-//! inside block references too, walked with the renderer's transforms and
+//! which replaces every curve (arcs, circles, ellipses, splines, bulged
+//! polylines, legacy POLYLINEs) by the same polyline the PDF draws, in the
+//! curve's own plane — inside block references too, walked with the renderer's transforms and
 //! visibility rules (invisible, off, frozen and non-plotting layers). Excluded:
 //! text, mtext, dimensions, tables, leaders, hatches, images and paper
 //! space. Everything is clipped to the page.
@@ -97,11 +97,18 @@ impl Collector<'_> {
                 self.point(transform, b);
                 self.segment(transform, a, b);
             }
-            // After preparation every polyline with a bulge or a tilted plane
-            // is a replaced curve in world XY; the rest are plain XY chains.
+            // After preparation no polyline has a bulge; its vertices are in
+            // its own plane (OCS), which may be tilted.
             EntityType::LwPolyline(polyline) => {
-                let z = polyline.elevation;
-                let vertices: Vec<[f64; 3]> = polyline.vertices.iter().map(|v| [v.location.x, v.location.y, z]).collect();
+                let normal = (polyline.normal.x, polyline.normal.y, polyline.normal.z);
+                let vertices: Vec<[f64; 3]> = polyline
+                    .vertices
+                    .iter()
+                    .map(|v| {
+                        let (x, y, z) = crate::scene::view::transform::ocs_point_to_wcs((v.location.x, v.location.y, polyline.elevation), normal);
+                        [x, y, z]
+                    })
+                    .collect();
                 match publication.key_points(polyline.common.handle.value()) {
                     Some(keys) => {
                         for key in keys {
@@ -251,11 +258,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn has_point(geometry: &SnapGeometry, (x, y): (f64, f64)) -> bool {
+    pub(crate) fn has_point(geometry: &SnapGeometry, (x, y): (f64, f64)) -> bool {
         geometry.points.iter().any(|p| (p[0] as f64 - x).abs() < 1e-3 && (p[1] as f64 - y).abs() < 1e-3)
     }
 
-    fn on_segments(geometry: &SnapGeometry, (x, y): (f64, f64)) -> bool {
+    pub(crate) fn on_segments(geometry: &SnapGeometry, (x, y): (f64, f64)) -> bool {
         geometry.segments.iter().any(|s| {
             [[s[0], s[1]], [s[2], s[3]]].iter().any(|p| (p[0] as f64 - x).abs() < 1e-3 && (p[1] as f64 - y).abs() < 1e-3)
         })
@@ -298,7 +305,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn scene_of(doc: CadDocument) -> crate::scene::Scene {
+    pub(crate) fn scene_of(doc: CadDocument) -> crate::scene::Scene {
         let mut scene = crate::scene::Scene::new();
         scene.document = doc;
         scene.rebuild_derived_caches();
@@ -315,7 +322,7 @@ pub(crate) mod tests {
         EntityType::Line(acadrust::entities::Line::from_points(Vector3::new(x0, y0, 0.0), Vector3::new(x1, y1, 0.0)))
     }
 
-    fn block(doc: &mut CadDocument, name: &str, members: Vec<EntityType>) {
+    pub(crate) fn block(doc: &mut CadDocument, name: &str, members: Vec<EntityType>) {
         let mut record = acadrust::tables::BlockRecord::new(name);
         record.handle = doc.allocate_handle();
         let owner = record.handle;

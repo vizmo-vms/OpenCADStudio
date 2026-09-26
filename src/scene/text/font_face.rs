@@ -56,6 +56,7 @@ impl Face {
         // A resolvable on-disk .SHX font renders its real stroke glyphs; the
         // LFF substitutes only cover names we can't load.
         if font_name.to_ascii_lowercase().ends_with(".shx")
+            && crate::io::reference_is_local(font_name)
             && std::path::Path::new(font_name).is_file()
         {
             if let Some((above, below)) = shx::font_metrics(font_name) {

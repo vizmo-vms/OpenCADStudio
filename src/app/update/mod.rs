@@ -3060,6 +3060,10 @@ impl OpenCADStudio {
             }
 
             Message::WindowCloseRequested(id) => {
+                #[cfg(feature = "secureplan")]
+                if let Some(task) = self.secureplan_window_close_requested(id) {
+                    return task;
+                }
                 if self.main_window == Some(id) {
                     if self.tabs.iter().any(|t| t.dirty) {
                         self.pending_close = Some(super::PendingClose::Quit);

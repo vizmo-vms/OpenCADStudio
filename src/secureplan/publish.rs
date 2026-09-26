@@ -195,33 +195,235 @@ where
     );
 }
 
-/// The largest length scale of a transform's plan part.
-fn plan_scale(transform: &acadrust::types::Transform) -> f64 {
+/// The largest factor by which `transform` can stretch a length on its way
+/// to the plan: the largest singular value of its linear part followed by the
+/// projection to world XY. Tessellating with `tolerance / plan_scale` keeps
+/// every instance of a curve within `tolerance` in the plan, whatever the
+/// nesting, rotation, non-uniform scale or tilt of its block references.
+pub(crate) fn plan_scale(transform: &acadrust::types::Transform) -> f64 {
     use acadrust::types::Vector3;
-    let x = transform.apply_rotation(Vector3::new(1.0, 0.0, 0.0));
-    let y = transform.apply_rotation(Vector3::new(0.0, 1.0, 0.0));
-    x.x.hypot(x.y).max(y.x.hypot(y.y)).max(f64::MIN_POSITIVE)
+    let columns = [Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)]
+        .map(|axis| transform.apply_rotation(axis));
+    // A·Aᵀ for the 2×3 plan matrix A whose columns are the images of the axes.
+    let (mut a, mut b, mut d) = (0.0, 0.0, 0.0);
+    for column in columns {
+        a += column.x * column.x;
+        b += column.x * column.y;
+        d += column.y * column.y;
+    }
+    let largest = (a + d) / 2.0 + (((a - d) / 2.0).powi(2) + b * b).sqrt();
+    largest.sqrt().max(f64::MIN_POSITIVE)
 }
 
-/// Whether the drawn geometry of `entity` needs replacing by a polyline in
-/// world XY: every curved or OCS-placed kind the snap file includes.
+/// Whether the drawn geometry of `entity` is curved and needs replacing by a
+/// polyline within the chord tolerance.
 fn needs_flattening(entity: &acadrust::EntityType) -> bool {
     use acadrust::EntityType;
     match entity {
         EntityType::Circle(_) | EntityType::Arc(_) | EntityType::Ellipse(_) | EntityType::Spline(_) | EntityType::Polyline2D(_) => true,
-        EntityType::LwPolyline(polyline) => {
-            polyline.vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-12)
-                || (polyline.normal.x, polyline.normal.y, polyline.normal.z) != (0.0, 0.0, 1.0)
-        }
+        EntityType::LwPolyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-12),
         _ => false,
     }
 }
 
+/// More segments than this for one curve means a curve far larger than any
+/// plan (a circle thousands of kilometres across at 0.1 mm): refuse it.
+const MAX_CURVE_SEGMENTS: usize = 2_000_000;
+
+/// An arc of radius `radius` about `center` from `start` through `sweep`
+/// radians, cut so no chord departs from it by more than `tolerance`, with
+/// no upper limit short of [`MAX_CURVE_SEGMENTS`] (unlike the kernel).
+fn arc_points(center: (f64, f64), radius: f64, start: f64, sweep: f64, tolerance: f64) -> Result<Vec<(f64, f64)>, String> {
+    let step = if tolerance >= radius { std::f64::consts::FRAC_PI_2 } else { (2.0 * (1.0 - tolerance / radius).acos()).min(std::f64::consts::FRAC_PI_2) };
+    let count = (sweep.abs() / step).ceil().max(1.0);
+    if !count.is_finite() || count > MAX_CURVE_SEGMENTS as f64 {
+        return Err(TOO_LARGE.into());
+    }
+    let count = count as usize;
+    Ok((0..=count)
+        .map(|i| {
+            let angle = start + sweep * i as f64 / count as f64;
+            (center.0 + radius * angle.cos(), center.1 + radius * angle.sin())
+        })
+        .collect())
+}
+
+const TOO_LARGE: &str = "A curve in the published view is too large to draw within the publication's precision. Shrink the published window or reduce the scale.";
+
+/// One polyline vertex in its OCS with the widths at the start and end of
+/// its outgoing segment.
+struct WideVertex {
+    at: (f64, f64),
+    bulge: f64,
+    start_width: f64,
+    end_width: f64,
+}
+
+/// Tessellate a (possibly bulged, possibly tapered) OCS polyline. Widths are
+/// interpolated linearly along each segment, as they are drawn.
+fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64) -> Result<Vec<acadrust::entities::LwVertex>, String> {
+    use acadrust::entities::LwVertex;
+    use acadrust::types::Vector2;
+    let mut out: Vec<LwVertex> = Vec::new();
+    let count = if closed { vertices.len() } else { vertices.len().saturating_sub(1) };
+    let mut push = |x: f64, y: f64, start_width: f64, end_width: f64| {
+        let mut vertex = LwVertex::new(Vector2::new(x, y));
+        vertex.start_width = start_width;
+        vertex.end_width = end_width;
+        out.push(vertex);
+    };
+    for i in 0..count {
+        let (from, to) = (&vertices[i], &vertices[(i + 1) % vertices.len()]);
+        let (a, b) = (from.at, to.at);
+        let chord = (b.0 - a.0).hypot(b.1 - a.1);
+        let width_at = |t: f64| from.start_width + (from.end_width - from.start_width) * t;
+        if from.bulge.abs() < 1e-12 || chord == 0.0 {
+            push(a.0, a.1, from.start_width, from.end_width);
+            continue;
+        }
+        // bulge = tan(θ/4): radius and centre from the chord.
+        let theta = 4.0 * from.bulge.atan();
+        let radius = chord / (2.0 * (theta / 2.0).sin().abs());
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let offset = radius * (theta / 2.0).cos() * theta.signum();
+        let normal = (-(b.1 - a.1) / chord, (b.0 - a.0) / chord);
+        let center = (mid.0 + normal.0 * offset, mid.1 + normal.1 * offset);
+        let start = (a.1 - center.1).atan2(a.0 - center.0);
+        let points = arc_points(center, radius, start, theta, tolerance)?;
+        let pieces = points.len() - 1;
+        for (k, point) in points[..pieces].iter().enumerate() {
+            push(point.0, point.1, width_at(k as f64 / pieces as f64), width_at((k + 1) as f64 / pieces as f64));
+        }
+    }
+    if let Some(last) = vertices.get(if closed { 0 } else { vertices.len().saturating_sub(1) }) {
+        push(last.at.0, last.at.1, 0.0, 0.0);
+    }
+    Ok(out)
+}
+
+/// OCS → WCS for a point with the given extrusion normal.
+fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
+    let (wx, wy, wz) = crate::scene::view::transform::ocs_point_to_wcs((x, y, elevation), (normal.x, normal.y, normal.z));
+    [wx, wy, wz]
+}
+
+/// The replacement polyline for a curved entity, in the entity's own plane
+/// (normal and elevation kept, so every enclosing transform still applies
+/// to its true 3D position), and its snap end points in block coordinates.
+/// A replacement polyline and its snap end points in block coordinates.
+type Flattened = (acadrust::entities::LwPolyline, Vec<[f64; 3]>);
+
+fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
+    use crate::scene::model::wire_model::SnapHint;
+    use acadrust::entities::{LwPolyline, LwVertex};
+    use acadrust::types::{Vector2, Vector3};
+    use acadrust::EntityType;
+    let plain = |points: Vec<(f64, f64)>| points.into_iter().map(|(x, y)| LwVertex::new(Vector2::new(x, y))).collect::<Vec<_>>();
+    let (vertices, normal, elevation, keys) = match entity {
+        EntityType::Circle(circle) => {
+            let points = arc_points((circle.center.x, circle.center.y), circle.radius, 0.0, std::f64::consts::TAU, tolerance)?;
+            (plain(points), circle.normal, circle.center.z, Vec::new())
+        }
+        EntityType::Arc(arc) => {
+            let mut sweep = arc.end_angle - arc.start_angle;
+            if sweep <= 0.0 {
+                sweep += std::f64::consts::TAU;
+            }
+            let points = arc_points((arc.center.x, arc.center.y), arc.radius, arc.start_angle, sweep, tolerance)?;
+            let keys = [points[0], points[points.len() - 1]].map(|p| ocs_to_wcs(arc.normal, p, arc.center.z)).to_vec();
+            (plain(points), arc.normal, arc.center.z, keys)
+        }
+        EntityType::LwPolyline(polyline) => {
+            // Widths as the renderer reads them: a vertex's own when set,
+            // otherwise the constant width.
+            let chain: Vec<WideVertex> = polyline
+                .vertices
+                .iter()
+                .map(|v| {
+                    let (start_width, end_width) = if v.start_width > 1e-9 || v.end_width > 1e-9 {
+                        (v.start_width, v.end_width)
+                    } else {
+                        (polyline.constant_width, polyline.constant_width)
+                    };
+                    WideVertex { at: (v.location.x, v.location.y), bulge: v.bulge, start_width, end_width }
+                })
+                .collect();
+            let keys = chain.iter().map(|v| ocs_to_wcs(polyline.normal, v.at, polyline.elevation)).collect();
+            (tessellate_chain(&chain, polyline.is_closed, tolerance)?, polyline.normal, polyline.elevation, keys)
+        }
+        EntityType::Polyline2D(polyline) => {
+            // The vertices it draws (fit points, not the spline frame), with
+            // their own widths when set, otherwise the polyline's defaults.
+            let drawn = crate::entities::polyline::drawn_vertices2d(polyline);
+            let chain: Vec<WideVertex> = drawn
+                .as_deref()
+                .unwrap_or(&polyline.vertices)
+                .iter()
+                .map(|v| {
+                    let (start_width, end_width) = if v.start_width > 1e-9 || v.end_width > 1e-9 {
+                        (v.start_width, v.end_width)
+                    } else {
+                        (polyline.start_width, polyline.end_width)
+                    };
+                    WideVertex { at: (v.location.x, v.location.y), bulge: v.bulge, start_width, end_width }
+                })
+                .collect();
+            let keys = chain.iter().map(|v| ocs_to_wcs(polyline.normal, v.at, polyline.elevation)).collect();
+            (tessellate_chain(&chain, polyline.flags.is_closed(), tolerance)?, polyline.normal, polyline.elevation, keys)
+        }
+        EntityType::Ellipse(_) | EntityType::Spline(_) => {
+            // Planar curves only; a curve through space stays as the renderer draws it.
+            let Some(curve) = crate::entities::curve::entity_curve(entity) else { return Ok(None) };
+            let points = curve.tessellate_within(tolerance);
+            if points.len() < 2 {
+                return Ok(None);
+            }
+            // The kernel caps how finely it cuts a curve; check every chord
+            // actually met the tolerance rather than trusting it did.
+            let met = points.windows(2).all(|pair| {
+                let middle = [0, 1, 2].map(|i| (pair[0][i] + pair[1][i]) / 2.0);
+                curve.parameter_at(middle).is_none_or(|t| {
+                    let on = curve.point_at(t);
+                    let gap = [0, 1, 2].map(|i| on[i] - middle[i]);
+                    (gap[0] * gap[0] + gap[1] * gap[1] + gap[2] * gap[2]).sqrt() <= tolerance * (1.0 + 1e-6)
+                })
+            });
+            if !met {
+                return Err(TOO_LARGE.into());
+            }
+            let [ux, uy, uz] = curve.plane.x_axis;
+            let [vx, vy, vz] = curve.plane.y_axis;
+            let normal = Vector3::new(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+            let length = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z).sqrt();
+            if length == 0.0 {
+                return Ok(None);
+            }
+            let normal = Vector3::new(normal.x / length, normal.y / length, normal.z / length);
+            let (ax, ay) = crate::scene::view::transform::ocs_axes((normal.x, normal.y, normal.z));
+            let dot = |p: &[f64; 3], a: (f64, f64, f64)| p[0] * a.0 + p[1] * a.1 + p[2] * a.2;
+            let elevation = dot(&points[0], (normal.x, normal.y, normal.z));
+            let ocs = points.iter().map(|p| (dot(p, ax), dot(p, ay))).collect();
+            let snap = crate::entities::curve::snap_from(&curve);
+            let keys = snap.snap_pts.iter().filter(|(_, hint)| matches!(hint, SnapHint::Endpoint)).map(|(p, _)| p.to_array()).collect();
+            (plain(ocs), normal, elevation, keys)
+        }
+        _ => return Ok(None),
+    };
+    if vertices.len() < 2 {
+        return Ok(None);
+    }
+    let mut polyline = LwPolyline::new();
+    polyline.vertices = vertices;
+    polyline.common = entity.common().clone();
+    polyline.normal = normal;
+    polyline.elevation = elevation;
+    // Linetypes run along the whole curve, as they did on the original.
+    polyline.plinegen = true;
+    Ok(Some((polyline, keys)))
+}
+
 /// Prepare the model-space view of `source` for publication.
 pub fn prepare_model(source: &crate::scene::Scene, transform: PageTransform) -> Result<Publication, String> {
-    use crate::scene::model::wire_model::SnapHint;
-    use acadrust::entities::LwPolyline;
-    use acadrust::types::Vector2;
     use acadrust::EntityType;
     if source.current_layout != "Model" {
         return Err("The published view must be model space.".into());
@@ -238,26 +440,12 @@ pub fn prepare_model(source: &crate::scene::Scene, transform: PageTransform) -> 
     });
     let mut document = source.document.clone();
     let mut key_points = rustc_hash::FxHashMap::default();
-    for (handle, scale) in scales {
+    let mut handles: Vec<(u64, f64)> = scales.into_iter().collect();
+    handles.sort_by_key(|(handle, _)| *handle);
+    for (handle, scale) in handles {
         let handle = acadrust::types::Handle::new(handle);
         let Some(entity) = document.get_entity(handle) else { continue };
-        // Planar curves only; a curve through space stays as the renderer draws it.
-        let Some(curve) = crate::entities::curve::entity_curve(entity) else { continue };
-        let points = curve.tessellate_within(tolerance_cad / scale);
-        if points.len() < 2 {
-            continue;
-        }
-        let mut polyline = LwPolyline::from_points(points.iter().map(|p| Vector2::new(p[0], p[1])).collect());
-        polyline.common = entity.common().clone();
-        // Linetypes run along the whole curve, as they did on the original.
-        polyline.plinegen = true;
-        if let EntityType::LwPolyline(original) = entity {
-            polyline.constant_width = original.constant_width;
-        }
-        // Chain vertices (polylines) and curve ends (arcs, open ellipses and splines).
-        let snap = crate::entities::curve::snap_from(&curve);
-        let mut keys = snap.key_vertices;
-        keys.extend(snap.snap_pts.iter().filter(|(_, hint)| matches!(hint, SnapHint::Endpoint)).map(|(point, _)| point.to_array()));
+        let Some((polyline, keys)) = flatten(entity, tolerance_cad / scale)? else { continue };
         key_points.insert(handle.value(), keys);
         document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::LwPolyline(polyline)));
     }
@@ -652,5 +840,204 @@ pub(crate) mod tests {
             .filter(|dash: &Vec<f64>| !dash.is_empty())
             .collect();
         assert!(dashes.iter().any(|dash| dash == &vec![(0.5 * unit).round(), (0.25 * unit).round()]), "dashes not scaled: {dashes:?}");
+    }
+    /// A 3000 × 3000 mm window at 1 mm per point, one drawing unit per mm.
+    fn square_transform() -> PageTransform {
+        let mapping = Mapping { cad_origin: [0.0, 3000.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
+        PageTransform { mapping, placement: place_page([0.0, 0.0, 3000.0, 3000.0], &mapping, 1.0).unwrap() }
+    }
+
+    fn replaced(publication: &Publication, handle: acadrust::types::Handle) -> LwPolyline {
+        match publication.scene.document.get_entity(handle) {
+            Some(EntityType::LwPolyline(polyline)) => polyline.clone(),
+            other => panic!("not replaced by a polyline: {other:?}"),
+        }
+    }
+
+    /// Widths along a replaced polyline: each piece starts where the previous
+    /// ended, and the widths at the original vertices are the stored ones.
+    fn assert_widths(polyline: &LwPolyline, at: &[((f64, f64), f64, f64)]) {
+        let vertices = &polyline.vertices;
+        // The last vertex starts no segment, so its widths are not drawn.
+        for pair in vertices[..vertices.len() - 1].windows(2) {
+            let joint = (pair[1].location.x, pair[1].location.y);
+            if !at.iter().any(|(p, _, _)| (p.0 - joint.0).hypot(p.1 - joint.1) < 1e-6) {
+                assert!((pair[0].end_width - pair[1].start_width).abs() < 1e-9, "width jumps at {joint:?}");
+            }
+        }
+        for ((x, y), start, end_before) in at {
+            let i = vertices.iter().position(|v| (v.location.x - x).hypot(v.location.y - y) < 1e-6).unwrap_or_else(|| panic!("({x}, {y}) is not a vertex"));
+            assert!((vertices[i].start_width - start).abs() < 1e-9, "start width at ({x}, {y}): {}", vertices[i].start_width);
+            if i > 0 {
+                assert!((vertices[i - 1].end_width - end_before).abs() < 1e-9, "end width before ({x}, {y}): {}", vertices[i - 1].end_width);
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_polylines_keep_and_interpolate_their_widths() {
+        use acadrust::entities::{LwVertex, Polyline2D, Vertex2D};
+        let mut doc = CadDocument::new();
+        // A bulged segment tapering from 10 to 30, then a straight one at 30.
+        let vertex = |x: f64, y: f64, bulge: f64, start: f64, end: f64| {
+            let mut v = LwVertex::new(Vector2::new(x, y));
+            v.bulge = bulge;
+            v.start_width = start;
+            v.end_width = end;
+            v
+        };
+        let mut tapered = LwPolyline::new();
+        tapered.vertices = vec![vertex(0.0, 1000.0, 0.5, 10.0, 30.0), vertex(1000.0, 1000.0, 0.0, 30.0, 30.0), vertex(1000.0, 2000.0, 0.0, 0.0, 0.0)];
+        let lw = doc.add_entity(EntityType::LwPolyline(tapered)).unwrap();
+        // A legacy POLYLINE: default widths 20 → 40 on its bulged segment, its own 5 → 15 on the next.
+        let mut legacy = Polyline2D::new();
+        legacy.start_width = 20.0;
+        legacy.end_width = 40.0;
+        let mut first = Vertex2D::new(Vector3::new(2000.0, 1000.0, 0.0));
+        first.bulge = 1.0;
+        legacy.add_vertex(first);
+        let mut second = Vertex2D::new(Vector3::new(2800.0, 1000.0, 0.0));
+        second.start_width = 5.0;
+        second.end_width = 15.0;
+        legacy.add_vertex(second);
+        legacy.add_vertex(Vertex2D::new(Vector3::new(2800.0, 2000.0, 0.0)));
+        let pl = doc.add_entity(EntityType::Polyline2D(legacy)).unwrap();
+        let scene = crate::app::secureplan::snap::tests::scene_of(doc);
+        let transform = square_transform();
+        let (pdf, publication) = publish(&scene, transform);
+
+        let lw = replaced(&publication, lw);
+        assert!(lw.vertices.len() > 10, "the bulge was not tessellated");
+        assert_widths(&lw, &[((0.0, 1000.0), 10.0, 0.0), ((1000.0, 1000.0), 30.0, 30.0)]);
+        let pl = replaced(&publication, pl);
+        assert_widths(&pl, &[((2000.0, 1000.0), 20.0, 0.0), ((2800.0, 1000.0), 5.0, 40.0)]);
+
+        // The PDF strokes both at their widest, as the exporter does for any
+        // tapered polyline (one drawing unit is one point here).
+        let widths: Vec<f64> = operations(&pdf.bytes).iter().filter(|op| op.operator == "w").map(|op| number(&op.operands[0])).collect();
+        for width in [30.0, 40.0] {
+            assert!(widths.iter().any(|w| (w - width).abs() < 0.01), "no stroke {width} wide: {widths:?}");
+        }
+    }
+
+    /// The page point of a block point drawn through an INSERT with the given
+    /// normal, at `insert_at` in its OCS, unrotated and unscaled.
+    fn through_insert(transform: &PageTransform, normal: Vector3, insert_at: (f64, f64, f64), point: (f64, f64, f64)) -> (f64, f64) {
+        let ocs = (insert_at.0 + point.0, insert_at.1 + point.1, insert_at.2 + point.2);
+        let (x, y, _) = crate::scene::view::transform::ocs_point_to_wcs(ocs, (normal.x, normal.y, normal.z));
+        transform.apply(x, y)
+    }
+
+    #[test]
+    fn an_elevated_arc_in_a_tilted_insert_keeps_its_height_until_placed() {
+        use acadrust::entities::Insert;
+        let mut doc = CadDocument::new();
+        let mut arc = Arc::new();
+        arc.center = Vector3::new(0.0, 0.0, 500.0);
+        arc.radius = 100.0;
+        arc.start_angle = 0.0;
+        arc.end_angle = std::f64::consts::FRAC_PI_2;
+        crate::app::secureplan::snap::tests::block(&mut doc, "RAISED", vec![EntityType::Arc(arc)]);
+        let tilt = 30.0_f64.to_radians();
+        let normal = Vector3::new(0.0, -tilt.sin(), tilt.cos());
+        let mut insert = Insert::new("RAISED", Vector3::new(1000.0, 1000.0, 0.0));
+        insert.normal = normal;
+        doc.add_entity(EntityType::Insert(insert)).unwrap();
+        let scene = crate::app::secureplan::snap::tests::scene_of(doc);
+        let transform = square_transform();
+        let (pdf, publication) = publish(&scene, transform);
+        let snaps = crate::app::secureplan::snap::extract(&publication);
+        let drawn = content_points(&pdf.bytes);
+        let at = |x: f64, y: f64| through_insert(&transform, normal, (1000.0, 1000.0, 0.0), (x, y, 500.0));
+        let near = |points: &[[f64; 2]], (x, y): (f64, f64), within: f64| points.iter().any(|p| (p[0] - x).hypot(p[1] - y) < within);
+        for end in [at(100.0, 0.0), at(0.0, 100.0)] {
+            assert!(near(&drawn, end, 1e-3), "PDF misses the arc end {end:?}");
+            assert!(crate::app::secureplan::snap::tests::has_point(&snaps, end), "no end-point snap at {end:?}");
+            assert!(crate::app::secureplan::snap::tests::on_segments(&snaps, end), "no snap segment ends at {end:?}");
+        }
+        // The middle of the arc is drawn and snappable too, within the chord tolerance.
+        let middle = at(100.0 * std::f64::consts::FRAC_1_SQRT_2, 100.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let ends: Vec<[f64; 2]> = snaps.segments.iter().flat_map(|s| [[s[0] as f64, s[1] as f64], [s[2] as f64, s[3] as f64]]).collect();
+        assert!(near(&drawn, middle, 3.0) && near(&ends, middle, 3.0), "the arc is not where the insert places it");
+    }
+
+    #[test]
+    fn nested_non_uniform_inserts_get_the_full_stretch() {
+        use acadrust::entities::Insert;
+        let mut doc = CadDocument::new();
+        let mut circle = Circle::new();
+        circle.radius = 100.0;
+        crate::app::secureplan::snap::tests::block(&mut doc, "INNER", vec![EntityType::Circle(circle)]);
+        let mut inner = Insert::new("INNER", Vector3::new(0.0, 0.0, 0.0));
+        inner.rotation = std::f64::consts::FRAC_PI_4;
+        crate::app::secureplan::snap::tests::block(&mut doc, "OUTER", vec![EntityType::Insert(inner)]);
+        let outer = Insert::new("OUTER", Vector3::new(1500.0, 1500.0, 0.0)).with_scale(10.0, 1.0, 1.0);
+        doc.add_entity(EntityType::Insert(outer)).unwrap();
+        let scene = crate::app::secureplan::snap::tests::scene_of(doc);
+        let transform = square_transform();
+        let mut placed = Vec::new();
+        walk_model(&scene, false, |entity, context| {
+            if let EntityType::Circle(_) = entity {
+                placed.push((entity.common().handle, context.transform));
+            }
+        });
+        let [(handle, instance)] = placed.as_slice() else { panic!("one circle instance expected") };
+        assert!((plan_scale(instance) - 10.0).abs() < 1e-9, "stretch {}", plan_scale(instance));
+        let publication = prepare_model(&scene, transform).unwrap();
+        let polyline = replaced(&publication, *handle);
+        let world = |x: f64, y: f64| instance.apply(Vector3::new(x, y, 0.0));
+        let mut worst = 0.0_f64;
+        for pair in polyline.vertices.windows(2) {
+            let (a, b) = (pair[0].location, pair[1].location);
+            let middle = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+            let angle = middle.1.atan2(middle.0);
+            let on_curve = world(100.0 * angle.cos(), 100.0 * angle.sin());
+            let on_chord = world(middle.0, middle.1);
+            worst = worst.max((on_curve.x - on_chord.x).hypot(on_curve.y - on_chord.y));
+        }
+        let tolerance = transform.placement.chord_tolerance_mm;
+        assert!(worst <= tolerance * (1.0 + 1e-6), "chord error {worst} mm > {tolerance} mm");
+    }
+
+    #[test]
+    fn curves_beyond_the_kernel_cap_still_meet_the_tolerance_or_are_refused() {
+        use acadrust::entities::Ellipse;
+        let transform = square_transform();
+        let tolerance = transform.placement.chord_tolerance_mm;
+        // A 100 km circle whose top crosses the window needs far more than the
+        // kernel's 16,384 segments.
+        let mut doc = CadDocument::new();
+        let mut circle = Circle::new();
+        circle.center = Vector3::new(1500.0, 1500.0 - 1.0e8, 0.0);
+        circle.radius = 1.0e8;
+        let handle = doc.add_entity(EntityType::Circle(circle.clone())).unwrap();
+        let publication = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).unwrap();
+        let polyline = replaced(&publication, handle);
+        assert!(polyline.vertices.len() > 16_385, "{} vertices", polyline.vertices.len());
+        let worst = polyline
+            .vertices
+            .windows(2)
+            .map(|pair| {
+                let middle = ((pair[0].location.x + pair[1].location.x) / 2.0, (pair[0].location.y + pair[1].location.y) / 2.0);
+                1.0e8 - (middle.0 - circle.center.x).hypot(middle.1 - circle.center.y)
+            })
+            .fold(0.0, f64::max);
+        assert!(worst <= tolerance * (1.0 + 1e-6), "chord error {worst} mm > {tolerance} mm");
+
+        // Past what any plan needs, curves are refused rather than drawn out of tolerance.
+        let mut doc = CadDocument::new();
+        circle.radius = 1.0e13;
+        circle.center = Vector3::new(1500.0, 1500.0 - 1.0e13, 0.0);
+        doc.add_entity(EntityType::Circle(circle)).unwrap();
+        let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
+        assert!(refused.contains("too large"), "{refused}");
+        let mut doc = CadDocument::new();
+        let mut ellipse = Ellipse::new();
+        ellipse.center = Vector3::new(1500.0, 1500.0 - 1.0e8, 0.0);
+        ellipse.major_axis = Vector3::new(0.0, 1.0e8, 0.0);
+        ellipse.minor_axis_ratio = 0.5;
+        doc.add_entity(EntityType::Ellipse(ellipse)).unwrap();
+        let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
+        assert!(refused.contains("too large"), "{refused}");
     }
 }

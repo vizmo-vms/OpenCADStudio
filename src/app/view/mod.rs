@@ -177,6 +177,11 @@ impl OpenCADStudio {
         // All dialogs are in-canvas modals now (Plan B); view_main stacks the
         // active one. `window_id` is unused — there is only the main window.
         let _ = window_id;
+        // SecurePlan CAD's prompt-only window, before any editor window exists.
+        #[cfg(feature = "secureplan")]
+        if let Some(element) = self.secureplan_window_view(window_id) {
+            return element;
+        }
         // Pan latency on a large drawing is ~120 ms while `update`, `prepare`
         // and `encode` together account for ~1 ms of it, the GPU sits at 0-8%,
         // and encoding no scene at all changes nothing. Widget-tree

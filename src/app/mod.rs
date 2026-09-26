@@ -4399,16 +4399,10 @@ impl OpenCADStudio {
         self.command_line.push_error(msg);
     }
 
-    /// Boot function for `iced::daemon`: returns initial state plus a task that
-    /// opens the primary application window. Native only — the web build uses
-    /// [`Self::boot_web`].
+    /// Open the primary application window (maximized) and record its id.
     #[cfg(not(target_arch = "wasm32"))]
-    fn boot() -> (Self, Task<Message>) {
+    pub(crate) fn open_main_window(&mut self) -> Task<Message> {
         use helpers::build_window_icon;
-        // File association is no longer re-registered on every launch. It is set
-        // up once via the first-launch prompt below (when the user hasn't been
-        // asked yet) and afterwards managed entirely by the FILEASSOC command.
-        let state = Self::new();
         let (id, open_task) = window::open(window::Settings {
             maximized: true,
             icon: build_window_icon().and_then(|rgba| window::icon::from_rgba(rgba, 32, 32).ok()),
@@ -4426,9 +4420,25 @@ impl OpenCADStudio {
             },
             ..Default::default()
         });
-        let mut s = state;
-        s.main_window = Some(id);
-        let open_main = open_task.map(|_| Message::Noop);
+        self.main_window = Some(id);
+        open_task.map(|_| Message::Noop)
+    }
+
+    /// Boot function for `iced::daemon`: returns initial state plus a task that
+    /// opens the primary application window. Native only — the web build uses
+    /// [`Self::boot_web`].
+    #[cfg(not(target_arch = "wasm32"))]
+    fn boot() -> (Self, Task<Message>) {
+        // File association is no longer re-registered on every launch. It is set
+        // up once via the first-launch prompt below (when the user hasn't been
+        // asked yet) and afterwards managed entirely by the FILEASSOC command.
+        let mut s = Self::new();
+        // SecurePlan CAD started by a `secureplan-cad:` link shows no editor
+        // until a session opens (or only the trust prompt for a new website).
+        #[cfg(feature = "secureplan")]
+        let open_main = if s.secureplan.cold_start { Task::none() } else { s.open_main_window() };
+        #[cfg(not(feature = "secureplan"))]
+        let open_main = s.open_main_window();
         let check_update = Task::perform(
             crate::io::update_check::check_for_update(),
             Message::UpdateCheckResult,

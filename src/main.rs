@@ -68,6 +68,17 @@ fn main() -> iced::Result {
         } else {
             launch_urls
         };
+        // Started by links alone: a link no website may use opens nothing;
+        // otherwise the editor stays hidden until a session opens (DSK-04).
+        #[cfg(feature = "secureplan")]
+        if !launch_urls.is_empty()
+            && args.files.is_empty()
+            && !args.new
+            && args.script.is_none()
+            && !OpenCADStudio::app::secureplan::begin_cold_start(&launch_urls)
+        {
+            return Ok(());
+        }
 
         // GPU probe child: exercise one backend offscreen, print one JSON
         // line on success and exit 0/1. This must run before any logging/GUI
@@ -194,8 +205,7 @@ fn main() -> iced::Result {
                     .collect(),
                 Err(e) => {
                     // SecurePlan CAD never writes file paths to its output.
-                    let shown = if cfg!(feature = "secureplan") { "[redacted]".to_string() } else { p.display().to_string() };
-                    eprintln!("--script: cannot read {shown}: {e}");
+                    eprintln!("--script: cannot read {}: {e}", io::diagnostic_path(p));
                     Vec::new()
                 }
             })

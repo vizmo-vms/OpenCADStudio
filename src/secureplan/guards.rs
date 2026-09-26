@@ -312,4 +312,54 @@ pub(crate) mod tests {
         assert!(allowed.0.ends_with("plan.pdf") && allowed.0 != "plan.pdf" && allowed.1, "{allowed:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A minimal compiled SHX font: header, one shape (#0, the font header
+    /// `above=9, below=2`).
+    fn write_shx_font(path: &std::path::Path) {
+        let mut bytes = b"AutoCAD-86 shapes 1.0\r\n\x1a".to_vec();
+        let blob: Vec<u8> = [b"FONT\0".as_slice(), &[9, 2, 0, 0]].concat();
+        for value in [0u16, 0, 1, 0, blob.len() as u16] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&blob);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn drawing_font_references_to_another_machine_are_never_touched() {
+        use crate::scene::text::font_face::Face;
+        let dir = temp_dir("font");
+        let font = dir.join("synthetic.shx");
+        write_shx_font(&font);
+        let local = font.to_string_lossy().into_owned();
+        // The fixture is a real SHX font: by its ordinary path it resolves.
+        assert!(matches!(Face::resolve(&local), Face::Shx { .. }));
+        assert!(crate::scene::text::shx::font_metrics(&local).is_some());
+
+        // A drawing whose TEXT names a style that does not exist falls back to
+        // the style name as the font: `//tmp/...` is that same file on Linux
+        // and a UNC path on Windows, so it must never be stat'ed or read.
+        let remote = format!("/{local}");
+        for style in [remote.clone(), "\\\\attacker\\share\\font.shx".to_string()] {
+            let mut doc = acadrust::CadDocument::new();
+            let mut text = acadrust::entities::Text::new();
+            text.value = "SYNTHETIC".into();
+            text.style = style.clone();
+            doc.add_entity(acadrust::EntityType::Text(text)).unwrap();
+            let resolved = crate::entities::text_support::resolve_text_style(&style, &doc);
+            assert!(!matches!(Face::resolve(&resolved.font_name), Face::Shx { .. }), "{style} resolved to an SHX file");
+            let mut scene = crate::scene::Scene::new();
+            scene.document = doc;
+            scene.rebuild_derived_caches();
+        }
+        assert!(crate::scene::text::shx::font_metrics(&remote).is_none(), "a remote SHX was read");
+        // A style that names a remote font file is refused the same way.
+        let mut doc = acadrust::CadDocument::new();
+        let mut style = acadrust::tables::TextStyle::new("REMOTE");
+        style.font_file = remote.clone();
+        doc.text_styles.add(style).unwrap();
+        let resolved = crate::entities::text_support::resolve_text_style("REMOTE", &doc);
+        assert!(!matches!(Face::resolve(&resolved.font_name), Face::Shx { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
