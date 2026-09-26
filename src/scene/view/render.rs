@@ -2547,6 +2547,13 @@ impl Scene {
         if reference.starts_with("http://") || reference.starts_with("https://") {
             return crate::scene::model::image_model::resolve_image(reference);
         }
+        // A SecurePlan drawing's texture files are never read (DSK-02).
+        #[cfg(feature = "secureplan")]
+        if !crate::app::secureplan::guards::external_resource_allowed(
+            crate::app::secureplan::guards::ExternalResource::Image,
+        ) {
+            return None;
+        }
         let normalized = reference.replace('\\', "/");
         let source = std::path::PathBuf::from(&normalized);
         let mut candidates = Vec::new();
@@ -2590,6 +2597,13 @@ impl Scene {
         {
             let reference = reference.trim();
             if reference.is_empty() {
+                return None;
+            }
+            // Nor its light profiles.
+            #[cfg(feature = "secureplan")]
+            if !crate::app::secureplan::guards::external_resource_allowed(
+                crate::app::secureplan::guards::ExternalResource::Image,
+            ) {
                 return None;
             }
             let source = std::path::PathBuf::from(reference.replace('\\', "/"));

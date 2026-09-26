@@ -364,7 +364,7 @@ pub fn welcome(request_id: &str) -> Value {
         "requestId": request_id,
         "desktopVersion": super::VERSION,
         "protocol": super::PROTOCOL,
-        "capabilities": [],
+        "capabilities": ["overlay", "import", "apply"],
     })
 }
 

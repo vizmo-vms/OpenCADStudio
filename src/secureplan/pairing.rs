@@ -29,7 +29,7 @@ pub enum Intent {
 }
 
 impl Intent {
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "edit" => Intent::Edit,
             "view" => Intent::View,

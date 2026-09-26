@@ -932,6 +932,11 @@ impl OpenCADStudio {
     pub(in crate::app) fn layer_translator_mappings_file(&mut self, path: &std::path::Path, save: bool) {
         use crate::modules::draw::layers::laytrans::Mapping;
         if save {
+            // A SecurePlan drawing's layer names are not written to files.
+            #[cfg(feature = "secureplan")]
+            if self.secureplan_refuse_save(self.active_tab) {
+                return;
+            }
             let Some(state) = self.layer_translator.as_ref() else {
                 return;
             };
@@ -980,6 +985,11 @@ impl OpenCADStudio {
 
     /// Write what the last translation did beside the drawing.
     pub(in crate::app) fn write_layer_translation_log(&mut self, i: usize) {
+        // Nor is a log of a SecurePlan drawing (its title is the survey name).
+        #[cfg(feature = "secureplan")]
+        if self.secureplan_refuse_save(i) {
+            return;
+        }
         let Some(report) = self.last_layer_translation.as_ref() else {
             return;
         };

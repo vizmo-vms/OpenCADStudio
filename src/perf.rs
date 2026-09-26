@@ -11,7 +11,15 @@ static UI_ENABLED: AtomicBool = AtomicBool::new(false);
 static ENV_ENABLED: OnceLock<bool> = OnceLock::new();
 static LINES: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 #[cfg(not(target_arch = "wasm32"))]
-static STDERR_TX: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
+static STDERR_TX: OnceLock<std::sync::mpsc::SyncSender<StderrItem>> = OnceLock::new();
+
+/// What the stderr writer thread receives: a line, or a request to confirm
+/// every earlier line is written.
+#[cfg(not(target_arch = "wasm32"))]
+enum StderrItem {
+    Line(String),
+    Flush(std::sync::mpsc::Sender<()>),
+}
 
 fn lines() -> &'static Mutex<VecDeque<String>> {
     LINES.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_LINES)))
@@ -44,17 +52,22 @@ pub fn record(args: fmt::Arguments<'_>) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let tx = STDERR_TX.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<StderrItem>(1024);
             let _ = std::thread::Builder::new()
                 .name("ocs-perf-log".to_string())
                 .spawn(move || {
-                    while let Ok(line) = rx.recv() {
-                        eprintln!("{line}");
+                    while let Ok(item) = rx.recv() {
+                        match item {
+                            StderrItem::Line(line) => eprintln!("{line}"),
+                            StderrItem::Flush(done) => {
+                                let _ = done.send(());
+                            }
+                        }
                     }
                 });
             tx
         });
-        let _ = tx.try_send(line.clone());
+        let _ = tx.try_send(StderrItem::Line(line.clone()));
     }
     #[cfg(target_arch = "wasm32")]
     eprintln!("{line}");
@@ -63,6 +76,18 @@ pub fn record(args: fmt::Arguments<'_>) {
         entries.pop_front();
     }
     entries.push_back(line);
+}
+
+/// Wait (briefly) until every recorded line is on stderr. The writer thread
+/// is detached, so a process that exits right after recording would
+/// otherwise lose the last lines.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn flush() {
+    let Some(tx) = STDERR_TX.get() else { return };
+    let (done, wait) = std::sync::mpsc::channel();
+    if tx.send(StderrItem::Flush(done)).is_ok() {
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+    }
 }
 
 /// Plain-text snapshot used by the panel and its Copy button.

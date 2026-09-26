@@ -5,8 +5,8 @@
   "files": [
     {
       "path": "README.md",
-      "bytes": 5986,
-      "sha256": "577a4bdd7c4fcb563a66dff6f44b99e9371b684456c590c84d55f5fa35275962"
+      "bytes": 6370,
+      "sha256": "34510739f55761f6a2f2d3569686f0b3adc1be5e5f175ab3ef924cc272dbd074"
     },
     {
       "path": "base-identity.json",
@@ -25,13 +25,13 @@
     },
     {
       "path": "messages/invalid.json",
-      "bytes": 31217,
-      "sha256": "3f7692e2e4897a827a51a3c9e1983ef2066212d5843e2e0850cfd4080de216f5"
+      "bytes": 34158,
+      "sha256": "45bd91f30f9eb10c2c77b4984f8b425291dba7989dbdfddd4e33787f101a24dd"
     },
     {
       "path": "messages/valid.json",
-      "bytes": 16761,
-      "sha256": "a6b1272d66656cf67a8bad352bfbec1a15bf772295e4f35fb2c3135f29b09116"
+      "bytes": 17090,
+      "sha256": "f2632db2f8efa8469c386755bb84340563f77409e356b6323fc5695acd808588"
     },
     {
       "path": "payloads/invalid.json",
@@ -65,8 +65,8 @@
     },
     {
       "path": "schemas/messages.schema.json",
-      "bytes": 18403,
-      "sha256": "96d2590d5543974263144e5e12e0dfaf5342916be94823f3b1305a1271eeac3d"
+      "bytes": 18877,
+      "sha256": "e28590cde4ef18d34798f63159e385361eee11b58ac72db18d5517185ae9f2be"
     },
     {
       "path": "schemas/overlay.schema.json",

@@ -526,7 +526,7 @@ pub fn resolve_material_handle_with_base(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<MaterialImage>> {
+pub(crate) fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<MaterialImage>> {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -534,6 +534,14 @@ fn load_map_image(map: &MaterialMap, base_dir: Option<&Path>) -> Option<Arc<Mate
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<MaterialImage>>>>> = OnceLock::new();
 
     if map.source != 1 || map.file_name.trim().is_empty() {
+        return None;
+    }
+    // A SecurePlan drawing's texture files are never read (DSK-02), not even
+    // from the cache of an earlier read.
+    #[cfg(feature = "secureplan")]
+    if !crate::app::secureplan::guards::external_resource_allowed(
+        crate::app::secureplan::guards::ExternalResource::Image,
+    ) {
         return None;
     }
     let normalized = map.file_name.trim().replace('\\', "/");

@@ -68,6 +68,14 @@ fn link_display_name(link: &DataLink) -> String {
 }
 
 fn resolve_link_path(doc: &CadDocument, link: &DataLink) -> PathBuf {
+    // While a SecurePlan drawing is open, the files its data links name are
+    // never read or written (DSK-02).
+    #[cfg(feature = "secureplan")]
+    if !crate::app::secureplan::guards::external_resource_allowed(
+        crate::app::secureplan::guards::ExternalResource::DataLink,
+    ) {
+        return PathBuf::new();
+    }
     let stored = PathBuf::from(&link.connection_string);
     let resolved = if stored.is_absolute() || link.path_option == 1 {
         stored
@@ -380,6 +388,9 @@ pub(crate) fn data_link_write_path(
         return Err(crate::t!("Writing to this data link is disabled.").into_owned());
     }
     let path = resolve_link_path(doc, link);
+    if path.as_os_str().is_empty() {
+        return Err(crate::t!("This data link cannot be written.").into_owned());
+    }
     let writable = path
         .extension()
         .and_then(|value| value.to_str())
@@ -1373,6 +1384,15 @@ impl OpenCADStudio {
     pub(super) fn on_data_extraction_finish(&mut self) -> Task<Message> {
         self.update_extraction_preview();
         if !self.data_extraction.error.is_empty() {
+            return Task::none();
+        }
+        // Nothing extracted from a SecurePlan drawing is written to a file
+        // (DSK-03); a table placed in the drawing is fine.
+        #[cfg(feature = "secureplan")]
+        if (self.data_extraction.output_file || !self.data_extraction.settings_path.trim().is_empty())
+            && self.secureplan_refuse_save(self.active_tab)
+        {
+            self.data_extraction.error = crate::t!("A SecurePlan drawing is not written to files.").into_owned();
             return Task::none();
         }
         if let Err(error) = save_extraction_settings(&self.data_extraction) {

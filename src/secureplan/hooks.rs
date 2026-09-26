@@ -8,8 +8,14 @@
 //! - `src/app/mod.rs`: the `Message::SecurePlan` variant, the `secureplan`
 //!   state field, the window title, and booting without the editor window;
 //! - `src/app/update/mod.rs`: `Message::SecurePlan` dispatch, keyboard
-//!   capture while a SecurePlan dialog is open, and the prompt window's close
-//!   button;
+//!   capture while a SecurePlan dialog is open, the prompt window's close
+//!   button, and refusing Save, Save As, plotting, printing and exports for a
+//!   bound document;
+//! - `src/app/update/file.rs`: no save of a bound document, a recovery copy
+//!   instead of its autosave, and recovery copies kept on exit;
+//! - `src/app/update/command.rs`: closing a bound document (Apply, Discard or
+//!   Keep);
+//! - `src/io/mod.rs`: the entity admission limit (DSK-01);
 //! - `src/app/view/mod.rs`: the subscription, the prompt-only window, the
 //!   viewport overlay layer and the dialog layer above the in-canvas modals;
 //! - `src/app/startup.rs`, `src/ui/window/options.rs`,
@@ -39,6 +45,7 @@ use super::redact::Redacted;
 use super::settings::{self, Settings};
 use super::trust::{Decision, PromptButton, Trust};
 use super::ui::trust_dialog::{self, DialogKey};
+use super::ui::{Action, Dialog};
 use crate::app::{Message, OpenCADStudio};
 
 /// Messages routed to the SecurePlan integration.
@@ -51,6 +58,23 @@ pub enum Msg {
     DialogKey(DialogKey),
     /// A link-started process has waited as long as its pairings can live.
     ColdStartExpired,
+    /// Periodic while a SecurePlan document is open: `sessionState` changes,
+    /// progress and notices.
+    Tick,
+    /// A drawing finished loading on a worker.
+    Loaded(super::import::LoadDone),
+    /// Apply's outputs finished building on a worker.
+    ApplyBuilt(super::session::ApplyBuilt),
+    /// The import file dialog closed (tab id, chosen file).
+    ImportPicked(u64, Option<Redacted<PathBuf>>),
+    /// Mouse input in a dialog field.
+    FormInput(usize, String),
+    FormCycle(usize),
+    /// A dialog button.
+    Action(Action),
+    /// A `secureplan-test` stdin driver command.
+    #[cfg(feature = "secureplan-test")]
+    Driver(super::testdriver::Command),
 }
 
 /// SecurePlan state held by the application.
@@ -70,20 +94,106 @@ pub struct State {
     pub cold_start: bool,
     /// The window showing only the trust prompt while there is no editor window.
     pub prompt_window: Option<iced::window::Id>,
+    /// Bound documents and their sessions (DSK-03, BRG-05).
+    pub sessions: super::session::Sessions,
+    /// The SecurePlan dialog showing, if any (below the trust prompt).
+    pub dialog: Option<Dialog>,
+    pub recovery: super::recovery::Store,
+    /// Whether the read-only design overlay is drawn (OVL-01).
+    pub overlay_visible: bool,
+    pub next_job: u64,
+    /// Per bound tab, the load or import whose result is awaited; any other
+    /// result for that tab is dropped.
+    pub load_jobs: std::collections::HashMap<u64, u64>,
+    /// Per bound tab: whether a parser worker is running, and the latest
+    /// load waiting for it (older waiting loads are dropped unstarted).
+    pub loads_running: std::collections::HashSet<u64>,
+    pub loads_pending: std::collections::HashMap<u64, super::import::PendingLoad>,
+    /// Worker jobs (parses, Apply builds) still running. While any runs,
+    /// external references stay refused even if every bound tab closed.
+    pub workers: usize,
+    /// How long a message may wait for a transfer before the session is
+    /// ended (tests shorten it).
+    pub transfer_wait: Duration,
+    /// Unit tests stand in for the import file picker with this file.
+    #[cfg(test)]
+    pub test_pick: Option<PathBuf>,
+    /// Unit tests can hold worker jobs to interleave their completions.
+    #[cfg(test)]
+    pub held_jobs: Option<HeldJobs>,
+    /// A notice for the command line once the editor runs (expired recovery copies).
+    pub notice: Option<String>,
+    /// The main window is closing and SecurePlan drawings are being decided.
+    pub quitting: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
         let settings_path = settings::path();
-        Self {
-            command_guard: CommandGuard::default(),
+        let mut command_guard = CommandGuard::default();
+        for verb in super::session::REFUSED_COMMANDS {
+            command_guard.refuse(verb);
+        }
+        let mut state = Self {
+            command_guard,
             settings: settings_path.as_deref().map(Settings::load_from).unwrap_or_default(),
             settings_path,
             trust: Trust::default(),
             bridge: None,
             cold_start: COLD_START.load(Ordering::SeqCst),
             prompt_window: None,
+            sessions: Default::default(),
+            dialog: None,
+            recovery: Default::default(),
+            overlay_visible: true,
+            next_job: 0,
+            load_jobs: Default::default(),
+            loads_running: Default::default(),
+            loads_pending: Default::default(),
+            workers: 0,
+            transfer_wait: super::session::TRANSFER_WAIT,
+            #[cfg(test)]
+            test_pick: None,
+            #[cfg(test)]
+            held_jobs: None,
+            notice: None,
+            quitting: false,
+        };
+        // Recovery copies older than 30 days go, with a notice (DSK-03).
+        // Unit tests never touch the user's folder.
+        if !cfg!(test) {
+            let deleted = state.recovery.sweep(std::time::SystemTime::now());
+            if deleted > 0 {
+                state.notice = Some(format!(
+                    "SecurePlan: {deleted} recovery cop{} older than 30 days {} deleted.",
+                    if deleted == 1 { "y" } else { "ies" },
+                    if deleted == 1 { "was" } else { "were" }
+                ));
+            }
         }
+        state
+    }
+}
+
+/// Worker jobs a unit test holds, to run them later in a chosen order.
+#[cfg(test)]
+#[derive(Default)]
+pub struct HeldJobs(pub Vec<Box<dyn FnOnce() -> Msg + Send>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for HeldJobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldJobs({})", self.0.len())
+    }
+}
+
+#[cfg(test)]
+impl OpenCADStudio {
+    /// Run held job `index` and deliver its result.
+    pub(crate) fn secureplan_release_job(&mut self, index: usize) -> Task<Message> {
+        let job = self.secureplan.held_jobs.as_mut().expect("jobs are held").0.remove(index);
+        let message = job();
+        self.secureplan_update(message)
     }
 }
 
@@ -184,15 +294,23 @@ fn bridge_events() -> impl iced::futures::Stream<Item = Message> {
     })
 }
 
+#[cfg(feature = "secureplan-test")]
+fn driver_commands() -> impl iced::futures::Stream<Item = Message> {
+    forward(super::testdriver::take_commands(), |command| Message::SecurePlan(Msg::Driver(command)))
+}
+
 fn launches() -> impl iced::futures::Stream<Item = Message> {
     let receiver = inbox().receiver.lock().unwrap_or_else(|e| e.into_inner()).take();
     forward(receiver, |url| Message::SecurePlan(Msg::Launch(url.into())))
 }
 
-fn dialog_key(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+fn dialog_key(event: iced::Event, status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
     match event {
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-            DialogKey::from_key(&key, modifiers).map(|key| Message::SecurePlan(Msg::DialogKey(key)))
+            let key = DialogKey::from_key(&key, modifiers)?;
+            // A text field focused with the mouse already took the typing.
+            let typed = matches!(key, DialogKey::Char(_) | DialogKey::Backspace);
+            (!(typed && status == iced::event::Status::Captured)).then_some(Message::SecurePlan(Msg::DialogKey(key)))
         }
         _ => None,
     }
@@ -203,17 +321,69 @@ impl OpenCADStudio {
         match msg {
             Msg::Launch(url) => self.secureplan_launch(url.expose()),
             Msg::TrustAnswer(accept) => self.secureplan_answer_trust(accept),
-            Msg::DialogKey(key) => match key {
-                DialogKey::Next | DialogKey::Previous => {
+            Msg::DialogKey(key) if self.secureplan.trust.prompt().is_some() => match key {
+                DialogKey::Next | DialogKey::Previous | DialogKey::Left | DialogKey::Right => {
                     self.secureplan.trust.move_focus();
                     Task::none()
                 }
-                DialogKey::Activate => {
+                DialogKey::Activate | DialogKey::Space => {
                     let accept = self.secureplan.trust.prompt().is_some_and(|p| p.focus == PromptButton::Trust);
                     self.secureplan_answer_trust(accept)
                 }
                 DialogKey::Cancel => self.secureplan_answer_trust(false),
+                DialogKey::Char(_) | DialogKey::Backspace => Task::none(),
             },
+            Msg::DialogKey(key) => {
+                let action = self.secureplan.dialog.as_mut().and_then(|dialog| dialog.form_mut().key(key));
+                self.secureplan_refresh_dialog();
+                match action {
+                    Some(action) => self.secureplan_action(action),
+                    None => Task::none(),
+                }
+            }
+            Msg::FormInput(index, value) => {
+                if let Some(dialog) = self.secureplan.dialog.as_mut() {
+                    dialog.form_mut().set_text(index, value);
+                    dialog.form_mut().focus = index;
+                }
+                Task::none()
+            }
+            Msg::FormCycle(index) => {
+                if let Some(dialog) = self.secureplan.dialog.as_mut() {
+                    dialog.form_mut().cycle(index, true);
+                    dialog.form_mut().focus = index;
+                }
+                self.secureplan_refresh_dialog();
+                Task::none()
+            }
+            Msg::Action(action) => self.secureplan_action(action),
+            Msg::Tick => {
+                if let Some(notice) = self.secureplan.notice.take() {
+                    self.command_line.push_info(&notice);
+                }
+                self.secureplan_expire_waiting();
+                self.secureplan_report_states();
+                Task::none()
+            }
+            Msg::Loaded(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_loaded(done)
+            }
+            Msg::ApplyBuilt(built) => {
+                self.secureplan_worker_done();
+                self.secureplan_apply_built(built)
+            }
+            Msg::ImportPicked(tab_id, Some(path)) => {
+                // The tab the picker was opened for, if it may still import.
+                if let Err(reason) = self.secureplan_can_edit_tab(tab_id) {
+                    self.command_line.push_error(&reason);
+                    return Task::none();
+                }
+                self.secureplan_import_path(tab_id, path.expose())
+            }
+            Msg::ImportPicked(_, None) => Task::none(),
+            #[cfg(feature = "secureplan-test")]
+            Msg::Driver(command) => self.secureplan_driver(command),
             Msg::Bridge(event) => self.secureplan_bridge_event(event),
             // Nothing opened in time: leave without ever showing the editor.
             Msg::ColdStartExpired if self.main_window.is_none() => self.exit_app(),
@@ -251,7 +421,36 @@ impl OpenCADStudio {
 
     /// The prompt-only window's close button declines, like Escape.
     pub(crate) fn secureplan_window_close_requested(&mut self, id: iced::window::Id) -> Option<Task<Message>> {
-        (self.secureplan.prompt_window == Some(id)).then(|| self.secureplan_answer_trust(false))
+        if self.secureplan.prompt_window == Some(id) {
+            return Some(self.secureplan_answer_trust(false));
+        }
+        if self.main_window != Some(id) {
+            return None;
+        }
+        // Quitting: each SecurePlan drawing with unapplied work is decided
+        // first (Apply, Discard or Keep, DSK-03); then the upstream prompt
+        // handles any other unsaved drawing.
+        match (0..self.tabs.len()).find(|&index| self.secureplan_has_unapplied(index)) {
+            Some(index) => {
+                self.secureplan.quitting = true;
+                self.active_tab = index;
+                let tab_id = self.tabs[index].id;
+                self.secureplan_open_close_dialog(tab_id);
+                Some(Task::none())
+            }
+            None => {
+                self.secureplan.quitting = false;
+                None
+            }
+        }
+    }
+
+    /// After a bound tab closed during a quit, go on quitting.
+    fn secureplan_continue_quit(&mut self, closed: Task<Message>) -> Task<Message> {
+        match (self.secureplan.quitting, self.main_window) {
+            (true, Some(id)) => Task::batch([closed, Task::done(Message::WindowCloseRequested(id))]),
+            _ => closed,
+        }
     }
 
     /// The view of a SecurePlan-owned window, if `id` is one.
@@ -266,7 +465,7 @@ impl OpenCADStudio {
         })
     }
 
-    fn secureplan_bridge(&mut self) -> Option<Arc<Bridge>> {
+    pub(crate) fn secureplan_bridge(&mut self) -> Option<Arc<Bridge>> {
         if self.secureplan.bridge.is_none() {
             self.secureplan.bridge = bridge::global_arc();
             self.secureplan_sync_trust();
@@ -356,44 +555,193 @@ impl OpenCADStudio {
 
     fn secureplan_bridge_event(&mut self, event: BridgeEvent) -> Task<Message> {
         match event {
-            BridgeEvent::Opened { origin, .. } => {
+            BridgeEvent::Opened { session, origin, survey, intent, needs_confirmation } => {
                 self.command_line.push_info(&format!("SecurePlan: connected to {origin}."));
+                if needs_confirmation {
+                    // Re-pairing to a drawing that is open here (BRG-05).
+                    self.secureplan.dialog = Some(Dialog::choice(
+                        "Reconnect this drawing?",
+                        vec![format!("{origin} wants to reconnect a SecurePlan drawing that is open here.")],
+                        vec![
+                            ("Reconnect".to_string(), Action::Repair(session, true)),
+                            ("Don't reconnect".to_string(), Action::Repair(session, false)),
+                        ],
+                    ));
+                }
+                self.secureplan_session_opened(session, origin, survey, intent);
                 // The editor appears once there is a session to work in.
                 if self.secureplan_windowless() {
                     return Task::batch([self.open_main_window(), self.focus_cmd_input()]);
                 }
             }
-            BridgeEvent::Closed { .. } => self.command_line.push_info("SecurePlan: disconnected."),
-            // Session messages and transfers are handled by the session tasks.
-            BridgeEvent::Message { .. } | BridgeEvent::Transfer { .. } => {}
+            BridgeEvent::Closed { session, .. } => {
+                if self.secureplan.sessions.by_session_mut(session).is_some() {
+                    self.command_line.push_info("SecurePlan: disconnected. Your edits stay here; open the survey from SecurePlan again to Apply them.");
+                } else {
+                    self.command_line.push_info("SecurePlan: disconnected.");
+                }
+                self.secureplan_session_closed(session);
+            }
+            BridgeEvent::Message { session, message } => {
+                if let super::protocol::Inbound::Session { kind, request_id, body } = message {
+                    return self.secureplan_message(session, kind, request_id, body);
+                }
+            }
+            BridgeEvent::Transfer { session, transfer } => return self.secureplan_transfer(session, transfer),
         }
         Task::none()
     }
 
     pub(crate) fn secureplan_subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![Subscription::run(bridge_events), Subscription::run(launches)];
+        #[cfg(feature = "secureplan-test")]
+        subscriptions.push(Subscription::run(driver_commands));
         if self.secureplan_dialog_open() {
             subscriptions.push(iced::event::listen_with(dialog_key));
+        }
+        if !self.secureplan.sessions.bound.is_empty() || self.secureplan.notice.is_some() || !self.secureplan.sessions.deferred.is_empty() {
+            subscriptions.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::SecurePlan(Msg::Tick)));
         }
         Subscription::batch(subscriptions)
     }
 
     /// Whether a SecurePlan dialog owns the keyboard.
     pub(crate) fn secureplan_dialog_open(&self) -> bool {
-        self.secureplan.trust.prompt().is_some()
+        self.secureplan.trust.prompt().is_some() || self.secureplan.dialog.is_some()
     }
 
     /// Non-entity layer drawn over the drawing viewport, below the viewport's
-    /// input layers. `None` draws nothing.
+    /// input layers: the read-only design overlay (OVL-01). `None` draws
+    /// nothing.
     pub(crate) fn secureplan_viewport_overlay(&self) -> Option<Element<'_, Message>> {
-        None
+        self.secureplan_overlay_layer()
     }
 
     /// SecurePlan dialogs stacked above the editor and its in-canvas modals.
     pub(crate) fn secureplan_view_layer<'a>(&'a self, base: Element<'a, Message>) -> Element<'a, Message> {
-        match self.secureplan.trust.prompt() {
-            Some(prompt) => trust_dialog::view(base, prompt),
-            None => base,
+        match (self.secureplan.trust.prompt(), &self.secureplan.dialog) {
+            (Some(prompt), _) => trust_dialog::view(base, prompt),
+            (None, Some(dialog)) => super::ui::view(base, dialog),
+            (None, None) => base,
+        }
+    }
+
+    /// Run `work` off the UI thread and handle its message when it is done.
+    /// Unit tests run it at once, on their own thread.
+    pub(crate) fn secureplan_run_job<F>(&mut self, work: F) -> Task<Message>
+    where
+        F: FnOnce() -> Msg + Send + 'static,
+    {
+        // References stay refused for the worker's whole life (DSK-02).
+        self.secureplan.workers += 1;
+        self.secureplan_refresh_guards();
+        #[cfg(test)]
+        {
+            if let Some(held) = self.secureplan.held_jobs.as_mut() {
+                held.0.push(Box::new(work));
+                return Task::none();
+            }
+            let message = work();
+            self.secureplan_update(message)
+        }
+        #[cfg(not(test))]
+        {
+            let (sender, receiver) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(work());
+            });
+            Task::perform(async move { receiver.await.ok() }, |message| match message {
+                Some(message) => Message::SecurePlan(message),
+                None => Message::Noop,
+            })
+        }
+    }
+
+    /// A worker finished: references may be allowed again if nothing else
+    /// needs them refused.
+    fn secureplan_worker_done(&mut self) {
+        self.secureplan.workers = self.secureplan.workers.saturating_sub(1);
+        self.secureplan_refresh_guards();
+    }
+
+    /// Keep a form dialog's derived state in step with its fields.
+    fn secureplan_refresh_dialog(&mut self) {
+        if let Some(Dialog::Align(dialog)) = self.secureplan.dialog.as_mut() {
+            dialog.refresh();
+        }
+    }
+
+    /// Carry out a dialog button.
+    pub(crate) fn secureplan_action(&mut self, action: Action) -> Task<Message> {
+        // The dialog that asked closes, unless the action keeps it.
+        let keeps_dialog = matches!(action, Action::AlignConfirm | Action::ApplyConfirm | Action::ApplyReset);
+        if !keeps_dialog {
+            self.secureplan.dialog = None;
+        }
+        // Anything but Discard or Keep in the close prompt stops a quit and
+        // abandons a Close All.
+        if !matches!(action, Action::CloseDiscard(_) | Action::CloseKeep(_)) {
+            self.secureplan.quitting = false;
+            self.pending_tab_closes.clear();
+        }
+        match action {
+            Action::Dismiss => Task::none(),
+            Action::CancelLoad(tab_id) => {
+                self.secureplan_cancel_load(tab_id);
+                Task::none()
+            }
+            Action::CloseApply(tab_id) => {
+                if let Some(index) = self.secureplan_tab_index(tab_id) {
+                    self.active_tab = index;
+                }
+                self.secureplan_begin_apply()
+            }
+            Action::CloseDiscard(tab_id) => {
+                self.secureplan_discard_recovery(tab_id);
+                let closed = self.secureplan_close_tab(tab_id);
+                self.secureplan_continue_quit(closed)
+            }
+            Action::CloseKeep(tab_id) => {
+                let kept = self
+                    .secureplan_tab_index(tab_id)
+                    .is_some_and(|index| self.secureplan_keep_recovery(index) != super::session::Preserve::Failed);
+                if kept {
+                    let closed = self.secureplan_close_tab(tab_id);
+                    self.secureplan_continue_quit(closed)
+                } else {
+                    // Nothing closes without its copy.
+                    self.secureplan.quitting = false;
+                    self.pending_tab_closes.clear();
+                    self.secureplan.dialog = Some(Dialog::notice(
+                        "Not closed",
+                        vec!["The recovery copy could not be saved, so the drawing stays open with your edits.".into()],
+                    ));
+                    Task::none()
+                }
+            }
+            Action::RecoveryRestore(tab_id) => {
+                self.secureplan_restore_recovery(tab_id);
+                Task::none()
+            }
+            Action::RecoveryDiscard(tab_id) => {
+                self.secureplan_discard_recovery(tab_id);
+                Task::none()
+            }
+            Action::Repair(session, accept) => {
+                if let Some(bridge) = self.secureplan_bridge() {
+                    bridge.confirm(session, accept);
+                }
+                Task::none()
+            }
+            Action::Command(command) => self.dispatch_command(command),
+            Action::AlignConfirm => self.secureplan_confirm_align(),
+            Action::ApplyConfirm => self.secureplan_confirm_apply(),
+            Action::ApplyReset => {
+                if let Some(Dialog::Apply(dialog)) = self.secureplan.dialog.as_mut() {
+                    dialog.reset_window();
+                }
+                Task::none()
+            }
         }
     }
 
@@ -422,9 +770,27 @@ impl OpenCADStudio {
                     self.secureplan_sync_trust();
                     self.command_line.push_output(&format!("SecurePlan no longer trusts {origin}."));
                 }
+                // From the ribbon: list the trusted websites and start the
+                // command so the user types (or pastes) the one to revoke.
+                None => {
+                    let origins = &self.secureplan.settings.trusted_origins;
+                    if origins.is_empty() {
+                        self.command_line.push_output("SecurePlan trusts no websites.");
+                    } else {
+                        self.command_line.push_output(&format!("SecurePlan trusted websites: {}", origins.join(", ")));
+                        self.command_line.push_info("Type the website to revoke and press Enter.");
+                        self.command_line.input = "SECUREPLANREVOKE ".to_string();
+                        return Some(self.focus_cmd_input());
+                    }
+                }
                 _ => self.command_line.push_error("Usage: SECUREPLANREVOKE <trusted website origin>"),
             },
             "SECUREPLANDEVORIGINS" => match argument.map(str::to_ascii_uppercase).as_deref() {
+                // From the ribbon: toggle.
+                None => {
+                    let on = !self.secureplan.settings.developer_loopback_origins;
+                    return self.secureplan_dispatch(if on { "SECUREPLANDEVORIGINS ON" } else { "SECUREPLANDEVORIGINS OFF" });
+                }
                 Some(value @ ("ON" | "OFF")) => {
                     self.secureplan.settings.developer_loopback_origins = value == "ON";
                     self.secureplan_save_settings();
@@ -436,12 +802,30 @@ impl OpenCADStudio {
                 }
                 _ => self.command_line.push_error("Usage: SECUREPLANDEVORIGINS ON|OFF"),
             },
+            // The SecurePlan tab's buttons as a keyboard menu with visible focus.
+            "SECUREPLAN" => {
+                let mut buttons: Vec<(String, Action)> =
+                    super::ribbon::COMMANDS.iter().map(|(command, label, _)| (label.to_string(), Action::Command(command))).collect();
+                buttons.push(("Close".to_string(), Action::Dismiss));
+                self.secureplan.dialog = Some(Dialog::choice("SecurePlan", vec!["Choose a SecurePlan action.".to_string()], buttons));
+            }
+            "SECUREPLANIMPORT" => return Some(self.secureplan_start_import(self.tabs[self.active_tab].id)),
+            "SECUREPLANALIGN" => self.secureplan_open_align(false),
+            "SECUREPLANAPPLY" => return Some(self.secureplan_begin_apply()),
+            "SECUREPLANOVERLAY" => {
+                self.secureplan.overlay_visible = !self.secureplan.overlay_visible;
+                let state = if self.secureplan.overlay_visible { "shown" } else { "hidden" };
+                self.command_line.push_output(&format!("{}: {state}.", super::overlay::LABEL));
+            }
             _ => return None,
         }
         Some(Task::none())
     }
 
     pub(crate) fn secureplan_window_title(&self) -> String {
+        if let Some(title) = self.secureplan_window_title_for_bound() {
+            return title;
+        }
         let product = format!("{} {}", super::APP_NAME, super::VERSION);
         match self.tabs.get(self.active_tab) {
             Some(tab) => {
@@ -463,9 +847,12 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         app.automation_op(r#"{"op":"new"}"#);
         app.secureplan.settings = Settings::default();
+        // Each test its own settings folder: they run in parallel.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
         app.secureplan.settings_path = Some(
             std::env::temp_dir()
-                .join(format!("secureplan_hooks_{}_{}", std::process::id(), line!()))
+                .join(format!("secureplan_hooks_{}_{n}", std::process::id()))
                 .join("secureplan.json"),
         );
         app

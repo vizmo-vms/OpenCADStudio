@@ -79,28 +79,62 @@ impl CommandGuard {
 pub enum ExternalResource {
     /// An Xref drawing read from disk.
     Xref,
-    /// A raster image or underlay read from disk or fetched over the network.
+    /// A raster image, underlay, material texture or light profile read from
+    /// disk or fetched over the network.
     Image,
+    /// A table's data link: a spreadsheet or CSV file the drawing names, read
+    /// by DATALINKUPDATE and written by DATALINKUPDATE WRITE.
+    DataLink,
 }
 
 static REFUSE_XREF: AtomicBool = AtomicBool::new(false);
 static REFUSE_IMAGE: AtomicBool = AtomicBool::new(false);
+static REFUSE_DATA_LINK: AtomicBool = AtomicBool::new(false);
 
 fn flag(kind: ExternalResource) -> &'static AtomicBool {
     match kind {
         ExternalResource::Xref => &REFUSE_XREF,
         ExternalResource::Image => &REFUSE_IMAGE,
+        ExternalResource::DataLink => &REFUSE_DATA_LINK,
     }
 }
 
+// Unit tests run in parallel threads of one process, and many upstream tests
+// resolve images and Xrefs: a test that binds a SecurePlan document must not
+// refuse them for every other test. So in tests the setting is per thread.
+#[cfg(test)]
+thread_local! {
+    static TEST_REFUSED: std::cell::Cell<[bool; 3]> = const { std::cell::Cell::new([false; 3]) };
+}
+
+/// Tests that run alone in a child process set this to use the process-wide
+/// flags as the application does (code on other threads then sees them too).
+#[cfg(test)]
+pub(crate) static TEST_PROCESS_WIDE: AtomicBool = AtomicBool::new(false);
+
 /// Refuse (or allow again) every resolution of `kind`.
 pub fn set_external_resource_refused(kind: ExternalResource, refused: bool) {
+    #[cfg(test)]
+    if TEST_PROCESS_WIDE.load(Ordering::SeqCst) {
+        flag(kind).store(refused, Ordering::SeqCst);
+        return;
+    }
+    #[cfg(test)]
+    TEST_REFUSED.with(|cell| {
+        let mut flags = cell.get();
+        flags[kind as usize] = refused;
+        cell.set(flags);
+    });
+    #[cfg(not(test))]
     flag(kind).store(refused, Ordering::SeqCst);
 }
 
 /// Whether a reference of `kind` may be resolved. Consulted before any disk
 /// read or network request for it.
 pub fn external_resource_allowed(kind: ExternalResource) -> bool {
+    #[cfg(test)]
+    return !TEST_REFUSED.with(|cell| cell.get()[kind as usize]) && !flag(kind).load(Ordering::SeqCst);
+    #[cfg(not(test))]
     !flag(kind).load(Ordering::SeqCst)
 }
 
@@ -190,6 +224,60 @@ pub(crate) mod tests {
         set_external_resource_refused(ExternalResource::Image, false);
         assert!(refused.is_none(), "a refused image reference was resolved");
         assert!(crate::scene::model::image_model::resolve_image(&reference).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A drawing whose table links to `path`, as the link manager stores it.
+    fn data_link_drawing(path: &std::path::Path, writable: bool) -> (acadrust::CadDocument, acadrust::Handle) {
+        use acadrust::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
+        let mut doc = acadrust::CadDocument::new();
+        let handle = doc.allocate_handle();
+        let link = DataLink { connection_string: path.to_string_lossy().into_owned(), option: i32::from(writable), path_option: 1, ..Default::default() };
+        let mut object = ClassObject::new(ClassObjectData::DataLink(link));
+        object.handle = handle;
+        doc.objects.insert(handle, ObjectType::ClassObject(object));
+        (doc, handle)
+    }
+
+    #[test]
+    fn refused_data_links_are_never_read_or_written() {
+        let _lock = RESOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("datalink");
+        let csv = dir.join("linked.csv");
+        std::fs::write(&csv, "a,b\nc,d\n").unwrap();
+        // A local link reads and is writable while data links are allowed.
+        let (doc, handle) = data_link_drawing(&csv, true);
+        assert!(crate::app::annotation_data::read_data_link(&doc, handle).is_ok(), "the fixture link reads");
+        assert!(crate::app::annotation_data::data_link_write_path(&doc, handle).is_ok());
+        set_external_resource_refused(ExternalResource::DataLink, true);
+        let read = crate::app::annotation_data::read_data_link(&doc, handle);
+        let write = crate::app::annotation_data::data_link_write_path(&doc, handle);
+        set_external_resource_refused(ExternalResource::DataLink, false);
+        assert!(read.is_err(), "a refused link was read");
+        assert!(write.is_err(), "a refused link can be written");
+        // A link to another computer is never touched, refused or not.
+        let (doc, handle) = data_link_drawing(std::path::Path::new(&format!("/{}", csv.display())), true);
+        assert!(crate::app::annotation_data::read_data_link(&doc, handle).is_err());
+        assert!(crate::app::annotation_data::data_link_write_path(&doc, handle).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refused_material_textures_are_never_read() {
+        let _lock = RESOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("texture");
+        let path = dir.join("brick.png");
+        image::RgbaImage::new(2, 2).save(&path).unwrap();
+        let map = acadrust::objects::MaterialMap {
+            source: 1,
+            file_name: path.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        set_external_resource_refused(ExternalResource::Image, true);
+        let refused = crate::scene::model::material_model::load_map_image(&map, None);
+        set_external_resource_refused(ExternalResource::Image, false);
+        assert!(refused.is_none(), "a refused texture was read");
+        assert!(crate::scene::model::material_model::load_map_image(&map, None).is_some(), "the fixture texture loads");
         std::fs::remove_dir_all(&dir).ok();
     }
 

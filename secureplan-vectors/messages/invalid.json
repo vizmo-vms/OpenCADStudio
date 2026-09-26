@@ -297,6 +297,7 @@
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
         "overlayTransferId": 4,
+        "surveyEmpty": false,
         "leaseToken": "never"
       }
     },
@@ -377,7 +378,8 @@
         },
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
-        "overlayTransferId": 4
+        "overlayTransferId": 4,
+        "surveyEmpty": false
       }
     },
     {
@@ -456,7 +458,98 @@
         },
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
+        "overlayTransferId": 4,
+        "surveyEmpty": false
+      }
+    },
+    {
+      "name": "openSession-missing-surveyEmpty",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "openSession",
+        "requestId": "open-1",
+        "intent": "edit",
+        "mode": "edit",
+        "surveyLabel": "Synthetic survey – ground floor",
+        "cadPlan": {
+          "schemaVersion": 1,
+          "original": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "drawing": {
+            "fileId": "file-original",
+            "kind": "floor_plan",
+            "name": "synthetic-original.dxf",
+            "mimeType": "image/vnd.dxf",
+            "formatVersion": "AC1027",
+            "sha256": "d87709563931c1914348d16ffbbaaa63572a455ab2e8387b0172a41999d55c54"
+          },
+          "snap": {
+            "fileId": "file-snap",
+            "kind": "floor_plan",
+            "name": "synthetic.spsnap",
+            "mimeType": "application/vnd.secureplan.snap",
+            "sha256": "f3f3a31429164b3f077014172b0ba56442878a9ee73158f70961778895e03cbf"
+          },
+          "pdfSha256": "8bb9086ceedd944dd431991229c441cffdc65ca7e51d75f4b93f7ebf2e9541d3",
+          "view": {
+            "kind": "model",
+            "windowCad": [
+              0,
+              0,
+              30000,
+              18000
+            ]
+          },
+          "cadUnits": "mm",
+          "mapping": {
+            "cadOrigin": [
+              0,
+              18000
+            ],
+            "anchorMm": [
+              0,
+              0
+            ],
+            "scaleMmPerCadUnit": 1,
+            "quarterTurns": 0
+          },
+          "version": {
+            "number": 1,
+            "publishedAt": "2026-09-26T00:00:00.000Z",
+            "desktopVersion": "1.0.0",
+            "protocol": 1,
+            "forkCommit": "0d023d267bc5b7afeca3b54e98875b0efd4f3926"
+          }
+        },
+        "placement": {
+          "widthPt": 10000,
+          "heightPt": 6000,
+          "centerX": 15000,
+          "centerY": 9000,
+          "widthMm": 30000,
+          "heightMm": 18000
+        },
+        "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
+        "drawingTransferId": 3,
         "overlayTransferId": 4
+      }
+    },
+    {
+      "name": "overlayUpdate-surveyEmpty-not-boolean",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "overlayUpdate",
+        "requestId": "ovl-1",
+        "overlayTransferId": 21,
+        "surveyEmpty": "true"
       }
     },
     {
@@ -535,7 +628,8 @@
         },
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
-        "overlayTransferId": 4
+        "overlayTransferId": 4,
+        "surveyEmpty": false
       }
     },
     {
@@ -614,7 +708,8 @@
         },
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
-        "overlayTransferId": 4
+        "overlayTransferId": 4,
+        "surveyEmpty": false
       }
     },
     {
@@ -693,7 +788,8 @@
         },
         "baseIdentity": "221bbc1c061a608c3c3f6dd11825b38060755cf4225abe8f419328376b538ff9",
         "drawingTransferId": 3,
-        "overlayTransferId": 4
+        "overlayTransferId": 4,
+        "surveyEmpty": false
       }
     },
     {

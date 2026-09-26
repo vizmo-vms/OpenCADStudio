@@ -43,7 +43,7 @@ Canonical synthetic vectors shared by the SecurePlan web app and the SecurePlan 
 
 ## Messages
 
-Every control message has `type` and `requestId`. Responses (`applyProgress`, `applyResult`, `convertResult`, `exportResult`) reuse the request's `requestId`. Unknown types or fields are rejected, as are the `semantic` rules in `messages/invalid.json`: JSON payload size, page area ≤ 64,000,000 pt², and `heightMm = heightPt · widthMm / widthPt` within 1e-6 relative.
+Every control message has `type` and `requestId`. Responses (`applyProgress`, `applyResult`, `convertResult`, `exportResult`) reuse the request's `requestId`. `openSession` and `overlayUpdate` carry a required boolean `surveyEmpty`: true only when the web draft the overlay was built from has no design elements and no comments, the CON-03/PUB-02 empty survey. The desktop uses it, not the overlay, to decide empty-survey placement, because comments are not in the overlay. The web sends `overlayUpdate` again whenever that emptiness changes. Unknown types or fields are rejected, as are the `semantic` rules in `messages/invalid.json`: JSON payload size, page area ≤ 64,000,000 pt², and `heightMm = heightPt · widthMm / widthPt` within 1e-6 relative.
 
 ## Page placement and SPSNAP
 
