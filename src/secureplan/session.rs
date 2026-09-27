@@ -295,6 +295,9 @@ pub struct Bound {
     pub plan_alignment: Option<Alignment>,
     /// `convertRequest`s waiting for their `convertResult`.
     pub converts: Vec<String>,
+    /// The conversion whose candidates are being assembled: it owns
+    /// `busy: convert`.
+    pub convert_job: Option<u64>,
     /// The CAD export under way, if any (EXP-01..03).
     pub export: Option<super::export::ExportJob>,
     /// The user re-aligned a plan that already had a stored mapping.
@@ -344,6 +347,7 @@ impl Bound {
             alignment: None,
             plan_alignment: None,
             converts: Vec::new(),
+            convert_job: None,
             export: None,
             realigned: false,
             busy: None,
@@ -618,6 +622,7 @@ impl OpenCADStudio {
             bound.busy = None;
             bound.apply = None;
             bound.converts.clear();
+            bound.convert_job = None;
             bound.last_state = None;
             let tab_id = bound.tab_id;
             // An export answers its session only: it ends with it.
@@ -832,6 +837,7 @@ impl OpenCADStudio {
             bound.last_state = None;
             bound.apply = None;
             bound.converts.clear();
+            bound.convert_job = None;
             if keep_local {
                 bound.plan_version = meta.plan_version;
                 bound.has_plan = meta.has_plan;
@@ -1228,10 +1234,22 @@ impl OpenCADStudio {
         let origin = dialog.origin;
         self.secureplan_report_states();
         self.command_line.push_info("SecurePlan: preparing the drawing, PDF and snap file…");
-        self.secureplan_run_job(move || {
-            let result = super::publish::build_outputs(&snapshot, &plan);
-            super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
-        })
+        let failed = super::Msg::ApplyBuilt(ApplyBuilt {
+            tab_id,
+            origin: origin.clone(),
+            snapshot_revision,
+            plan: plan.clone(),
+            alignment,
+            realigned,
+            result: super::Carry::new(Err(super::publish::ApplyError::new(ErrorCode::Internal, "Preparing the outputs stopped unexpectedly."))),
+        });
+        self.secureplan_run_job(
+            move || {
+                let result = super::publish::build_outputs(&snapshot, &plan);
+                super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
+            },
+            failed,
+        )
     }
 
     /// The outputs are ready: send them and `applyRequest`, or report why not.
@@ -2204,6 +2222,29 @@ pub(crate) mod tests {
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))));
         h.key(DialogKey::Activate);
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "the Apply dialog follows");
+    }
+
+    #[test]
+    fn a_worker_that_fails_never_leaves_the_survey_busy() {
+        // Apply: the build's worker panics; Apply stops and can run again.
+        let mut h = Harness::new("worker_panic");
+        h.open_dxf();
+        align_and_open_apply(&mut h);
+        h.app.secureplan.test_panic_next_job = true;
+        h.key(DialogKey::Activate);
+        assert!(h.bound().busy.is_none(), "Apply is not busy for good");
+        assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Choice { title, .. }) if title == "Apply stopped"));
+        assert_eq!(h.app.secureplan.workers, 0, "the worker is counted as done");
+        let _ = h.receive("sessionState");
+        h.app.secureplan.dialog = None;
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "Apply can start again");
+        // A load: its parser panics; the survey is not left loading.
+        let mut h = Harness::new("worker_panic_load");
+        h.app.secureplan.test_panic_next_job = true;
+        h.open_dxf();
+        assert!(h.bound().busy.is_none());
+        assert_eq!(h.bound().error, Some(ErrorCode::Internal));
     }
 
     #[test]

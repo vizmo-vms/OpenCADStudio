@@ -129,27 +129,48 @@ impl OpenCADStudio {
         else {
             return iced::Task::none();
         };
-        // The selection is cut on this thread within a fixed budget; the
-        // candidates are assembled on a worker.
-        let scene = &self.tabs[self.active_tab].scene;
-        let pieces = convert::pieces(scene, &scene.selected, &mapping);
-        let origin = convert::Origin { session, base_identity: base, generation, revision: self.tabs[self.active_tab].edit_revision };
+        // The drawing and selection as they are now; the cutting and the
+        // assembly run on a worker, within their budgets.
+        let tab = &self.tabs[self.active_tab];
+        let snapshot = convert::Snapshot {
+            document: tab.scene.document.clone(),
+            annotation_scale: tab.scene.annotation_scale,
+            selected: tab.scene.selected.iter().copied().collect(),
+            mapping,
+        };
+        self.secureplan.next_job += 1;
+        let origin = convert::Origin { job: self.secureplan.next_job, session, base_identity: base, generation, revision: tab.edit_revision };
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
             bound.busy = Some(crate::app::secureplan::session::Busy { operation: "convert", progress: None });
+            bound.convert_job = Some(origin.job);
         }
         self.secureplan_report_states();
-        self.secureplan_run_job(move || {
-            let result = convert::assemble(&pieces, kind);
-            crate::app::secureplan::Msg::Converted(convert::Done { tab_id, kind, origin, mapping, result: crate::app::secureplan::Carry::new(result) })
-        })
+        let failed = crate::app::secureplan::Msg::Converted(convert::Done {
+            tab_id,
+            kind,
+            origin: origin.clone(),
+            mapping,
+            result: crate::app::secureplan::Carry::new(Err(convert::Refusal::failed())),
+        });
+        self.secureplan_run_job(
+            move || {
+                let result = convert::prepare(&snapshot, kind);
+                crate::app::secureplan::Msg::Converted(convert::Done { tab_id, kind, origin, mapping, result: crate::app::secureplan::Carry::new(result) })
+            },
+            failed,
+        )
     }
 
     /// The candidates are ready: send them if nothing changed meanwhile.
     pub(crate) fn secureplan_converted(&mut self, done: convert::Done) -> iced::Task<crate::app::Message> {
         let (tab_id, kind, mapping) = (done.tab_id, done.kind, done.mapping);
         let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) else { return iced::Task::none() };
-        if bound.busy.is_some_and(|busy| busy.operation == "convert") {
-            bound.busy = None;
+        // Only this conversion's own busy state ends here: a later one may be running.
+        if bound.convert_job == Some(done.origin.job) {
+            bound.convert_job = None;
+            if bound.busy.is_some_and(|busy| busy.operation == "convert") {
+                bound.busy = None;
+            }
         }
         let Some(result) = done.result.take() else { return iced::Task::none() };
         let current = self.secureplan_tab_index(tab_id).is_some_and(|index| {
@@ -437,6 +458,77 @@ mod tests {
             assert!(!seen.iter().any(|t| t == "convertRequest"), "{change}: {seen:?}");
             assert!(h.bound().busy.is_none_or(|b| b.operation != "convert"), "{change}");
         }
+    }
+
+    #[test]
+    fn a_failed_conversion_worker_ends_the_conversion() {
+        let mut h = applied("convert_panic");
+        select_corner(&mut h);
+        h.app.secureplan.test_panic_next_job = true;
+        let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
+        assert!(h.bound().busy.is_none(), "not busy for good");
+        assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Choice { title, .. }) if title == "Not converted"));
+        assert!(h.bound().converts.is_empty());
+        h.app.secureplan.dialog = None;
+        let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
+        let (request, _) = h.receive("convertRequest");
+        assert_eq!(request["candidates"]["kind"], "walls", "a conversion can run again");
+    }
+
+    #[test]
+    fn a_late_conversion_leaves_the_running_ones_busy_state_alone() {
+        let mut h = applied("convert_busy_owner");
+        select_corner(&mut h);
+        h.hold_jobs();
+        // Conversion A, then the survey re-pairs and conversion B starts.
+        let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
+        let mut plan = crate::app::secureplan::session::tests::sample("openSession-edit")["cadPlan"].clone();
+        plan["mapping"] = json!({ "cadOrigin": [0.0, 18000.0], "anchorMm": [0.0, 0.0], "scaleMmPerCadUnit": 1.0, "quarterTurns": 0 });
+        plan["cadUnits"] = json!("mm");
+        h.pair_again_overtaking(51);
+        h.open(Some(("synthetic.dxf", crate::app::secureplan::session::Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", plan, BASE, "edit");
+        h.release(h.held() - 1);
+        select_corner(&mut h);
+        let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
+        assert_eq!(h.held(), 2, "A and B both running");
+        // A finishes late: B still owns the busy state, and nothing of A is sent.
+        h.release(0);
+        assert_eq!(h.bound().busy.map(|b| b.operation), Some("convert"), "B is still running");
+        assert!(h.app.secureplan_can_convert().is_err(), "a third conversion still waits for B");
+        assert!(h.bound().converts.is_empty());
+        // B finishes: sent, and the tab is idle.
+        h.release(0);
+        assert_eq!(h.bound().converts.len(), 1);
+        assert!(h.bound().busy.is_none());
+        let (request, _) = h.receive("convertRequest");
+        assert_eq!(request["candidates"]["kind"], "walls");
+        h.deliver_held_close();
+    }
+
+    #[test]
+    fn the_selection_is_cut_on_the_worker_not_while_starting() {
+        // A spline cut into 150,000 points: starting the conversion only
+        // copies the drawing; the cutting happens in the worker.
+        let mut h = applied("convert_off_thread");
+        let index = h.app.active_tab;
+        let handle = h.app.tabs[index].scene.add_entity(crate::app::secureplan::convert::tests::many_knots(150_000));
+        h.app.tabs[index].scene.select_entities(&[handle]);
+        // Adding the spline was an edit: take it into the survey's plan.
+        let revision = h.app.tabs[index].edit_revision;
+        h.app.tabs[index].dirty = false;
+        let tab_id = h.tab_id();
+        if let Some(bound) = h.app.secureplan.sessions.by_tab_mut(tab_id) {
+            bound.clean_revision = revision;
+        }
+        h.hold_jobs();
+        let started = std::time::Instant::now();
+        let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
+        let starting = started.elapsed();
+        let started = std::time::Instant::now();
+        h.release(0);
+        let working = started.elapsed();
+        assert!(starting * 4 < working, "starting took {starting:?}, the worker {working:?}");
+        assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Choice { title, .. }) if title == "Not converted"), "over the wall limit");
     }
 
     #[test]

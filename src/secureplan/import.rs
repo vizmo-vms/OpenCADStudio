@@ -329,11 +329,23 @@ impl OpenCADStudio {
     fn secureplan_start_load(&mut self, tab_id: u64, load: PendingLoad) -> Task<Message> {
         self.secureplan.loads_running.insert(tab_id);
         let PendingLoad { job, generation, session, drawing, purpose } = load;
-        self.secureplan_run_job(move || {
-            let name = drawing.name.expose().clone();
-            let result = load_drawing(&name, drawing.bytes.as_ref().clone());
-            super::Msg::Loaded(LoadDone { job, tab_id, purpose, generation, session, drawing, result: super::Carry::new(result) })
-        })
+        let failed = super::Msg::Loaded(LoadDone {
+            job,
+            tab_id,
+            purpose,
+            generation,
+            session,
+            drawing: drawing.clone(),
+            result: super::Carry::new(Err(ImportError::new(ErrorCode::Internal, "Reading the drawing stopped unexpectedly."))),
+        });
+        self.secureplan_run_job(
+            move || {
+                let name = drawing.name.expose().clone();
+                let result = load_drawing(&name, drawing.bytes.as_ref().clone());
+                super::Msg::Loaded(LoadDone { job, tab_id, purpose, generation, session, drawing, result: super::Carry::new(result) })
+            },
+            failed,
+        )
     }
 
     pub(crate) fn secureplan_loaded(&mut self, done: LoadDone) -> Task<Message> {

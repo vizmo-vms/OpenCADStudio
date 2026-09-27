@@ -135,6 +135,9 @@ pub struct State {
     /// with no file waits in `Saving`.
     #[cfg(test)]
     pub test_hold_save: bool,
+    /// Unit tests make the next worker job panic.
+    #[cfg(test)]
+    pub test_panic_next_job: bool,
     /// A notice for the command line once the editor runs (expired recovery copies).
     pub notice: Option<String>,
     /// The main window is closing and SecurePlan drawings are being decided.
@@ -172,6 +175,8 @@ impl Default for State {
             held_jobs: None,
             #[cfg(test)]
             test_hold_save: false,
+            #[cfg(test)]
+            test_panic_next_job: false,
             notice: None,
             quitting: false,
         };
@@ -662,8 +667,10 @@ impl OpenCADStudio {
     }
 
     /// Run `work` off the UI thread and handle its message when it is done.
-    /// Unit tests run it at once, on their own thread.
-    pub(crate) fn secureplan_run_job<F>(&mut self, work: F) -> Task<Message>
+    /// If `work` panics, `failed` is delivered instead, so the operation it
+    /// belongs to always ends (never busy for good). Unit tests run it at
+    /// once, on their own thread.
+    pub(crate) fn secureplan_run_job<F>(&mut self, work: F, failed: Msg) -> Task<Message>
     where
         F: FnOnce() -> Msg + Send + 'static,
     {
@@ -671,19 +678,31 @@ impl OpenCADStudio {
         self.secureplan.workers += 1;
         self.secureplan_refresh_guards();
         #[cfg(test)]
+        let test_panic = std::mem::take(&mut self.secureplan.test_panic_next_job);
+        let guarded = move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                #[cfg(test)]
+                if test_panic {
+                    panic!("a worker failed (test)");
+                }
+                work()
+            }))
+            .unwrap_or(failed)
+        };
+        #[cfg(test)]
         {
             if let Some(held) = self.secureplan.held_jobs.as_mut() {
-                held.0.push(Box::new(work));
+                held.0.push(Box::new(guarded));
                 return Task::none();
             }
-            let message = work();
+            let message = guarded();
             self.secureplan_update(message)
         }
         #[cfg(not(test))]
         {
             let (sender, receiver) = iced::futures::channel::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = sender.send(work());
+                let _ = sender.send(guarded());
             });
             Task::perform(async move { receiver.await.ok() }, |message| match message {
                 Some(message) => Message::SecurePlan(message),

@@ -200,10 +200,14 @@ impl OpenCADStudio {
         let snapshot = body["snapshot"].clone();
         self.secureplan_report_states();
         self.command_line.push_info("SecurePlan: preparing the CAD export…");
-        self.secureplan_run_job(move || {
-            let result = export::prepare(&drawing, &payload, &snapshot, &mapping);
-            Msg::ExportComposed(ComposeDone { tab_id, key, result: Carry::new(result) })
-        })
+        let failed = Msg::ExportComposed(ComposeDone { tab_id, key, result: Carry::new(Err("Preparing the export stopped unexpectedly.".into())) });
+        self.secureplan_run_job(
+            move || {
+                let result = export::prepare(&drawing, &payload, &snapshot, &mapping);
+                Msg::ExportComposed(ComposeDone { tab_id, key, result: Carry::new(result) })
+            },
+            failed,
+        )
     }
 
     /// Tab `tab_id`'s export job `key`, if it is still wanted: the tab is
@@ -317,10 +321,14 @@ impl OpenCADStudio {
         let (tab_id, key, document) = (dialog.tab_id, dialog.key, Arc::clone(&dialog.document));
         let Some(job) = self.secureplan_export_job(tab_id, key) else { return Task::none() };
         job.stage = Stage::Writing;
-        self.secureplan_run_job(move || {
-            let result = export::write(&document, format, version);
-            Msg::ExportWritten(WriteDone { tab_id, key, format, version, result: Carry::new(result) })
-        })
+        let failed = Msg::ExportWritten(WriteDone { tab_id, key, format, version, result: Carry::new(Err(WriteError::Writer)) });
+        self.secureplan_run_job(
+            move || {
+                let result = export::write(&document, format, version);
+                Msg::ExportWritten(WriteDone { tab_id, key, format, version, result: Carry::new(result) })
+            },
+            failed,
+        )
     }
 
     /// Cancel: nothing is written.
@@ -400,10 +408,14 @@ impl OpenCADStudio {
         };
         job.stage = Stage::Storing;
         let name = export::result_name(&path);
-        self.secureplan_run_job(move || {
-            let saved = std::fs::write(&path, bytes.as_ref()).is_ok();
-            Msg::ExportSaved(SaveDone { tab_id, key, name, format, version, saved })
-        })
+        let failed = Msg::ExportSaved(SaveDone { tab_id, key, name: name.clone(), format, version, saved: false });
+        self.secureplan_run_job(
+            move || {
+                let saved = std::fs::write(&path, bytes.as_ref()).is_ok();
+                Msg::ExportSaved(SaveDone { tab_id, key, name, format, version, saved })
+            },
+            failed,
+        )
     }
 
     /// The file was written, or could not be.
@@ -724,6 +736,39 @@ mod tests {
         assert!(file.exists());
         let (result, _) = h.receive("exportResult");
         assert_eq!((result["status"].as_str(), result["fileName"].as_str()), (Some("written"), Some("slow target.dxf")));
+    }
+
+    #[test]
+    fn a_failed_export_worker_answers_and_ends_the_export() {
+        for stage in ["compose", "write", "save"] {
+            let mut h = exporting(&format!("export_panic_{stage}"), "edit");
+            let file = h.dir().join("panic.dxf");
+            match stage {
+                "compose" => {
+                    h.app.secureplan.test_panic_next_job = true;
+                    request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
+                }
+                "write" => {
+                    request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
+                    h.app.secureplan.test_panic_next_job = true;
+                    let _ = h.app.secureplan_export_to(file.clone(), None, None, false).unwrap();
+                }
+                _ => {
+                    request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
+                    h.hold_jobs();
+                    let _ = h.app.secureplan_export_to(file.clone(), None, None, false).unwrap();
+                    // The write finishes; the file write's worker (started now) fails.
+                    h.app.secureplan.test_panic_next_job = true;
+                    h.release(0);
+                    h.release(0);
+                }
+            }
+            let (result, _) = h.receive("exportResult");
+            assert_eq!(result["status"], "error", "{stage}");
+            assert!(h.bound().export.is_none(), "{stage}: the export ended");
+            assert_eq!(h.app.secureplan.workers, 0, "{stage}");
+            let _ = h.state_where(|s| s["busy"].is_null());
+        }
     }
 
     #[test]

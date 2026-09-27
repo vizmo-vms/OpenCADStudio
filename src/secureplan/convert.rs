@@ -172,6 +172,11 @@ impl Refusal {
         Self { message: message.into(), at_mm: Vec::new() }
     }
 
+    /// The worker stopped unexpectedly.
+    pub fn failed() -> Self {
+        Self::new("The conversion stopped unexpectedly. Nothing was sent to SecurePlan.")
+    }
+
     fn at(reason: Reason, places: Vec<[f64; 2]>) -> Self {
         let message = match reason {
             Reason::Gap => "The selection is not one connected path: the pieces do not meet.",
@@ -240,6 +245,10 @@ pub fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: 
             let transform = &context.transform;
             let chain: Option<Vec<[f64; 2]>> = match entity {
                 EntityType::Line(line) => Some(vec![to_world(transform, line.start), to_world(transform, line.end)]),
+                EntityType::Polyline3D(polyline) if polyline.vertices.len() > MAX_PIECE_POINTS - pieces.points => {
+                    pieces.over_budget = true;
+                    None
+                }
                 EntityType::Polyline3D(polyline) => {
                     // The drawn vertices: not a spline fit's frame.
                     let mut points: Vec<[f64; 2]> =
@@ -257,7 +266,9 @@ pub fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: 
                 | EntityType::Spline(_) => {
                     // The tolerance in the entity's own units, for this instance.
                     let local = CHORD_TOLERANCE_MM / (mapping.scale_mm_per_cad_unit * super::publish::plan_scale(transform));
-                    match super::publish::flatten(entity, local) {
+                    // Cut within what is left of the budget, never further.
+                    let left = MAX_PIECE_POINTS + 1 - pieces.points;
+                    match super::publish::flatten_within(entity, local, left) {
                         Ok(Some((polyline, _))) => Some(
                             polyline
                                 .vertices
@@ -268,6 +279,10 @@ pub fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: 
                                 })
                                 .collect(),
                         ),
+                        Err(error) if error == super::publish::OVER_LIMIT => {
+                            pieces.over_budget = true;
+                            None
+                        }
                         Ok(None) | Err(_) => {
                             pieces.unsupported.push(to_world(transform, curve_anchor(entity)));
                             None
@@ -627,10 +642,36 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
     Ok(Candidates { kind: Kind::Route, walls: Vec::new(), points, rejected, rejected_total: total, skipped: 0 })
 }
 
+/// What a conversion works on, taken on the UI thread when it starts: the
+/// drawing as it is then (an immutable copy) and the selected handles.
+pub struct Snapshot {
+    pub document: acadrust::CadDocument,
+    pub annotation_scale: f32,
+    pub selected: HashSet<Handle>,
+    pub mapping: Mapping,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot").field("selected", &self.selected.len()).finish_non_exhaustive()
+    }
+}
+
+/// Cut the snapshot's selection and assemble the candidates (on a worker).
+pub fn prepare(snapshot: &Snapshot, kind: Kind) -> Result<Candidates, Refusal> {
+    let mut scene = crate::scene::Scene::new();
+    scene.document = snapshot.document.clone();
+    scene.annotation_scale = snapshot.annotation_scale;
+    scene.rebuild_derived_caches();
+    candidates(&scene, &snapshot.selected, &snapshot.mapping, kind)
+}
+
 /// What a conversion was started under: its candidates are sent only if the
 /// session, plan, document and drawing are still the same.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Origin {
+    /// The conversion job: only it may clear the tab's `busy: convert`.
+    pub job: u64,
     pub session: super::bridge::SessionId,
     pub base_identity: String,
     pub generation: u64,
@@ -660,7 +701,7 @@ pub fn rejected_lines(candidates: &Candidates) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use acadrust::entities::{Arc, Insert, Line, LwPolyline};
     use acadrust::types::Vector2;
@@ -757,6 +798,48 @@ mod tests {
         let cad: Vec<[f64; 2]> = found.points.iter().map(|p| [p[0], 20000.0 - p[1]]).collect();
         let departure = crate::app::secureplan::publish::tests::polyline_departure(&cad, curve);
         assert!(departure <= CHORD_TOLERANCE_MM * (1.0 + 1e-6), "the curve leaves a chord by {departure} mm");
+    }
+
+    #[test]
+    fn unclamped_and_periodic_splines_are_converted_within_a_millimetre() {
+        for spline in crate::app::secureplan::publish::tests::awkward_splines() {
+            let entity = EntityType::Spline(spline);
+            let exact = crate::entities::curve::entity_curve(&entity).expect("a planar curve");
+            let (scene, selected) = scene_with(vec![entity]);
+            let found = candidates(&scene, &selected, &mapping(), Kind::Route).unwrap();
+            let cad: Vec<[f64; 2]> = found.points.iter().map(|p| [p[0], 20000.0 - p[1]]).collect();
+            let departure = crate::app::secureplan::publish::tests::polyline_departure(&cad, |t| {
+                let p = exact.point_at(t);
+                [p[0], p[1]]
+            });
+            assert!(departure <= CHORD_TOLERANCE_MM * (1.0 + 1e-6), "{departure} mm");
+        }
+    }
+
+    /// A degree-1 spline through `count` control points in a zigzag.
+    pub(crate) fn many_knots(count: usize) -> EntityType {
+        let points = (0..count).map(|i| Vector3::new(i as f64 * 20.0 % 9_000_000.0, if i % 2 == 0 { 0.0 } else { 300.0 }, 0.0)).collect();
+        EntityType::Spline(acadrust::entities::Spline::from_control_points(1, points))
+    }
+
+    #[test]
+    fn a_spline_with_many_knots_is_handled_quickly_and_the_budget_holds_inside_a_curve() {
+        let started = std::time::Instant::now();
+        let (scene, selected) = scene_with(vec![many_knots(100_000)]);
+        let walls = candidates(&scene, &selected, &mapping(), Kind::Walls).unwrap_err();
+        assert!(walls.message.contains("at most"), "{}", walls.message);
+        let route = candidates(&scene, &selected, &mapping(), Kind::Route).unwrap_err();
+        assert!(route.message.contains("too large"), "{}", route.message);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+        // One circle that would need ~700,000 chords at 1 mm: the cut stops at
+        // the budget instead of producing them.
+        let mut circle = acadrust::entities::Circle::new();
+        circle.radius = 1.0e11;
+        let (scene, selected) = scene_with(vec![EntityType::Circle(circle)]);
+        let pieces = pieces(&scene, &selected, &mapping());
+        assert!(pieces.over_budget && pieces.points <= MAX_PIECE_POINTS, "{} points", pieces.points);
+        assert!(assemble(&pieces, Kind::Walls).unwrap_err().message.contains("too large to convert at once"));
     }
 
     #[test]
