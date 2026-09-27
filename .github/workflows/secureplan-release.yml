@@ -1,0 +1,317 @@
+name: SecurePlan CAD release
+
+# Builds and publishes SecurePlan CAD releases (DSK-05, DSK-07):
+#   SecurePlanCAD-macos-arm64.dmg, SecurePlanCAD-macos-x64.dmg (ad-hoc signed),
+#   SecurePlanCAD-windows-x64.msi (per-user, no signing), the source archive
+#   SecurePlanCAD-source.tar.gz and SHA256SUMS over all four.
+#
+# - Pushing the tag `secureplan-cad-vX.Y.Z` (on the secureplan branch, equal to
+#   VERSION in src/secureplan/mod.rs, with release notes in
+#   packaging/secureplan/release-notes/X.Y.Z.md) builds everything and then
+#   publishes: draft release -> upload every asset -> download and verify
+#   them against SHA256SUMS -> publish and mark latest -> check that
+#   releases/latest/download/<name> serves them.
+# - Running it by hand (workflow_dispatch) is always a DRY RUN: it builds every
+#   asset, writes and verifies SHA256SUMS, and uploads them as workflow
+#   artifacts only. It never creates, edits or publishes a release: the
+#   publish job runs only for a tag push, and it is the only job whose token
+#   may write.
+#
+# Never enables the test-only cargo feature (SecurePlan CI fails any other
+# workflow that names it).
+
+on:
+  push:
+    tags: ["secureplan-cad-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secureplan-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Version, tag and notes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      protocol: ${{ steps.version.outputs.protocol }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the version, tag and release notes
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^pub const VERSION: &str = "\(.*\)";$/\1/p' src/secureplan/mod.rs)"
+          protocol="$(sed -n 's/^pub const PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' src/secureplan/mod.rs)"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || (( BASH_REMATCH[1] > 255 )); then
+            echo "::error::VERSION '$version' must be MAJOR.MINOR.PATCH with MAJOR <= 255"
+            exit 1
+          fi
+          test -n "$protocol"
+          tag="secureplan-cad-v$version"
+          notes="packaging/secureplan/release-notes/$version.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::$notes is missing: every release needs its notes"
+            exit 1
+          fi
+          publish=false
+          if [ "$EVENT" = push ]; then
+            if [ "$REF_TYPE" != tag ] || [ "$REF_NAME" != "$tag" ]; then
+              echo "::error::the tag $REF_NAME does not match VERSION $version (expected $tag)"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/secureplan; then
+              echo "::error::$tag is not on the secureplan branch"
+              exit 1
+            fi
+            publish=true
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "protocol=$protocol"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## SecurePlan CAD $version"
+            echo "Tag \`$tag\`, bridge protocol $protocol, commit \`$GITHUB_SHA\`."
+            if [ "$publish" = true ]; then echo "This run publishes the release."; else echo "**Dry run:** nothing is published."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  macos:
+    name: macOS ${{ matrix.arch }} disk image
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            lipo: arm64
+          - arch: x64
+            target: x86_64-apple-darwin
+            lipo: x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Release build (secureplan)
+        run: cargo build --locked --release --features secureplan --target ${{ matrix.target }} --bin OpenCADStudio --bin ocs_launcher
+
+      - name: The build embeds its fork commit
+        run: grep -aqF "$GITHUB_SHA" "target/${{ matrix.target }}/release/OpenCADStudio"
+
+      - name: Install librsvg (icon)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install librsvg
+
+      - name: Assemble, sign and package
+        run: packaging/secureplan/make-release-dmg.sh "target/${{ matrix.target }}/release" "${{ matrix.lipo }}" "SecurePlanCAD-macos-${{ matrix.arch }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-macos-${{ matrix.arch }}
+          path: SecurePlanCAD-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64 installer
+    needs: prepare
+    # windows-2022 ships WiX Toolset 3 (the WIX environment variable).
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Release build (secureplan)
+        run: cargo build --locked --release --features secureplan --bin OpenCADStudio
+
+      - name: The build embeds its fork commit
+        shell: bash
+        run: grep -aqF "$GITHUB_SHA" target/release/OpenCADStudio.exe
+
+      - name: Build the per-user MSI
+        shell: pwsh
+        run: packaging/windows/build-msi.ps1 -Exe target\release\OpenCADStudio.exe -Version "${{ needs.prepare.outputs.version }}" -Out SecurePlanCAD-windows-x64.msi
+
+      - name: Check the MSI
+        shell: pwsh
+        run: packaging/windows/check-msi.ps1 -Msi SecurePlanCAD-windows-x64.msi -Version "${{ needs.prepare.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-windows-x64
+          path: SecurePlanCAD-windows-x64.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  source:
+    name: Source archive
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The corresponding source with the build scripts, workflows and
+      # Cargo.lock (GPL-3.0; DSK-05).
+      - name: Archive the source
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: git archive --format=tar.gz --prefix="OpenCADStudio-$TAG/" -o SecurePlanCAD-source.tar.gz "$GITHUB_SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-source
+          path: SecurePlanCAD-source.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  checksums:
+    name: SHA256SUMS
+    needs: [prepare, macos, windows, source]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: secureplan-cad-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write and verify SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          assets=(SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-source.tar.gz)
+          if [ "$(ls | sort)" != "$(printf '%s\n' "${assets[@]}" | sort)" ]; then
+            echo "::error::unexpected assets: $(ls | tr '\n' ' ')"
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          sha256sum "${assets[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          {
+            echo '### SHA256SUMS'
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secureplan-cad-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish the release (tag pushes only)
+    needs: [prepare, checksums]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROTOCOL: ${{ needs.prepare.outputs.protocol }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: secureplan-cad-release
+          path: dist
+
+      - name: Verify the assets again
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          test "$(ls | wc -l)" -eq 5
+          sha256sum -c SHA256SUMS
+
+      - name: Write the release notes
+        run: |
+          {
+            cat "packaging/secureplan/release-notes/$VERSION.md"
+            echo
+            echo "## Build"
+            echo
+            echo "- SecurePlan CAD $VERSION, bridge protocol $PROTOCOL, fork commit \`$GITHUB_SHA\`."
+            echo "- Check a download with \`sha256sum -c SHA256SUMS --ignore-missing\`."
+          } > release-notes.md
+
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          existing="$(gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
+          if [ -n "$existing" ]; then
+            echo "::error::a release (possibly a draft) for $TAG already exists; delete it or release a new version"
+            exit 1
+          fi
+          gh release create "$TAG" --draft --verify-tag --title "SecurePlan CAD $VERSION" --notes-file release-notes.md
+
+      - name: Upload every asset to the draft
+        run: gh release upload "$TAG" dist/SecurePlanCAD-macos-arm64.dmg dist/SecurePlanCAD-macos-x64.dmg dist/SecurePlanCAD-windows-x64.msi dist/SecurePlanCAD-source.tar.gz dist/SHA256SUMS
+
+      - name: Download the draft's assets and verify them
+        run: |
+          set -euo pipefail
+          mkdir draft
+          gh release download "$TAG" --dir draft
+          if [ "$(ls draft | sort)" != "$(ls dist | sort)" ]; then
+            echo "::error::the draft's assets differ: $(ls draft | tr '\n' ' ')"
+            exit 1
+          fi
+          cmp draft/SHA256SUMS dist/SHA256SUMS
+          (cd draft && sha256sum -c SHA256SUMS)
+
+      - name: Publish and mark latest
+        run: gh release edit "$TAG" --draft=false --prerelease=false --latest
+
+      - name: releases/latest serves this release
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$TAG"
+          mkdir latest
+          for name in SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-source.tar.gz SHA256SUMS; do
+            curl -fsSL --retry 5 --retry-delay 10 -o "latest/$name" "https://github.com/$GH_REPO/releases/latest/download/$name"
+          done
+          (cd latest && sha256sum -c SHA256SUMS)
+          echo "Published $TAG and marked it latest." >> "$GITHUB_STEP_SUMMARY"

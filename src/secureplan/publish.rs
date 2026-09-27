@@ -1335,6 +1335,19 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
                 Some(loaded) => (loaded.format, loaded.version(), loaded.name.expose().clone()),
                 None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
             };
+            // PUB-04: an edited drawing is written in its original version;
+            // one the writer cannot produce (R13) stops Apply rather than
+            // being written as another version.
+            if !super::export::writable(format, version) {
+                let label = super::export::version_label(format, version);
+                return Err(ApplyError::new(
+                    ErrorCode::WriterError,
+                    format!(
+                        "SecurePlan CAD cannot write {label}, this drawing's version, so the edited drawing cannot be applied. Undo the edits to apply the drawing unchanged, or import it saved as {} R14 or later.",
+                        format.ext().to_ascii_uppercase()
+                    ),
+                ));
+            }
             let is_dxf = format == Format::Dxf;
             let dropped = crate::io::dropped_on_save_count(&snapshot.document, version, is_dxf);
             if dropped > 0 {
@@ -1605,6 +1618,37 @@ pub(crate) mod tests {
             };
             assert_eq!(result, Err(expected), "{}", case["name"]);
         }
+    }
+
+    /// PUB-04 with a version the writer cannot produce: an edited R13 drawing
+    /// stops Apply with the writer's reason instead of being written as R14;
+    /// an unedited one is still applied byte for byte.
+    #[test]
+    fn an_edited_r13_drawing_stops_apply_and_an_unedited_one_applies_verbatim() {
+        use super::super::session::{Drawing, ErrorCode, Format};
+        let scene = synthetic_dxf_scene();
+        let window = [0.0, 0.0, 30000.0, 18000.0];
+        let mapping = super::super::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
+        let plan = ApplyPlan { view: PublishedView::Model { window_cad: window }, mapping, mm_per_pt: choose_mm_per_pt(window, &mapping).unwrap(), damaged_acknowledged: false };
+        let snapshot = |format: Format, version: &str, modified: bool| {
+            let bytes = std::sync::Arc::new(format!("{version} synthetic original bytes").into_bytes());
+            let loaded = Drawing { bytes, name: format!("r13.{}", format.ext()).into(), format, format_version: version.into() };
+            Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: Some(loaded), modified, pending_original: None, lost_entities: 0 }
+        };
+        for format in [Format::Dwg, Format::Dxf] {
+            let error = build_outputs(&snapshot(format, "AC1012", true), &plan).unwrap_err();
+            assert_eq!(error.code, ErrorCode::WriterError, "{format:?}");
+            let label = format!("{} R13 (AC1012)", format.ext().to_ascii_uppercase());
+            assert!(error.message.contains(&label) && error.message.contains("R14 or later"), "{}", error.message);
+            let unedited = snapshot(format, "AC1012", false);
+            let outputs = build_outputs(&unedited, &plan).expect("an unedited R13 drawing applies");
+            assert_eq!(outputs.drawing.bytes, unedited.loaded.as_ref().unwrap().bytes, "verbatim");
+            assert!(!outputs.written);
+        }
+        // R14, the oldest version the writer offers, is written as R14.
+        let outputs = build_outputs(&snapshot(Format::Dwg, "AC1014", true), &plan).expect("R14 is written");
+        assert_eq!(&outputs.drawing.bytes[..6], b"AC1014");
+        assert_eq!(outputs.drawing.format_version, "AC1014");
     }
 
     /// A synthetic floor plan, written as DXF and read back like an import:

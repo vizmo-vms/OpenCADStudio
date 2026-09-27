@@ -16,6 +16,10 @@ pub struct Settings {
     pub trusted_origins: Vec<String>,
     #[serde(default)]
     pub developer_loopback_origins: bool,
+    /// The automatic update check at startup and daily is off (DSK-07). A
+    /// manual check still works. Absent in older files, which means on.
+    #[serde(default)]
+    pub update_checks_off: bool,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -103,6 +107,7 @@ mod tests {
         settings.trust("https://secureplan.example");
         settings.trust("https://secureplan.example");
         settings.developer_loopback_origins = true;
+        settings.update_checks_off = true;
         settings.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded, settings);
@@ -128,7 +133,10 @@ mod tests {
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
         std::fs::write(&path, br#"{"trustedOrigins":["https://ok.example","https://Bad.example/","null"]}"#).unwrap();
-        assert_eq!(Settings::load_from(&path).trusted_origins, vec!["https://ok.example"]);
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.trusted_origins, vec!["https://ok.example"]);
+        // Files from before the update setting keep automatic checks on.
+        assert!(!loaded.update_checks_off);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

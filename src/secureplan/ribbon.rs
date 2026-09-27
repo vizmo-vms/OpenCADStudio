@@ -3,8 +3,8 @@
 //! Every button runs a command, so each is also reachable from the keyboard
 //! by typing it at the command line:
 //! `SECUREPLANIMPORT`, `SECUREPLANALIGN`, `SECUREPLANAPPLY`,
-//! `SECUREPLANCONVERT`, `SECUREPLANOVERLAY`, `SECUREPLANTRUST`, `SECUREPLANREVOKE` and
-//! `SECUREPLANDEVORIGINS`. The command `SECUREPLAN` opens the same actions as
+//! `SECUREPLANCONVERT`, `SECUREPLANOVERLAY`, `SECUREPLANTRUST`, `SECUREPLANREVOKE`,
+//! `SECUREPLANDEVORIGINS`, `SECUREPLANUPDATE` and `SECUREPLANAUTOUPDATE`. The command `SECUREPLAN` opens the same actions as
 //! a keyboard menu with visible focus (the upstream ribbon has no keyboard
 //! focus of its own). Labels are text, never colour alone.
 
@@ -15,7 +15,7 @@ use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, 
 pub struct SecurePlanModule;
 
 /// The SecurePlan commands, in ribbon order: (command, label, glyph).
-pub const COMMANDS: [(&str, &str, &str); 8] = [
+pub const COMMANDS: [(&str, &str, &str); 10] = [
     ("SECUREPLANIMPORT", "Import drawing", "⤓"),
     ("SECUREPLANALIGN", "Align", "⌖"),
     ("SECUREPLANAPPLY", "Apply", "✓"),
@@ -24,6 +24,8 @@ pub const COMMANDS: [(&str, &str, &str); 8] = [
     ("SECUREPLANTRUST", "Trusted websites", "☰"),
     ("SECUREPLANREVOKE", "Revoke trust", "✕"),
     ("SECUREPLANDEVORIGINS", "Developer origins", "⚙"),
+    ("SECUREPLANUPDATE", "Check for updates", "↻"),
+    ("SECUREPLANAUTOUPDATE", "Automatic update checks", "⏲"),
 ];
 
 fn tool(index: usize) -> ToolDef {
@@ -44,6 +46,8 @@ fn groups() -> &'static [RibbonGroup] {
                 title: "Trust",
                 tools: vec![RibbonItem::LabeledTool(tool(5)), RibbonItem::LabeledTool(tool(6)), RibbonItem::LabeledTool(tool(7))],
             },
+            // The About/Help place for SecurePlan CAD's own updates (DSK-07).
+            RibbonGroup { title: "SecurePlan CAD", tools: vec![RibbonItem::LabeledTool(tool(8)), RibbonItem::LabeledTool(tool(9))] },
         ]
     })
 }
@@ -82,6 +86,10 @@ mod tests {
         // The trust commands are on the tab (user decision, F4a).
         for trust in ["SECUREPLANTRUST", "SECUREPLANREVOKE", "SECUREPLANDEVORIGINS"] {
             assert!(commands.iter().any(|c| c == trust), "{trust}");
+        }
+        // The manual update check and the automatic-check switch (DSK-07).
+        for update in ["SECUREPLANUPDATE", "SECUREPLANAUTOUPDATE"] {
+            assert!(commands.iter().any(|c| c == update), "{update}");
         }
     }
 }

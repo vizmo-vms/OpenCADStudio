@@ -3152,9 +3152,13 @@ impl OpenCADStudio {
 
     /// Remove the autosave recovery files, then quit the application.
     pub(in crate::app) fn exit_app(&self) -> Task<Message> {
-        // Unapplied SecurePlan work is kept as recovery copies.
+        // Unapplied SecurePlan work is kept as recovery copies, and a pending
+        // SecurePlan CAD update starts its installer helper.
         #[cfg(feature = "secureplan")]
-        self.secureplan_keep_all_recovery();
+        {
+            self.secureplan_keep_all_recovery();
+            self.secureplan_update_on_exit();
+        }
         self.cleanup_autosaves();
         iced::exit()
     }

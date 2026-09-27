@@ -2027,7 +2027,19 @@ pub(crate) mod tests {
         let labels: Vec<&str> = form.buttons.iter().map(|(label, _)| label.as_str()).collect();
         assert_eq!(
             labels,
-            ["Import drawing", "Align", "Apply", "Convert selection", "Design overlay", "Trusted websites", "Revoke trust", "Developer origins", "Close"]
+            [
+                "Import drawing",
+                "Align",
+                "Apply",
+                "Convert selection",
+                "Design overlay",
+                "Trusted websites",
+                "Revoke trust",
+                "Developer origins",
+                "Check for updates",
+                "Automatic update checks",
+                "Close"
+            ]
         );
         assert_eq!(form.focus, 0, "focus starts on the first action");
         // Down to "Developer origins", then Enter.

@@ -41,6 +41,9 @@ pub struct ExportDialog {
     pub stem: String,
     /// The known loss for the chosen format: (choice, objects lost).
     loss: (usize, usize),
+    /// Said when the writer cannot write the applied drawing's own version
+    /// (R13), so the default is the nearest version it can (EXP-03).
+    pub version_note: Option<String>,
     /// Written and waiting: further confirmations are ignored.
     pub writing: bool,
 }
@@ -48,6 +51,16 @@ pub struct ExportDialog {
 impl ExportDialog {
     pub fn new(tab_id: u64, key: JobKey, request_id: String, composed: Composed) -> Self {
         let default = export::default_choice(composed.format, &composed.version);
+        let version_note = acadrust::DxfVersion::parse(&composed.version)
+            .filter(|&version| !export::writable(composed.format, version))
+            .map(|version| {
+                let (format, nearest) = export::choice(default);
+                format!(
+                    "SecurePlan CAD cannot write {}, the applied drawing's version, so the export defaults to {}, the nearest version it can write.",
+                    export::version_label(composed.format, version),
+                    export::version_label(format, nearest)
+                )
+            });
         let formats = export::choices().iter().map(|choice| choice.to_string()).collect();
         let mut acknowledge = Field::choice("Export without the objects listed", vec!["No".into(), "Yes".into()], 0);
         acknowledge.enabled = false;
@@ -63,6 +76,7 @@ impl ExportDialog {
             lost_entities: composed.lost_entities,
             stem: composed.stem,
             loss: (usize::MAX, 0),
+            version_note,
             writing: false,
         };
         dialog.refresh();
@@ -125,6 +139,7 @@ impl ExportDialog {
 
     pub fn lines(&self) -> Vec<String> {
         let mut lines = self.summary.clone();
+        lines.extend(self.version_note.clone());
         if self.loss.1 > 0 {
             let (format, version) = self.choice();
             let unwritable = self.loss.1 - self.lost_entities;
@@ -586,6 +601,55 @@ mod tests {
         let cut = text[..text[..end].rfind('\n').unwrap()].rfind('\n').unwrap() + 1;
         let unknown = "  0\nSECUREPLANTESTOBJECT\n  5\nFFF0\n100\nAcDbEntity\n  8\n0\n";
         format!("{}{unknown}{}", &text[..cut], &text[cut..]).into_bytes()
+    }
+
+    /// EXP-03: an R13 drawing exports as R14 by default, the dialog says why,
+    /// and anything R14 cannot hold is known loss needing the acknowledgement.
+    #[test]
+    fn an_r13_drawing_defaults_to_r14_says_so_and_counts_what_r14_loses() {
+        let mut document = testutil::synthetic_document();
+        let handle = document.allocate_handle();
+        document.objects.insert(
+            handle,
+            acadrust::objects::ObjectType::Unknown {
+                type_name: "SYNTHETIC_R13_OBJECT".into(),
+                handle,
+                owner: acadrust::Handle::NULL,
+                raw_dxf_codes: None,
+                raw_dwg_data: Some(vec![0u8; 4]),
+                raw_dwg_handle_bits: 0,
+                raw_dwg_version: Some(acadrust::DxfVersion::AC1012),
+            },
+        );
+        let composed = export::Composed {
+            document,
+            composition: Default::default(),
+            format: Format::Dwg,
+            version: "AC1012".into(),
+            lost_entities: 0,
+            stem: "r13".into(),
+        };
+        let key = JobKey { session: 1, serial: 1 };
+        let dialog = ExportDialog::new(1, key, "x1".into(), composed);
+        assert_eq!(dialog.choice(), (Format::Dwg, acadrust::DxfVersion::AC1014), "the nearest version the writer offers");
+        let lines = dialog.lines();
+        assert!(
+            lines.iter().any(|line| line.contains("cannot write DWG R13 (AC1012)") && line.contains("defaults to DWG R14 (AC1014)")),
+            "{lines:?}"
+        );
+        assert_eq!(dialog.known_loss(), 1, "R14 cannot hold the R13-only object");
+        assert!(dialog.form.fields[ACKNOWLEDGE].enabled);
+        assert!(dialog.plan().is_err(), "not without the acknowledgement");
+        // A drawing in a version the writer offers gets no such line.
+        let composed = export::Composed {
+            document: testutil::synthetic_document(),
+            composition: Default::default(),
+            format: Format::Dwg,
+            version: "AC1018".into(),
+            lost_entities: 0,
+            stem: "r2004".into(),
+        };
+        assert!(ExportDialog::new(1, key, "x2".into(), composed).version_note.is_none());
     }
 
     #[test]

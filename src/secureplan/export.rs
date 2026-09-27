@@ -576,6 +576,22 @@ pub fn choice(index: usize) -> (Format, DxfVersion) {
     (if ext == "dxf" { Format::Dxf } else { Format::Dwg }, version)
 }
 
+/// Whether the native writer offers `format` in `version`. DWG and DXF R13
+/// (AC1012) are read but never written (EXP-03, PUB-04).
+pub fn writable(format: Format, version: DxfVersion) -> bool {
+    (0..choices().len()).any(|index| choice(index) == (format, version))
+}
+
+/// `DWG R13 (AC1012)`: the format, release name where there is one, and code.
+pub fn version_label(format: Format, version: DxfVersion) -> String {
+    let release = match version {
+        DxfVersion::AC1012 => "R13 ",
+        DxfVersion::AC1014 => "R14 ",
+        _ => "",
+    };
+    format!("{} {release}({})", format.ext().to_ascii_uppercase(), version.as_str())
+}
+
 /// The choice for the applied drawing's own format and version (EXP-03's
 /// default), or the nearest newer version the writer offers.
 pub fn default_choice(format: Format, version: &str) -> usize {

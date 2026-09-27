@@ -26,6 +26,11 @@ fn main() -> iced::Result {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // SecurePlan CAD's update helper (DSK-07) runs before anything else.
+        #[cfg(feature = "secureplan")]
+        if let Some(code) = OpenCADStudio::app::secureplan::update_helper::main_hook() {
+            std::process::exit(code);
+        }
         use clap::Parser;
         let args = cli::Cli::parse();
 

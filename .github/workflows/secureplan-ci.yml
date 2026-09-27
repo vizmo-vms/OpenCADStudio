@@ -187,48 +187,13 @@ jobs:
 
       - name: Build the per-user MSI (structure check)
         shell: pwsh
-        run: |
-          magick assets/logo.svg -define icon:auto-resize=16,24,32,48,64,128,256 packaging/windows/AppIcon.ico
-          $candle = Join-Path $env:WIX "bin\candle.exe"
-          $light  = Join-Path $env:WIX "bin\light.exe"
-          $objDir = Join-Path $PWD "packaging\windows\"
-          & $candle -arch x64 "-dVersion=0.1.0" `
-            "-dSource=$((Resolve-Path target\debug\OpenCADStudio.exe).Path)" `
-            "-dIcon=$((Resolve-Path packaging\windows\AppIcon.ico).Path)" `
-            "-dLicense=$((Resolve-Path packaging\windows\License.rtf).Path)" `
-            packaging\windows\main.wxs packaging\windows\ui.wxs -out $objDir
-          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
-          & $light (Join-Path $objDir "main.wixobj") (Join-Path $objDir "ui.wixobj") `
-            -ext WixUIExtension -cultures:en-us -loc packaging/windows/strings.en-US.wxl `
-            -out SecurePlanCAD-debug.msi
-          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+        run: packaging/windows/build-msi.ps1 -Exe target\debug\OpenCADStudio.exe -Version 0.1.0 -Out SecurePlanCAD-debug.msi
 
-      - name: Check the MSI is per-user with no file associations
+      # Per-user, no elevation, SecurePlan CAD's own UpgradeCode, no file
+      # associations, and the secureplan-cad: scheme under HKCU (DSK-04/05).
+      - name: Check the MSI
         shell: pwsh
-        run: |
-          $installer = New-Object -ComObject WindowsInstaller.Installer
-          $db = $installer.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $installer, @((Resolve-Path SecurePlanCAD-debug.msi).Path, 0))
-          function Query($sql) {
-            $view = $db.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $db, @($sql))
-            $view.GetType().InvokeMember("Execute", "InvokeMethod", $null, $view, $null)
-            $rows = @()
-            while ($record = $view.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $view, $null)) {
-              $rows += $record.GetType().InvokeMember("StringData", "GetProperty", $null, $record, 1)
-            }
-            $rows
-          }
-          $allUsers = Query "SELECT Value FROM Property WHERE Property='ALLUSERS'"
-          if ($allUsers) { throw "ALLUSERS is set ($allUsers): the MSI is not per-user" }
-          # Summary-information word count bit 3: elevation is not required.
-          $summary = $db.GetType().InvokeMember("SummaryInformation", "GetProperty", $null, $db, @(0))
-          $wordCount = $summary.GetType().InvokeMember("Property", "GetProperty", $null, $summary, @(15))
-          if (($wordCount -band 8) -eq 0) { throw "the MSI requires elevation" }
-          $upgrade = Query "SELECT Value FROM Property WHERE Property='UpgradeCode'"
-          if ($upgrade -eq "{BD6BCEAB-6C7A-4CE2-A62D-6EF06A92F8B1}") { throw "upstream UpgradeCode" }
-          foreach ($table in "Extension", "ProgId", "Verb", "MIME") {
-            $tables = Query "SELECT Name FROM _Tables WHERE Name='$table'"
-            if ($tables) { throw "the MSI has a $table table (file association)" }
-          }
+        run: packaging/windows/check-msi.ps1 -Msi SecurePlanCAD-debug.msi -Version 0.1.0
 
       - uses: actions/upload-artifact@v4
         with:
@@ -239,3 +204,52 @@ jobs:
             packaging/dev/secureplan-cad.reg
           if-no-files-found: error
           retention-days: 14
+
+  # DSK-07: the update helper waits for the application to exit, swaps the new
+  # app in from the DMG (ditto to the same volume, rename) and relaunches it
+  # through Launch Services; a damaged image leaves the app as it was.
+  macos-update-helper:
+    name: macOS update helper
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: update-helper
+
+      - name: Update helper tests
+        run: cargo test --locked --features secureplan,secureplan-test --test secureplan_update_helper
+
+  # DSK-07: the update helper waits for the application to exit, installs a
+  # per-user MSI of this test build with msiexec (registering the scheme under
+  # HKCU), relaunches the installed copy, and the uninstall removes it again.
+  windows-update-helper:
+    name: Windows update helper
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: update-helper
+
+      - name: Test build and its per-user MSI
+        shell: pwsh
+        run: |
+          cargo build --locked --features secureplan,secureplan-test
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          packaging/windows/build-msi.ps1 -Exe target\debug\OpenCADStudio.exe -Version 0.1.0 -Out update-test.msi
+
+      - name: Update helper tests
+        env:
+          SECUREPLAN_TEST_MSI: ${{ github.workspace }}\update-test.msi
+        run: cargo test --locked --features secureplan,secureplan-test --test secureplan_update_helper
