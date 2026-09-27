@@ -620,6 +620,18 @@
           "version": 12,
           "documentHash": "2b69620a5a625907df23f2bd30c3276da97753912d6460d22d778a7b0208f56a"
         },
+        "mapping": {
+          "cadOrigin": [
+            0,
+            18000
+          ],
+          "anchorMm": [
+            0,
+            0
+          ],
+          "scaleMmPerCadUnit": 1,
+          "quarterTurns": 0
+        },
         "drawingTransferId": 22,
         "payloadTransferId": 23
       }

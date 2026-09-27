@@ -220,6 +220,8 @@ pub struct ApplyInFlight {
     pub drawing: Drawing,
     /// Whether it is the writer's output (not the verbatim loaded bytes).
     pub written: bool,
+    /// The alignment sent: the survey's stored mapping once committed.
+    pub alignment: Alignment,
 }
 
 /// The survey's plan as `openSession` or `planUpdate` describe it. It is
@@ -288,6 +290,16 @@ pub struct Bound {
     pub survey_empty: bool,
     /// The mapping the next Apply uses (stored or newly aligned).
     pub alignment: Option<Alignment>,
+    /// The survey's stored mapping (its current `cadPlan`), never a local
+    /// re-alignment: conversion and export map with it (CNV-02, EXP-02).
+    pub plan_alignment: Option<Alignment>,
+    /// `convertRequest`s waiting for their `convertResult`.
+    pub converts: Vec<String>,
+    /// The conversion whose candidates are being assembled: it owns
+    /// `busy: convert`.
+    pub convert_job: Option<u64>,
+    /// The CAD export under way, if any (EXP-01..03).
+    pub export: Option<super::export::ExportJob>,
     /// The user re-aligned a plan that already had a stored mapping.
     pub realigned: bool,
     pub busy: Option<Busy>,
@@ -333,6 +345,10 @@ impl Bound {
             overlay: None,
             survey_empty: false,
             alignment: None,
+            plan_alignment: None,
+            converts: Vec::new(),
+            convert_job: None,
+            export: None,
             realigned: false,
             busy: None,
             error: None,
@@ -352,6 +368,7 @@ impl Bound {
         self.plan_version = meta.plan_version;
         self.has_plan = meta.has_plan;
         self.alignment = meta.alignment;
+        self.plan_alignment = meta.alignment;
         self.realigned = false;
         self.staged = None;
         self.unresolved = false;
@@ -513,7 +530,10 @@ impl OpenCADStudio {
             let body = json!({
                 "dirty": tab.dirty || bound.unapplied(),
                 "activeView": active_view(&tab.scene),
-                "busy": bound.busy.map(|busy| json!({ "operation": busy.operation, "progress": busy.progress })),
+                "busy": bound
+                    .busy
+                    .or(bound.export.as_ref().map(|_| Busy { operation: "export", progress: None }))
+                    .map(|busy| json!({ "operation": busy.operation, "progress": busy.progress })),
                 "error": bound.error.map(|code| json!({ "code": code.as_str() })),
             });
             if bound.last_state.as_ref() != Some(&body) {
@@ -601,8 +621,12 @@ impl OpenCADStudio {
             bound.session = None;
             bound.busy = None;
             bound.apply = None;
+            bound.converts.clear();
+            bound.convert_job = None;
             bound.last_state = None;
             let tab_id = bound.tab_id;
+            // An export answers its session only: it ends with it.
+            self.secureplan_drop_export(tab_id);
             self.secureplan_release_held(tab_id);
         }
         super::testdriver_event("closed", "");
@@ -719,21 +743,11 @@ impl OpenCADStudio {
             }
             "applyResult" => self.secureplan_apply_result(session, &request_id, &body),
             "planUpdate" => self.secureplan_plan_update(session, &body),
-            "exportRequest" => {
-                // CAD export arrives in a later version (EXP-01..03).
-                for key in ["drawingTransferId", "payloadTransferId"] {
-                    if let Some(id) = body[key].as_u64() {
-                        self.secureplan_take_transfer(session, id as u32);
-                    }
-                }
-                self.command_line.push_error("SecurePlan: CAD export is not available in this version of SecurePlan CAD.");
-                self.secureplan_send(
-                    session,
-                    json!({ "type": "exportResult", "requestId": request_id, "status": "error", "code": "INVALID" }),
-                );
+            "exportRequest" => self.secureplan_export_request(session, &request_id, &body),
+            "convertResult" => {
+                self.secureplan_convert_result(session, &request_id, &body);
                 Task::none()
             }
-            // Conversion arrives in a later version (CNV-01..03).
             _ => Task::none(),
         };
         self.secureplan_report_states();
@@ -804,6 +818,10 @@ impl OpenCADStudio {
         // A changed plan replaces the document: keep the local work first,
         // under the plan it was made from, and replace nothing if that fails.
         let preserved = if unapplied && !keep_local { self.secureplan_keep_recovery(index) } else { Preserve::Nothing };
+        // An export answers the session that asked for it: it ends before the
+        // document is bound to the new one, whether or not the old session's
+        // close has arrived yet.
+        self.secureplan_drop_export(tab_id);
         {
             let bound = self.secureplan.sessions.by_tab_mut(tab_id).expect("bound above");
             bound.session = Some(session);
@@ -818,6 +836,8 @@ impl OpenCADStudio {
             bound.error = None;
             bound.last_state = None;
             bound.apply = None;
+            bound.converts.clear();
+            bound.convert_job = None;
             if keep_local {
                 bound.plan_version = meta.plan_version;
                 bound.has_plan = meta.has_plan;
@@ -1003,6 +1023,7 @@ impl OpenCADStudio {
 
     /// Forget a bound tab: its session ends with `documentClosed`.
     pub(crate) fn secureplan_unbind(&mut self, tab_id: u64) {
+        self.secureplan_drop_export(tab_id);
         let Some(position) = self.secureplan.sessions.bound.iter().position(|b| b.tab_id == tab_id) else { return };
         let bound = self.secureplan.sessions.bound.remove(position);
         self.secureplan.command_guard.unbind_tab(tab_id);
@@ -1213,10 +1234,22 @@ impl OpenCADStudio {
         let origin = dialog.origin;
         self.secureplan_report_states();
         self.command_line.push_info("SecurePlan: preparing the drawing, PDF and snap file…");
-        self.secureplan_run_job(move || {
-            let result = super::publish::build_outputs(&snapshot, &plan);
-            super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
-        })
+        let failed = super::Msg::ApplyBuilt(ApplyBuilt {
+            tab_id,
+            origin: origin.clone(),
+            snapshot_revision,
+            plan: plan.clone(),
+            alignment,
+            realigned,
+            result: super::Carry::new(Err(super::publish::ApplyError::new(ErrorCode::Internal, "Preparing the outputs stopped unexpectedly."))),
+        });
+        self.secureplan_run_job(
+            move || {
+                let result = super::publish::build_outputs(&snapshot, &plan);
+                super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
+            },
+            failed,
+        )
     }
 
     /// The outputs are ready: send them and `applyRequest`, or report why not.
@@ -1286,7 +1319,13 @@ impl OpenCADStudio {
             return fail(self, Some(ErrorCode::TransferFailed), "The request could not be sent to SecurePlan.".into());
         }
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(built.tab_id) {
-            bound.apply = Some(ApplyInFlight { request_id, snapshot_revision: built.snapshot_revision, drawing: outputs.drawing, written: outputs.written });
+            bound.apply = Some(ApplyInFlight {
+                request_id,
+                snapshot_revision: built.snapshot_revision,
+                drawing: outputs.drawing,
+                written: outputs.written,
+                alignment: built.alignment,
+            });
             bound.alignment = Some(built.alignment);
         }
         let mut note = "SecurePlan: sent. Confirm the Apply in SecurePlan.".to_string();
@@ -1330,6 +1369,7 @@ impl OpenCADStudio {
             bound.recovered_base = None;
             bound.replace_confirmed = false;
             bound.realigned = false;
+            bound.plan_alignment = Some(apply.alignment);
             // Written by the writer, the stored drawing no longer holds the
             // damaged items the reader dropped.
             if apply.written {
@@ -1483,6 +1523,10 @@ pub(crate) mod tests {
         pub survey_empty: bool,
         /// Earlier web connections, kept open.
         old_webs: Vec<Web>,
+        /// A session whose `Closed` event is held back (a re-pair that
+        /// overtakes the old session's close), and the event once it came.
+        pub hold_close: Option<SessionId>,
+        pub held_close: Option<BridgeEvent>,
         dir: std::path::PathBuf,
     }
 
@@ -1510,7 +1554,7 @@ pub(crate) mod tests {
             let BridgeEvent::Opened { session, .. } = &opened else { panic!("expected Opened") };
             let session = *session;
             let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
-            Self { app, events, web, session, next_transfer: 1, bridge, survey_empty: true, old_webs: Vec::new(), dir }
+            Self { app, events, web, session, next_transfer: 1, bridge, survey_empty: true, old_webs: Vec::new(), hold_close: None, held_close: None, dir }
         }
 
         pub(crate) fn dir(&self) -> &std::path::Path {
@@ -1520,8 +1564,54 @@ pub(crate) mod tests {
 
         /// Deliver the next bridge event to the app.
         pub(crate) fn pump(&mut self) {
-            let event = next_event(&self.events);
-            let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+            loop {
+                let event = next_event(&self.events);
+                if matches!(&event, BridgeEvent::Closed { session, .. } if Some(*session) == self.hold_close) {
+                    self.held_close = Some(event);
+                    continue;
+                }
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+                return;
+            }
+        }
+
+        /// Re-pair the open survey from a new page, confirmed in the desktop,
+        /// holding back the old session's `Closed` event so that the new
+        /// session's messages overtake it.
+        pub(crate) fn pair_again_overtaking(&mut self, pairing: u8) {
+            let old = self.session;
+            self.hold_close = Some(old);
+            let request = launch(ORIGIN, pairing);
+            self.bridge.add_pending(request.clone());
+            let web = connect_web(self.bridge.port(), &request).expect("pair again");
+            self.old_webs.push(std::mem::replace(&mut self.web, web));
+            loop {
+                let event = next_event(&self.events);
+                if matches!(&event, BridgeEvent::Closed { session, .. } if *session == old) {
+                    self.held_close = Some(event);
+                    continue;
+                }
+                let opened = match &event {
+                    BridgeEvent::Opened { session, needs_confirmation, .. } => Some((*session, *needs_confirmation)),
+                    _ => None,
+                };
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+                if let Some((session, needs_confirmation)) = opened {
+                    self.session = session;
+                    if needs_confirmation {
+                        let _ = self.app.update(Message::SecurePlan(Msg::Action(Action::Repair(session, true))));
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// Deliver the held-back `Closed` event, if it came.
+        pub(crate) fn deliver_held_close(&mut self) {
+            self.hold_close = None;
+            if let Some(event) = self.held_close.take() {
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+            }
         }
 
         pub(crate) fn send(&mut self, message: Value) {
@@ -1607,6 +1697,30 @@ pub(crate) mod tests {
                         let chunk = self.web.opener.open(FrameKind::Chunk, &sealed).unwrap();
                         let id = u32::from_le_bytes(chunk[..4].try_into().unwrap()) as u64;
                         transfers.get_mut(&id).expect("announced").1.extend_from_slice(&chunk[8..]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// The types of the control messages the web receives up to and
+        /// including the next one of type `kind`.
+        pub(crate) fn types_until(&mut self, kind: &str) -> Vec<String> {
+            let mut types = Vec::new();
+            loop {
+                match self.web.socket.read().expect("a frame") {
+                    Frame::Text(text) => {
+                        let sealed = channel::b64url_decode(text.as_str()).unwrap();
+                        let message: Value = serde_json::from_slice(&self.web.opener.open(FrameKind::Control, &sealed).unwrap()).unwrap();
+                        let found = message["type"].as_str().unwrap_or_default().to_string();
+                        types.push(found.clone());
+                        if found == kind {
+                            return types;
+                        }
+                    }
+                    Frame::Binary(sealed) => {
+                        // Every frame advances the counter: open it to stay in step.
+                        let _ = self.web.opener.open(FrameKind::Chunk, &sealed);
                     }
                     _ => {}
                 }
@@ -1911,10 +2025,13 @@ pub(crate) mod tests {
         let _ = h.app.dispatch_command("SECUREPLAN");
         let Some(Dialog::Choice { form, .. }) = &h.app.secureplan.dialog else { panic!("no menu") };
         let labels: Vec<&str> = form.buttons.iter().map(|(label, _)| label.as_str()).collect();
-        assert_eq!(labels, ["Import drawing", "Align", "Apply", "Design overlay", "Trusted websites", "Revoke trust", "Developer origins", "Close"]);
+        assert_eq!(
+            labels,
+            ["Import drawing", "Align", "Apply", "Convert selection", "Design overlay", "Trusted websites", "Revoke trust", "Developer origins", "Close"]
+        );
         assert_eq!(form.focus, 0, "focus starts on the first action");
         // Down to "Developer origins", then Enter.
-        for _ in 0..6 {
+        for _ in 0..7 {
             h.key(DialogKey::Next);
         }
         h.key(DialogKey::Activate);
@@ -2108,6 +2225,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_worker_that_fails_never_leaves_the_survey_busy() {
+        // Apply: the build's worker panics; Apply stops and can run again.
+        let mut h = Harness::new("worker_panic");
+        h.open_dxf();
+        align_and_open_apply(&mut h);
+        h.app.secureplan.test_panic_next_job = true;
+        h.key(DialogKey::Activate);
+        assert!(h.bound().busy.is_none(), "Apply is not busy for good");
+        assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Choice { title, .. }) if title == "Apply stopped"));
+        assert_eq!(h.app.secureplan.workers, 0, "the worker is counted as done");
+        let _ = h.receive("sessionState");
+        h.app.secureplan.dialog = None;
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "Apply can start again");
+        // A load: its parser panics; the survey is not left loading.
+        let mut h = Harness::new("worker_panic_load");
+        h.app.secureplan.test_panic_next_job = true;
+        h.open_dxf();
+        assert!(h.bound().busy.is_none());
+        assert_eq!(h.bound().error, Some(ErrorCode::Internal));
+    }
+
+    #[test]
     fn apply_sends_every_output_from_one_snapshot() {
         let mut h = Harness::new("apply");
         h.open_dxf();
@@ -2153,9 +2293,12 @@ pub(crate) mod tests {
         assert!(!near(late, &points) && !near(late, &snaps), "the edit leaked into the outputs");
         // Committed: the edit made after the snapshot keeps the document dirty.
         let request_id = request["requestId"].clone();
+        assert_eq!(h.bound().plan_alignment, None, "nothing stored before the commit");
         h.send(json!({ "type": "applyResult", "requestId": request_id, "status": "committed", "planVersion": 1, "baseIdentity": BASE }));
         assert_eq!(h.bound().base_identity, BASE);
         assert_eq!(h.bound().plan_version, Some(1));
+        // The applied mapping is the survey's stored one now (conversion and export map with it).
+        assert_eq!(h.bound().plan_alignment.map(|a| a.mapping_json()), Some(request["mapping"].clone()));
         assert!(h.app.tabs[h.app.active_tab].dirty);
         assert!(h.bound().apply.is_none() && h.bound().busy.is_none());
     }
@@ -2588,8 +2731,7 @@ pub(crate) mod tests {
     }
 
     /// The synthetic plan with one damaged polyline the reader drops.
-    #[cfg(feature = "secureplan-test")]
-    fn damaged_dxf() -> Vec<u8> {
+    pub(crate) fn damaged_dxf() -> Vec<u8> {
         use acadrust::types::Vector2;
         let mut doc = testutil::synthetic_document();
         let mut damaged = acadrust::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);

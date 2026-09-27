@@ -274,8 +274,18 @@ where
 /// [`walk_model`] for the entities of `block` (model or a paper space), in
 /// the drawing's own annotation context or, for model space seen through a
 /// paper viewport, in that viewport's (`view`).
-pub(crate) fn walk_block<F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, plot_only: bool, mut leaf: F)
+pub(crate) fn walk_block<F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, plot_only: bool, leaf: F)
 where
+    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+{
+    walk_block_where(scene, block, view, |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context), leaf);
+}
+
+/// [`walk_block`] that descends only into what `keep` accepts (a block
+/// reference it refuses is not walked at all).
+pub(crate) fn walk_block_where<K, F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, keep: K, mut leaf: F)
+where
+    K: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext) -> bool,
     F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
 {
     use crate::scene::render_graph::{BlockRoot, BlockRootRole, RenderSceneGraph, SceneRoot};
@@ -297,7 +307,7 @@ where
     let root = SceneRoot::Block(BlockRoot { record: block, role: BlockRootRole::ModelSpace });
     graph.walk_root(
         root,
-        |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context),
+        keep,
         |entity, context| {
             let owned_content = !context.root_handle.is_null()
                 && !matches!(document.get_entity(context.root_handle), Some(acadrust::EntityType::Insert(_)));
@@ -363,14 +373,8 @@ fn flatten_hatch(hatch: &acadrust::entities::Hatch, tolerance: f64) -> Result<ac
             continue;
         }
         let Some(curve) = crate::entities::hatch::edge_curve(edge) else { continue };
-        let points = curve.tessellate_within(tolerance);
-        // The kernel caps how finely it cuts a curve; check every chord.
-        let met = points.windows(2).all(|pair| {
-            let middle = [(pair[0][0] + pair[1][0]) / 2.0, (pair[0][1] + pair[1][1]) / 2.0];
-            let on = curve.point_at(curve.parameter_at(middle));
-            (on[0] - middle[0]).hypot(on[1] - middle[1]) <= tolerance * (1.0 + 1e-6)
-        });
-        if !met || points.len() < 2 {
+        let points = bounded_points(&curve, tolerance, MAX_CURVE_SEGMENTS)?;
+        if points.len() < 2 {
             return Err(TOO_LARGE.into());
         }
         *edge = BoundaryEdge::Polyline(PolylineEdge::new(points.into_iter().map(|[x, y]| Vector2::new(x, y)).collect(), false));
@@ -419,6 +423,152 @@ fn exact_fill_boundaries(fills: &mut [crate::scene::model::hatch_model::HatchMod
     }
 }
 
+/// Points along `curve`, first to last, whose chords depart from it by at
+/// most `tolerance` anywhere along their span, not only at their middles:
+///
+/// - an elliptic arc is cut in equal parameter steps `Δ ≤ √(8·tol/a)`: its
+///   second derivative is at most the major radius `a`, and a chord of a
+///   curve departs from it by at most `Δ²/8·max|C''|`;
+/// - a NURBS curve is split into its Bézier pieces by knot insertion, and each
+///   piece is halved (de Casteljau) until every control point lies within the
+///   tolerance of the chord between its ends. A piece lies in the convex hull
+///   of its control points (positive weights), so its distance from that
+///   chord is at most theirs;
+/// - lines, circles, circular arcs and polylines of those: the kernel's own
+///   cut, checked at each chord's middle, where a circular arc departs from
+///   its chord the most.
+///
+/// A curve that needs more than [`MAX_CURVE_SEGMENTS`] chords is refused.
+pub(crate) fn bounded_points(curve: &cadkernel::geom2d::Curve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
+    use cadkernel::geom2d::Curve;
+    if !(tolerance.is_finite() && tolerance > 0.0) {
+        return Err(TOO_LARGE.into());
+    }
+    match curve {
+        Curve::Ellipse(arc) => {
+            let a = arc.ellipse.major_radius.abs().max(arc.ellipse.minor_radius.abs());
+            let sweep = arc.sweep();
+            let count = if a <= 0.0 { 1.0 } else { (sweep / (8.0 * tolerance / a).sqrt()).ceil().max(1.0) };
+            if !count.is_finite() || count > MAX_CURVE_SEGMENTS as f64 {
+                return Err(TOO_LARGE.into());
+            }
+            if count >= limit as f64 {
+                return Err(OVER_LIMIT.into());
+            }
+            let count = count as usize;
+            Ok((0..=count).map(|i| arc.ellipse.point_at(arc.start_parameter + sweep * i as f64 / count as f64)).collect())
+        }
+        Curve::Nurbs(nurbs) => nurbs_points(nurbs, tolerance, limit),
+        _ => {
+            let points = curve.tessellate_within(tolerance);
+            if points.len() > limit {
+                return Err(OVER_LIMIT.into());
+            }
+            let met = points.windows(2).all(|pair| {
+                let middle = [(pair[0][0] + pair[1][0]) / 2.0, (pair[0][1] + pair[1][1]) / 2.0];
+                let on = curve.point_at(curve.parameter_at(middle));
+                (on[0] - middle[0]).hypot(on[1] - middle[1]) <= tolerance * (1.0 + 1e-6)
+            });
+            if met { Ok(points) } else { Err(TOO_LARGE.into()) }
+        }
+    }
+}
+
+/// Degrees past this are refused rather than cut (drawings use 1 to 3,
+/// rarely more; the work per span grows with the cube of the degree).
+const MAX_NURBS_DEGREE: usize = 32;
+
+/// [`bounded_points`] for a NURBS curve, in homogeneous coordinates, with at
+/// most `limit` points. Each non-empty knot span of the domain is turned
+/// into its Bézier piece by blossoming: control point `j` of the span
+/// `[a, b]` is the blossom `f(a, …, a, b, …, b)` with `j` arguments `b`,
+/// evaluated by de Boor's recurrence on the span's own `p + 1` controls. That
+/// works for clamped, unclamped and periodic knot vectors alike (its
+/// denominators are at least `b − a > 0`), needs no knot insertion and no
+/// multiplicity counts, and costs O(p³) per span.
+fn nurbs_points(nurbs: &cadkernel::geom2d::NurbsCurve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
+    let p = nurbs.degree();
+    let knots = nurbs.knots();
+    let control: Vec<[f64; 3]> = nurbs.control_points().iter().zip(nurbs.weights()).map(|(c, w)| [c[0] * w, c[1] * w, *w]).collect();
+    let n = control.len();
+    if p == 0 || p > MAX_NURBS_DEGREE || n <= p || knots.len() != n + p + 1 {
+        return Err(UNSUPPORTED_SPLINE.into());
+    }
+    let finite = knots.iter().all(|k| k.is_finite()) && control.iter().flatten().all(|v| v.is_finite());
+    if !finite || knots.windows(2).any(|w| w[0] > w[1]) || control.iter().any(|h| h[2] <= 0.0) || knots[p] >= knots[n] {
+        return Err(UNSUPPORTED_SPLINE.into());
+    }
+    let euclid = |h: [f64; 3]| [h[0] / h[2], h[1] / h[2]];
+    // The blossom of span k (U[k] < U[k+1]) at the arguments `t`.
+    let blossom = |k: usize, t: &[f64]| -> [f64; 3] {
+        let mut d: Vec<[f64; 3]> = control[k - p..=k].to_vec();
+        for (r, &tr) in t.iter().enumerate().map(|(r, t)| (r + 1, t)) {
+            for i in (r..=p).rev() {
+                let g = k - p + i;
+                let alpha = (tr - knots[g]) / (knots[g + p + 1 - r] - knots[g]);
+                d[i] = [0, 1, 2].map(|c| (1.0 - alpha) * d[i - 1][c] + alpha * d[i][c]);
+            }
+        }
+        d[p]
+    };
+    let mut out: Vec<[f64; 2]> = Vec::new();
+    for k in p..n {
+        let (a, b) = (knots[k], knots[k + 1]);
+        if a >= b {
+            continue;
+        }
+        let piece: Vec<[f64; 3]> = (0..=p)
+            .map(|j| {
+                let t: Vec<f64> = std::iter::repeat_n(a, p - j).chain(std::iter::repeat_n(b, j)).collect();
+                blossom(k, &t)
+            })
+            .collect();
+        if piece.iter().any(|h| h[2] <= 0.0 || !h.iter().all(|v| v.is_finite())) {
+            return Err(UNSUPPORTED_SPLINE.into());
+        }
+        if out.is_empty() {
+            out.push(euclid(piece[0]));
+        }
+        // Halve until flat; a stack keeps the pieces in order.
+        let mut stack = vec![(piece, 0u32)];
+        while let Some((piece, depth)) = stack.pop() {
+            let (start, end) = (euclid(piece[0]), euclid(piece[p]));
+            if piece.iter().all(|h| segment_distance(euclid(*h), start, end) <= tolerance) {
+                out.push(end);
+                if out.len() > limit {
+                    return Err(if limit < MAX_CURVE_SEGMENTS { OVER_LIMIT.into() } else { TOO_LARGE.into() });
+                }
+                continue;
+            }
+            if depth >= 60 {
+                return Err(TOO_LARGE.into());
+            }
+            // de Casteljau at the middle.
+            let (mut left, mut right) = (Vec::with_capacity(p + 1), vec![[0.0; 3]; p + 1]);
+            let mut row = piece;
+            for level in 0..=p {
+                left.push(row[0]);
+                right[p - level] = row[row.len() - 1];
+                row = row.windows(2).map(|w| [0, 1, 2].map(|j| (w[0][j] + w[1][j]) / 2.0)).collect();
+            }
+            stack.push((right, depth + 1));
+            stack.push((left, depth + 1));
+        }
+    }
+    if out.len() < 2 {
+        return Err(UNSUPPORTED_SPLINE.into());
+    }
+    Ok(out)
+}
+
+/// The distance from `point` to the segment `a`–`b`.
+fn segment_distance(point: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 == 0.0 { 0.0 } else { (((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length2).clamp(0.0, 1.0) };
+    (point[0] - a[0] - t * dx).hypot(point[1] - a[1] - t * dy)
+}
+
 /// More segments than this for one curve means a curve far larger than any
 /// plan (a circle thousands of kilometres across at 0.1 mm): refuse it.
 const MAX_CURVE_SEGMENTS: usize = 2_000_000;
@@ -426,11 +576,14 @@ const MAX_CURVE_SEGMENTS: usize = 2_000_000;
 /// An arc of radius `radius` about `center` from `start` through `sweep`
 /// radians, cut so no chord departs from it by more than `tolerance`, with
 /// no upper limit short of [`MAX_CURVE_SEGMENTS`] (unlike the kernel).
-fn arc_points(center: (f64, f64), radius: f64, start: f64, sweep: f64, tolerance: f64) -> Result<Vec<(f64, f64)>, String> {
+fn arc_points(center: (f64, f64), radius: f64, start: f64, sweep: f64, tolerance: f64, limit: usize) -> Result<Vec<(f64, f64)>, String> {
     let step = if tolerance >= radius { std::f64::consts::FRAC_PI_2 } else { (2.0 * (1.0 - tolerance / radius).acos()).min(std::f64::consts::FRAC_PI_2) };
     let count = (sweep.abs() / step).ceil().max(1.0);
     if !count.is_finite() || count > MAX_CURVE_SEGMENTS as f64 {
         return Err(TOO_LARGE.into());
+    }
+    if count >= limit as f64 {
+        return Err(OVER_LIMIT.into());
     }
     let count = count as usize;
     Ok((0..=count)
@@ -441,6 +594,9 @@ fn arc_points(center: (f64, f64), radius: f64, start: f64, sweep: f64, tolerance
         .collect())
 }
 
+/// A curve needs more points than the caller's budget allows.
+pub(crate) const OVER_LIMIT: &str = "The curve needs more points than this operation allows.";
+const UNSUPPORTED_SPLINE: &str = "A spline in the published view has a knot structure SecurePlan CAD cannot cut within the publication's precision.";
 const TOO_LARGE: &str = "A curve in the published view is too large to draw within the publication's precision. Shrink the published window or reduce the scale.";
 
 /// One polyline vertex in its OCS with the widths at the start and end of
@@ -454,12 +610,15 @@ struct WideVertex {
 
 /// Tessellate a (possibly bulged, possibly tapered) OCS polyline. Widths are
 /// interpolated linearly along each segment, as they are drawn.
-fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64) -> Result<Vec<acadrust::entities::LwVertex>, String> {
+fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64, limit: usize) -> Result<Vec<acadrust::entities::LwVertex>, String> {
+    if vertices.len() > limit {
+        return Err(OVER_LIMIT.into());
+    }
     use acadrust::entities::LwVertex;
     use acadrust::types::Vector2;
     let mut out: Vec<LwVertex> = Vec::new();
     let count = if closed { vertices.len() } else { vertices.len().saturating_sub(1) };
-    let mut push = |x: f64, y: f64, start_width: f64, end_width: f64| {
+    let push = |out: &mut Vec<LwVertex>, x: f64, y: f64, start_width: f64, end_width: f64| {
         let mut vertex = LwVertex::new(Vector2::new(x, y));
         vertex.start_width = start_width;
         vertex.end_width = end_width;
@@ -471,7 +630,7 @@ fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64) -> Re
         let chord = (b.0 - a.0).hypot(b.1 - a.1);
         let width_at = |t: f64| from.start_width + (from.end_width - from.start_width) * t;
         if from.bulge.abs() < 1e-12 || chord == 0.0 {
-            push(a.0, a.1, from.start_width, from.end_width);
+            push(&mut out, a.0, a.1, from.start_width, from.end_width);
             continue;
         }
         // bulge = tan(θ/4): radius and centre from the chord.
@@ -482,20 +641,23 @@ fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64) -> Re
         let normal = (-(b.1 - a.1) / chord, (b.0 - a.0) / chord);
         let center = (mid.0 + normal.0 * offset, mid.1 + normal.1 * offset);
         let start = (a.1 - center.1).atan2(a.0 - center.0);
-        let points = arc_points(center, radius, start, theta, tolerance)?;
+        let points = arc_points(center, radius, start, theta, tolerance, limit.saturating_sub(out.len()))?;
         let pieces = points.len() - 1;
         for (k, point) in points[..pieces].iter().enumerate() {
-            push(point.0, point.1, width_at(k as f64 / pieces as f64), width_at((k + 1) as f64 / pieces as f64));
+            push(&mut out, point.0, point.1, width_at(k as f64 / pieces as f64), width_at((k + 1) as f64 / pieces as f64));
         }
     }
     if let Some(last) = vertices.get(if closed { 0 } else { vertices.len().saturating_sub(1) }) {
-        push(last.at.0, last.at.1, 0.0, 0.0);
+        push(&mut out, last.at.0, last.at.1, 0.0, 0.0);
+    }
+    if out.len() > limit {
+        return Err(OVER_LIMIT.into());
     }
     Ok(out)
 }
 
 /// OCS → WCS for a point with the given extrusion normal.
-fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
+pub(crate) fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
     let (wx, wy, wz) = crate::scene::view::transform::ocs_point_to_wcs((x, y, elevation), (normal.x, normal.y, normal.z));
     [wx, wy, wz]
 }
@@ -504,9 +666,15 @@ fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f
 /// (normal and elevation kept, so every enclosing transform still applies
 /// to its true 3D position), and its snap end points in block coordinates.
 /// A replacement polyline and its snap end points in block coordinates.
-type Flattened = (acadrust::entities::LwPolyline, Vec<[f64; 3]>);
+pub(crate) type Flattened = (acadrust::entities::LwPolyline, Vec<[f64; 3]>);
 
-fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
+pub(crate) fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
+    flatten_within(entity, tolerance, MAX_CURVE_SEGMENTS)
+}
+
+/// [`flatten`] with at most `limit` points: a curve that needs more is
+/// [`OVER_LIMIT`] (conversion's work budget) before it is cut any further.
+pub(crate) fn flatten_within(entity: &acadrust::EntityType, tolerance: f64, limit: usize) -> Result<Option<Flattened>, String> {
     use crate::scene::model::wire_model::SnapHint;
     use acadrust::entities::{LwPolyline, LwVertex};
     use acadrust::types::{Vector2, Vector3};
@@ -514,7 +682,7 @@ fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flatt
     let plain = |points: Vec<(f64, f64)>| points.into_iter().map(|(x, y)| LwVertex::new(Vector2::new(x, y))).collect::<Vec<_>>();
     let (vertices, normal, elevation, keys) = match entity {
         EntityType::Circle(circle) => {
-            let points = arc_points((circle.center.x, circle.center.y), circle.radius, 0.0, std::f64::consts::TAU, tolerance)?;
+            let points = arc_points((circle.center.x, circle.center.y), circle.radius, 0.0, std::f64::consts::TAU, tolerance, limit)?;
             (plain(points), circle.normal, circle.center.z, Vec::new())
         }
         EntityType::Arc(arc) => {
@@ -522,7 +690,7 @@ fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flatt
             if sweep <= 0.0 {
                 sweep += std::f64::consts::TAU;
             }
-            let points = arc_points((arc.center.x, arc.center.y), arc.radius, arc.start_angle, sweep, tolerance)?;
+            let points = arc_points((arc.center.x, arc.center.y), arc.radius, arc.start_angle, sweep, tolerance, limit)?;
             let keys = [points[0], points[points.len() - 1]].map(|p| ocs_to_wcs(arc.normal, p, arc.center.z)).to_vec();
             (plain(points), arc.normal, arc.center.z, keys)
         }
@@ -542,7 +710,7 @@ fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flatt
                 })
                 .collect();
             let keys = chain.iter().map(|v| ocs_to_wcs(polyline.normal, v.at, polyline.elevation)).collect();
-            (tessellate_chain(&chain, polyline.is_closed, tolerance)?, polyline.normal, polyline.elevation, keys)
+            (tessellate_chain(&chain, polyline.is_closed, tolerance, limit)?, polyline.normal, polyline.elevation, keys)
         }
         EntityType::Polyline2D(polyline) => {
             // The vertices it draws (fit points, not the spline frame), with
@@ -562,27 +730,16 @@ fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flatt
                 })
                 .collect();
             let keys = chain.iter().map(|v| ocs_to_wcs(polyline.normal, v.at, polyline.elevation)).collect();
-            (tessellate_chain(&chain, polyline.flags.is_closed(), tolerance)?, polyline.normal, polyline.elevation, keys)
+            (tessellate_chain(&chain, polyline.flags.is_closed(), tolerance, limit)?, polyline.normal, polyline.elevation, keys)
         }
         EntityType::Ellipse(_) | EntityType::Spline(_) => {
             // Planar curves only; a curve through space stays as the renderer draws it.
             let Some(curve) = crate::entities::curve::entity_curve(entity) else { return Ok(None) };
-            let points = curve.tessellate_within(tolerance);
+            // Cut with a bound that holds along each whole chord, in the
+            // curve's plane (an isometry of space, so the bound carries over).
+            let points: Vec<[f64; 3]> = bounded_points(&curve.curve, tolerance, limit)?.into_iter().map(|uv| curve.plane.point_at(uv)).collect();
             if points.len() < 2 {
                 return Ok(None);
-            }
-            // The kernel caps how finely it cuts a curve; check every chord
-            // actually met the tolerance rather than trusting it did.
-            let met = points.windows(2).all(|pair| {
-                let middle = [0, 1, 2].map(|i| (pair[0][i] + pair[1][i]) / 2.0);
-                curve.parameter_at(middle).is_none_or(|t| {
-                    let on = curve.point_at(t);
-                    let gap = [0, 1, 2].map(|i| on[i] - middle[i]);
-                    (gap[0] * gap[0] + gap[1] * gap[1] + gap[2] * gap[2]).sqrt() <= tolerance * (1.0 + 1e-6)
-                })
-            });
-            if !met {
-                return Err(TOO_LARGE.into());
             }
             let [ux, uy, uz] = curve.plane.x_axis;
             let [vx, vy, vz] = curve.plane.y_axis;
@@ -1149,7 +1306,7 @@ pub struct ApplyError {
 }
 
 impl ApplyError {
-    fn new(code: super::session::ErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: super::session::ErrorCode, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
     }
 }
@@ -1258,6 +1415,142 @@ pub(crate) mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+    }
+
+    /// The cubic Bézier of the fix-round review: its midpoint-only check
+    /// passed a 250 mm chord that the curve leaves by ±12 mm.
+    pub(crate) fn bulging_spline() -> (acadrust::entities::Spline, impl Fn(f64) -> [f64; 2]) {
+        let control = [[0.0, 0.0], [1000.0 / 3.0, 512.0 / 3.0], [2000.0 / 3.0, -5120.0 / 3.0], [1000.0, 10752.0]];
+        let spline = acadrust::entities::Spline::from_control_points(3, control.iter().map(|[x, y]| Vector3::new(*x, *y, 0.0)).collect());
+        let at = move |t: f64| {
+            let u = 1.0 - t;
+            let b = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+            [0, 1].map(|i| (0..4).map(|k| b[k] * control[k][i]).sum())
+        };
+        (spline, at)
+    }
+
+    /// The largest distance from the exact curve (densely sampled) to the polyline.
+    pub(crate) fn polyline_departure(points: &[[f64; 2]], curve: impl Fn(f64) -> [f64; 2]) -> f64 {
+        let segment = |p: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length2 = dx * dx + dy * dy;
+            let t = if length2 == 0.0 { 0.0 } else { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2).clamp(0.0, 1.0) };
+            (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
+        };
+        (0..=20_000)
+            .map(|i| curve(i as f64 / 20_000.0))
+            .map(|p| points.windows(2).map(|w| segment(p, w[0], w[1])).fold(f64::INFINITY, f64::min))
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn a_spline_is_published_within_the_tolerance_along_every_chord() {
+        let (spline, curve) = bulging_spline();
+        for tolerance in [0.1, 1.0] {
+            let (polyline, _) = flatten(&EntityType::Spline(spline.clone()), tolerance).unwrap().expect("flattened");
+            let points: Vec<[f64; 2]> = polyline.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+            let departure = polyline_departure(&points, &curve);
+            assert!(departure <= tolerance * (1.0 + 1e-6), "the curve leaves a chord by {departure} mm at tolerance {tolerance}");
+        }
+    }
+
+    #[test]
+    fn splines_and_ellipses_of_every_kind_stay_within_the_tolerance() {
+        use acadrust::entities::{Ellipse, Spline};
+        let mut weighted = Spline::from_control_points(
+            3,
+            [[0.0, 0.0], [3000.0, 4000.0], [6000.0, -2000.0], [9000.0, 5000.0], [12000.0, 0.0], [15000.0, 3000.0]]
+                .iter()
+                .map(|[x, y]| Vector3::new(*x, *y, 0.0))
+                .collect(),
+        );
+        weighted.weights = vec![1.0, 3.0, 0.5, 2.0, 1.0, 4.0];
+        let mut fitted = Spline::new();
+        fitted.fit_points = [[0.0, 0.0], [2000.0, 3000.0], [5000.0, -1000.0], [9000.0, 4000.0], [12000.0, 0.0]]
+            .iter()
+            .map(|[x, y]| Vector3::new(*x, *y, 0.0))
+            .collect();
+        let mut ellipse = Ellipse::new();
+        ellipse.center = Vector3::new(1000.0, 2000.0, 0.0);
+        ellipse.major_axis = Vector3::new(8000.0, 3000.0, 0.0);
+        ellipse.minor_axis_ratio = 0.2;
+        ellipse.start_parameter = 0.3;
+        ellipse.end_parameter = 5.0;
+        for entity in [EntityType::Spline(weighted), EntityType::Spline(fitted), EntityType::Ellipse(ellipse)] {
+            let exact = crate::entities::curve::entity_curve(&entity).expect("a planar curve");
+            let (polyline, _) = flatten(&entity, 0.1).unwrap().expect("flattened");
+            let points: Vec<[f64; 2]> = polyline.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+            let departure = polyline_departure(&points, |t| {
+                let p = exact.point_at(t);
+                [p[0], p[1]]
+            });
+            assert!(departure <= 0.1 * (1.0 + 1e-6), "{:?}: {departure} mm", std::mem::discriminant(&entity));
+            let [first, last] = [exact.point_at(0.0), exact.point_at(1.0)];
+            assert!((points[0][0] - first[0]).hypot(points[0][1] - first[1]) < 1e-6, "starts on the curve");
+            let end = points[points.len() - 1];
+            assert!((end[0] - last[0]).hypot(end[1] - last[1]) < 1e-6, "ends on the curve");
+        }
+    }
+
+    /// Unclamped and weighted periodic splines, as drawings carry them.
+    pub(crate) fn awkward_splines() -> Vec<acadrust::entities::Spline> {
+        use acadrust::entities::Spline;
+        let spline = |degree: i32, points: &[[f64; 2]], knots: Vec<f64>, weights: Vec<f64>, periodic: bool| {
+            let mut spline = Spline::new();
+            spline.degree = degree;
+            spline.control_points = points.iter().map(|[x, y]| Vector3::new(*x, *y, 0.0)).collect();
+            spline.knots = knots;
+            spline.weights = weights;
+            spline.flags.periodic = periodic;
+            spline.flags.rational = spline.weights.iter().any(|w| *w != 1.0);
+            spline
+        };
+        // The review's case: degree 2, unclamped uniform knots.
+        let unclamped = spline(2, &[[0.0, 0.0], [1000.0, 1000.0], [2000.0, 0.0]], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], vec![1.0; 3], false);
+        let cubic = spline(
+            3,
+            &[[0.0, 0.0], [1000.0, 2000.0], [3000.0, -1000.0], [4000.0, 1500.0], [6000.0, 0.0]],
+            (0..9).map(f64::from).collect(),
+            vec![1.0, 2.0, 0.5, 3.0, 1.0],
+            false,
+        );
+        // Periodic: the first `degree` controls repeated at the end, uniform knots, weights.
+        let ring = [[0.0, 0.0], [2000.0, 0.0], [3000.0, 2000.0], [1000.0, 3000.0], [-1000.0, 1500.0]];
+        let mut closed: Vec<[f64; 2]> = ring.to_vec();
+        closed.extend_from_slice(&ring[..3]);
+        let weights = vec![1.0, 2.0, 1.0, 3.0, 1.5, 1.0, 2.0, 1.0];
+        let periodic = spline(3, &closed, (0..12).map(f64::from).collect(), weights, true);
+        vec![unclamped, cubic, periodic]
+    }
+
+    #[test]
+    fn a_spline_with_many_knots_is_published_quickly() {
+        let started = std::time::Instant::now();
+        let entity = crate::app::secureplan::convert::tests::many_knots(100_000);
+        let (polyline, _) = flatten(&entity, 0.1).unwrap().expect("flattened");
+        assert_eq!(polyline.vertices.len(), 100_000, "one point per control of a degree-1 spline");
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[test]
+    fn unclamped_and_periodic_splines_are_published_within_the_tolerance() {
+        for spline in awkward_splines() {
+            let entity = EntityType::Spline(spline);
+            let exact = crate::entities::curve::entity_curve(&entity).expect("a planar curve");
+            let (polyline, _) = flatten(&entity, 0.1).unwrap().expect("flattened");
+            let points: Vec<[f64; 2]> = polyline.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+            let departure = polyline_departure(&points, |t| {
+                let p = exact.point_at(t);
+                [p[0], p[1]]
+            });
+            assert!(departure <= 0.1 * (1.0 + 1e-6), "{departure} mm");
+            let [first, last] = [exact.point_at(0.0), exact.point_at(1.0)];
+            let end = points[points.len() - 1];
+            assert!((points[0][0] - first[0]).hypot(points[0][1] - first[1]) < 1e-6, "starts on the curve");
+            assert!((end[0] - last[0]).hypot(end[1] - last[1]) < 1e-6, "ends on the curve");
+        }
     }
 
     #[test]
@@ -1754,11 +2047,19 @@ pub(crate) mod tests {
         doc.add_entity(EntityType::Circle(circle)).unwrap();
         let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
         assert!(refused.contains("too large"), "{refused}");
-        let mut doc = CadDocument::new();
+        // A 100 km ellipse is cut in steps its curvature bound allows, far
+        // past the kernel's cap; one a hundred thousand times larger is refused.
         let mut ellipse = Ellipse::new();
         ellipse.center = Vector3::new(1500.0, 1500.0 - 1.0e8, 0.0);
         ellipse.major_axis = Vector3::new(0.0, 1.0e8, 0.0);
         ellipse.minor_axis_ratio = 0.5;
+        let mut doc = CadDocument::new();
+        let handle = doc.add_entity(EntityType::Ellipse(ellipse.clone())).unwrap();
+        let publication = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).unwrap();
+        assert!(replaced(&publication, handle).vertices.len() > 16_385);
+        ellipse.major_axis = Vector3::new(0.0, 1.0e13, 0.0);
+        ellipse.center = Vector3::new(1500.0, 1500.0 - 1.0e13, 0.0);
+        let mut doc = CadDocument::new();
         doc.add_entity(EntityType::Ellipse(ellipse)).unwrap();
         let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
         assert!(refused.contains("too large"), "{refused}");

@@ -65,6 +65,16 @@ pub enum Msg {
     Loaded(super::import::LoadDone),
     /// Apply's outputs finished building on a worker.
     ApplyBuilt(super::session::ApplyBuilt),
+    /// Conversion candidates were assembled on a worker.
+    Converted(super::convert::Done),
+    /// An export's drawing was read and the design added, on a worker.
+    ExportComposed(super::export::ComposeDone),
+    /// An export was written and checked, on a worker.
+    ExportWritten(super::export::WriteDone),
+    /// The export's Save dialog closed (tab id, export, chosen file).
+    ExportPicked(u64, super::export::JobKey, Option<Redacted<PathBuf>>),
+    /// An export was written to its file, on a worker.
+    ExportSaved(super::export::SaveDone),
     /// The import file dialog closed (tab id, chosen file).
     ImportPicked(u64, Option<Redacted<PathBuf>>),
     /// Mouse input in a dialog field.
@@ -121,6 +131,13 @@ pub struct State {
     /// Unit tests can hold worker jobs to interleave their completions.
     #[cfg(test)]
     pub held_jobs: Option<HeldJobs>,
+    /// Unit tests stand in for an open export Save dialog: a written export
+    /// with no file waits in `Saving`.
+    #[cfg(test)]
+    pub test_hold_save: bool,
+    /// Unit tests make the next worker job panic.
+    #[cfg(test)]
+    pub test_panic_next_job: bool,
     /// A notice for the command line once the editor runs (expired recovery copies).
     pub notice: Option<String>,
     /// The main window is closing and SecurePlan drawings are being decided.
@@ -156,6 +173,10 @@ impl Default for State {
             test_pick: None,
             #[cfg(test)]
             held_jobs: None,
+            #[cfg(test)]
+            test_hold_save: false,
+            #[cfg(test)]
+            test_panic_next_job: false,
             notice: None,
             quitting: false,
         };
@@ -362,6 +383,7 @@ impl OpenCADStudio {
                     self.command_line.push_info(&notice);
                 }
                 self.secureplan_expire_waiting();
+                self.secureplan_show_waiting_export();
                 self.secureplan_report_states();
                 Task::none()
             }
@@ -372,6 +394,24 @@ impl OpenCADStudio {
             Msg::ApplyBuilt(built) => {
                 self.secureplan_worker_done();
                 self.secureplan_apply_built(built)
+            }
+            Msg::Converted(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_converted(done)
+            }
+            Msg::ExportComposed(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_export_composed(done)
+            }
+            Msg::ExportWritten(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_export_written(done)
+            }
+            Msg::ExportPicked(tab_id, key, path) => self.secureplan_export_picked(tab_id, key, path.map(|path| path.expose().clone())),
+            Msg::ExportSaved(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_export_saved(done);
+                Task::none()
             }
             Msg::ImportPicked(tab_id, Some(path)) => {
                 // The tab the picker was opened for, if it may still import.
@@ -627,8 +667,10 @@ impl OpenCADStudio {
     }
 
     /// Run `work` off the UI thread and handle its message when it is done.
-    /// Unit tests run it at once, on their own thread.
-    pub(crate) fn secureplan_run_job<F>(&mut self, work: F) -> Task<Message>
+    /// If `work` panics, `failed` is delivered instead, so the operation it
+    /// belongs to always ends (never busy for good). Unit tests run it at
+    /// once, on their own thread.
+    pub(crate) fn secureplan_run_job<F>(&mut self, work: F, failed: Msg) -> Task<Message>
     where
         F: FnOnce() -> Msg + Send + 'static,
     {
@@ -636,19 +678,31 @@ impl OpenCADStudio {
         self.secureplan.workers += 1;
         self.secureplan_refresh_guards();
         #[cfg(test)]
+        let test_panic = std::mem::take(&mut self.secureplan.test_panic_next_job);
+        let guarded = move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                #[cfg(test)]
+                if test_panic {
+                    panic!("a worker failed (test)");
+                }
+                work()
+            }))
+            .unwrap_or(failed)
+        };
+        #[cfg(test)]
         {
             if let Some(held) = self.secureplan.held_jobs.as_mut() {
-                held.0.push(Box::new(work));
+                held.0.push(Box::new(guarded));
                 return Task::none();
             }
-            let message = work();
+            let message = guarded();
             self.secureplan_update(message)
         }
         #[cfg(not(test))]
         {
             let (sender, receiver) = iced::futures::channel::oneshot::channel();
             std::thread::spawn(move || {
-                let _ = sender.send(work());
+                let _ = sender.send(guarded());
             });
             Task::perform(async move { receiver.await.ok() }, |message| match message {
                 Some(message) => Message::SecurePlan(message),
@@ -669,6 +723,7 @@ impl OpenCADStudio {
         match self.secureplan.dialog.as_mut() {
             Some(Dialog::Align(dialog)) => dialog.refresh(),
             Some(Dialog::Apply(dialog)) => dialog.refresh(),
+            Some(Dialog::Export(dialog)) => dialog.refresh(),
             _ => {}
         }
     }
@@ -676,7 +731,8 @@ impl OpenCADStudio {
     /// Carry out a dialog button.
     pub(crate) fn secureplan_action(&mut self, action: Action) -> Task<Message> {
         // The dialog that asked closes, unless the action keeps it.
-        let keeps_dialog = matches!(action, Action::AlignConfirm | Action::ApplyConfirm | Action::ApplyReset);
+        let keeps_dialog =
+            matches!(action, Action::AlignConfirm | Action::ApplyConfirm | Action::ApplyReset | Action::ExportSave | Action::ExportCancel);
         if !keeps_dialog {
             self.secureplan.dialog = None;
         }
@@ -686,7 +742,7 @@ impl OpenCADStudio {
             self.secureplan.quitting = false;
             self.pending_tab_closes.clear();
         }
-        match action {
+        let task = match action {
             Action::Dismiss => Task::none(),
             Action::CancelLoad(tab_id) => {
                 self.secureplan_cancel_load(tab_id);
@@ -744,7 +800,16 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
-        }
+            Action::Convert(tab_id, kind) => self.secureplan_convert(tab_id, kind),
+            Action::ExportSave => self.secureplan_export_save(),
+            Action::ExportCancel => {
+                self.secureplan_export_cancel();
+                Task::none()
+            }
+        };
+        // An export dialog that waited for this one comes up now.
+        self.secureplan_show_waiting_export();
+        task
     }
 
     /// Run a SecurePlan command, or refuse a guarded one. `None` lets the
@@ -814,6 +879,11 @@ impl OpenCADStudio {
             "SECUREPLANIMPORT" => return Some(self.secureplan_start_import(self.tabs[self.active_tab].id)),
             "SECUREPLANALIGN" => self.secureplan_open_align(false),
             "SECUREPLANAPPLY" => return Some(self.secureplan_begin_apply()),
+            "SECUREPLANCONVERT" => match argument.map(super::convert::Kind::parse) {
+                None => return Some(self.secureplan_open_convert(None)),
+                Some(Some(kind)) => return Some(self.secureplan_open_convert(Some(kind))),
+                Some(None) => self.command_line.push_error("Usage: SECUREPLANCONVERT [WALLS|ROUTE]"),
+            },
             "SECUREPLANOVERLAY" => {
                 self.secureplan.overlay_visible = !self.secureplan.overlay_visible;
                 let state = if self.secureplan.overlay_visible { "shown" } else { "hidden" };
