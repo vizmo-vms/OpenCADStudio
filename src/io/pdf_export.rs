@@ -108,7 +108,7 @@ fn drawing_unit_pt() -> f32 {
 
 #[cfg(all(feature = "secureplan", not(target_arch = "wasm32")))]
 thread_local! {
-    static SECUREPLAN_PAGE: std::cell::Cell<Option<crate::app::secureplan::publish::PageTransform>> =
+    static SECUREPLAN_PAGE: std::cell::Cell<Option<crate::app::secureplan::publish::LayerTransform>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -126,16 +126,12 @@ pub fn secureplan_page_pdf(layers: Vec<crate::app::secureplan::publish::PageLaye
             SECUREPLAN_PAGE.with(|page| page.set(None));
         }
     }
-    let placement = layers.first().ok_or("No page content.")?.transform.placement;
+    let placement = layers.first().ok_or("No page content.")?.transform.page.placement;
     let (width_pt, height_pt) = (placement.width_pt, placement.height_pt);
     let (w, h) = (width_pt as f32, height_pt as f32);
     let corner = |x: f32, y: f32| LinePoint { p: Point { x: Pt(x), y: Pt(y) }, bezier: false };
-    let clip_to = |[x0, y0, x1, y1]: [f32; 4]| Op::DrawPolygon {
-        polygon: Polygon {
-            rings: vec![PolygonRing { points: vec![corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1)] }],
-            mode: PaintMode::Clip,
-            winding_order: WindingOrder::NonZero,
-        },
+    let clip_to = |points: Vec<LinePoint>| Op::DrawPolygon {
+        polygon: Polygon { rings: vec![PolygonRing { points }], mode: PaintMode::Clip, winding_order: WindingOrder::NonZero },
     };
     let single = layers.len() == 1;
     let mut doc = PdfDocument::new("SecurePlan plan");
@@ -177,14 +173,14 @@ pub fn secureplan_page_pdf(layers: Vec<crate::app::secureplan::publish::PageLaye
             ops.extend(background);
         }
         ops.push(Op::SaveGraphicsState);
-        if let Some([x0, y0, x1, y1]) = layer.clip {
-            ops.push(clip_to([x0 as f32, y0 as f32, x1 as f32, y1 as f32]));
+        for clip in &layer.clips {
+            ops.push(clip_to(clip.iter().map(|&[x, y]| corner(x as f32, y as f32)).collect()));
         }
         ops.extend(layer_ops);
         ops.push(Op::RestoreGraphicsState);
     }
     // Nothing outside the published page is visible.
-    ops.splice(0..0, [Op::SaveGraphicsState, clip_to([0.0, 0.0, w, h])]);
+    ops.splice(0..0, [Op::SaveGraphicsState, clip_to(vec![corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)])]);
     ops.push(Op::RestoreGraphicsState);
     let mut pdf_page = first_page.ok_or("No page was written.")?;
     pdf_page.ops = ops;

@@ -18,7 +18,7 @@ use iced::{Element, Length};
 use super::{Action, Field, FieldKind, Form};
 use crate::app::secureplan::align::{check_placement, mapping_at, trim_margin_to_canvas, Alignment};
 use crate::app::secureplan::layout::{sheet_too_large, LayoutReference};
-use crate::app::secureplan::publish::{choose_mm_per_pt, place_page, ApplyPlan, Mapping, PublishedView, Snapshot};
+use crate::app::secureplan::publish::{check_contract, choose_mm_per_pt, place_page, ApplyPlan, Mapping, PublishedView, Snapshot};
 use crate::app::Message;
 
 /// Model space, or one of the paper layouts.
@@ -193,7 +193,9 @@ impl ApplyDialog {
                 return Err(unacknowledged());
             }
             let view = PublishedView::Layout(Box::new(reference.clone()));
-            return Ok(ApplyPlan { view, mapping, mm_per_pt: transform.placement.mm_per_pt, damaged_acknowledged });
+            let plan = ApplyPlan { view, mapping, mm_per_pt: transform.placement.mm_per_pt, damaged_acknowledged };
+            check_contract(&plan)?;
+            return Ok(plan);
         }
         let window = self.window()?;
         let mapping = self.mapping(window);
@@ -203,7 +205,9 @@ impl ApplyDialog {
         if !damaged_acknowledged {
             return Err(unacknowledged());
         }
-        Ok(ApplyPlan { view: PublishedView::Model { window_cad: window }, mapping, mm_per_pt, damaged_acknowledged })
+        let plan = ApplyPlan { view: PublishedView::Model { window_cad: window }, mapping, mm_per_pt, damaged_acknowledged };
+        check_contract(&plan)?;
+        Ok(plan)
     }
 
     pub fn summary(&self) -> Vec<String> {
@@ -347,6 +351,32 @@ mod tests {
         assert!(empty.select_view(Some("Sheet A1")));
         assert!(!empty.select_view(Some("No such layout")));
         assert_eq!(empty.plan().unwrap().transform().unwrap().placement.page_world_min, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_page_beyond_the_contract_bounds_is_refused_before_anything_is_built() {
+        // Model space: a 20 km window at 2000 mm per point is exactly the
+        // 20,000,000 mm page width (and a 10,000,000 mm centre) the schema allows.
+        let mut model = dialog(true, [0.0, 0.0]);
+        model.set_window([0.0, 0.0, 2.0e7, 1000.0]);
+        let plan = model.plan().expect("at the bounds");
+        assert_eq!(plan.transform().unwrap().placement.width_mm, 2.0e7);
+        model.set_window([0.0, 0.0, 2.0e7 + 1.0, 1000.0]);
+        let refused = model.plan().unwrap_err();
+        assert!(refused.starts_with("The published page is outside what SecurePlan accepts: placement.") && refused.contains("out of range (maximum"), "{refused}");
+
+        // A layout: the A1 sheet at 1:100 is 2384 pt of s × 3.53 mm, so a
+        // drawing in feet (304.8 mm per unit) would be a 25.6 km page.
+        let mut layout = layout_dialog(0.0, true);
+        for (scale, fits) in [(237.0, true), (238.0, false), (304.8, false)] {
+            layout.alignment.mapping.scale_mm_per_cad_unit = scale;
+            assert!(layout.select_view(Some("Sheet A1")));
+            let result = layout.plan();
+            assert_eq!(result.is_ok(), fits, "{scale}: {result:?}");
+            if let Err(refused) = result {
+                assert!(refused.contains("placement.") && refused.contains("out of range (maximum"), "{refused}");
+            }
+        }
     }
 
     #[test]

@@ -143,9 +143,14 @@ impl Collector<'_> {
 pub fn extract(publication: &Publication) -> SnapGeometry {
     let page = &publication.transform;
     let mut collector = Collector { page, clip: publication.clip, out: SnapGeometry::default() };
-    super::publish::walk_model(&publication.scene, true, |entity, context| {
+    let mut leaf = |entity: &EntityType, context: &crate::scene::render_graph::InstanceContext| {
         collector.entity(publication, entity, &context.transform);
-    });
+    };
+    match &publication.layout {
+        // Model space as the layout's reference viewport shows it.
+        Some(layout) => super::publish::walk_block(&publication.scene, layout.reference.model_block, Some(&layout.reference), true, &mut leaf),
+        None => super::publish::walk_model(&publication.scene, true, &mut leaf),
+    }
     collector.out
 }
 

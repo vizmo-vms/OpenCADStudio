@@ -169,11 +169,14 @@ fn validate(value: &Value, schema: &Value, file: &str, path: &str) -> Result<(),
                 return fail("expected an integer");
             }
             let bound = |key: &str| schema.get(key).and_then(Value::as_f64);
-            if bound("minimum").is_some_and(|min| number < min)
-                || bound("maximum").is_some_and(|max| number > max)
-                || bound("exclusiveMinimum").is_some_and(|min| number <= min)
-            {
-                return fail("out of range");
+            if let Some(min) = bound("minimum").filter(|min| number < *min) {
+                return fail(&format!("out of range (minimum {min})"));
+            }
+            if let Some(max) = bound("maximum").filter(|max| number > *max) {
+                return fail(&format!("out of range (maximum {max})"));
+            }
+            if let Some(min) = bound("exclusiveMinimum").filter(|min| number <= *min) {
+                return fail(&format!("out of range (more than {min})"));
             }
         }
         Some("boolean") if !value.is_boolean() => return fail("expected a boolean"),
@@ -188,6 +191,14 @@ fn validate(value: &Value, schema: &Value, file: &str, path: &str) -> Result<(),
 pub fn validate_payload(schema_file: &str, value: &Value) -> Result<(), ProtocolError> {
     let schema = schemas().get(schema_file).ok_or_else(|| ProtocolError("unknown payload schema".into()))?;
     validate(value, schema, schema_file, "$").map_err(ProtocolError)
+}
+
+/// Validate `value` against one node of a protocol schema (for example
+/// `("common.schema.json", "/$defs/placement")`), reporting it as `path`.
+pub fn validate_node(schema_file: &str, pointer: &str, value: &Value, path: &str) -> Result<(), ProtocolError> {
+    let schema = schemas().get(schema_file).and_then(|schema| schema.pointer(pointer)).ok_or_else(|| ProtocolError("unknown schema node".into()))?;
+    validate(value, schema, schema_file, path).map_err(ProtocolError)?;
+    semantic_checks(&serde_json::json!({ path: value })).map_err(ProtocolError)
 }
 
 fn semantic_checks(message: &Value) -> Result<(), String> {

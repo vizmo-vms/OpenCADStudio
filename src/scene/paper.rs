@@ -857,4 +857,37 @@ impl Scene {
     ) -> Arc<Vec<WireModel>> {
         self.model_wires_for_viewport(vp_handle, screen_height_px)
     }
+
+    /// SecurePlan (PUB-03 layouts): the context native paper rendering uses
+    /// for model space seen through `viewport`: the model block, the
+    /// viewport's frozen layers, its annotation scale and the annotation
+    /// multiplier.
+    #[cfg(feature = "secureplan")]
+    pub(crate) fn secureplan_viewport_context(
+        &self,
+        viewport: Handle,
+    ) -> (Handle, rustc_hash::FxHashSet<Handle>, Option<Handle>, f32) {
+        let frozen = match self.document.get_entity(viewport) {
+            Some(EntityType::Viewport(vp)) => vp.frozen_layers.iter().copied().collect(),
+            _ => rustc_hash::FxHashSet::default(),
+        };
+        (
+            self.model_space_block_handle(),
+            frozen,
+            self.viewport_scale_handle(viewport),
+            self.viewport_annotation_multiplier(viewport),
+        )
+    }
+
+    /// SecurePlan (PUB-03 layouts): the plot hatches and wipeouts of model
+    /// space as `viewport` shows them, in model coordinates (not projected).
+    #[cfg(feature = "secureplan")]
+    pub(crate) fn secureplan_viewport_fills(&self, viewport: Handle) -> (Vec<HatchModel>, Vec<HatchModel>) {
+        let (model, frozen, scale, _) = self.secureplan_viewport_context(viewport);
+        let all_visible = self.annotation_all_visible();
+        (
+            self.plot_hatches_for_block(model, Some(&frozen), scale, all_visible, false),
+            self.plot_wipeouts_for_block(model, Some(&frozen), scale, all_visible, false),
+        )
+    }
 }

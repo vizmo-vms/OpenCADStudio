@@ -52,8 +52,25 @@ pub struct LayoutReference {
     pub model_center: [f64; 2],
     /// The model directions of paper +x and +y: a quarter turn, exactly.
     pub basis: [[f64; 2]; 2],
-    /// Layers frozen in the viewport.
-    pub frozen_layers: Vec<Handle>,
+    /// The other viewports that show the drawing on the sheet, in the
+    /// layout's order; the reference goes at `reference_position` in it.
+    pub others: Vec<SheetView>,
+    pub reference_position: usize,
+}
+
+/// Another viewport on a published sheet: a plan view (any twist), drawn
+/// exactly from model space but giving no snaps.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetView {
+    pub viewport: Handle,
+    /// `[x0, y0, x1, y1]` in paper units.
+    pub rect: [f64; 4],
+    /// The boundary it is clipped to, if not its rectangle.
+    pub boundary: Option<Handle>,
+    /// Model → paper, `[a, b, c, d, e, f]`: `(a·x + b·y + e, c·x + d·y + f)`.
+    pub to_paper: [f64; 6],
+    /// Model units per paper unit.
+    pub model_per_paper: f64,
 }
 
 impl LayoutReference {
@@ -162,6 +179,7 @@ pub fn sheet_too_large(sheet_mm: [f64; 2]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Problem {
     NoView,
+    DepthClipped,
     Clipped,
     Perspective,
     NotPlan,
@@ -173,6 +191,7 @@ impl Problem {
     fn text(self) -> &'static str {
         match self {
             Problem::NoView => "has no valid size or view",
+            Problem::DepthClipped => "uses front or back clipping, which SecurePlan cannot publish",
             Problem::Clipped => "is clipped to a non-rectangular boundary",
             Problem::Perspective => "shows a perspective view",
             Problem::NotPlan => "does not look straight down on the plan",
@@ -215,11 +234,37 @@ fn crosses([x0, y0]: [f64; 2], [x1, y1]: [f64; 2], rect: [f64; 4]) -> bool {
     t0 <= t1
 }
 
+/// Whether the viewport looks straight down on the plan (+Z).
+fn looks_down(viewport: &acadrust::entities::Viewport) -> bool {
+    let direction = viewport.view_direction;
+    let length = (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z).sqrt();
+    length > 0.0 && direction.z > 0.0 && direction.x.abs() <= 1e-9 * length && direction.y.abs() <= 1e-9 * length
+}
+
+/// Whether a point is inside the rings (even-odd).
+fn inside(rings: &[Vec<[f64; 2]>], [x, y]: [f64; 2]) -> bool {
+    let mut inside = false;
+    for ring in rings {
+        for (i, a) in ring.iter().enumerate() {
+            let b = ring[(i + 1) % ring.len()];
+            if (a[1] > y) != (b[1] > y) && x < a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
 /// Whether the viewport shows any visible model geometry (its own frozen
-/// layers excluded), measured through the renderer's own viewport frame.
+/// layers excluded), measured through the renderer's own viewport frame:
+/// a drawn line, or a fill (a solid hatch has no lines).
 fn shows_geometry(model: &crate::scene::Scene, viewport: Handle, frame: &crate::scene::viewport_ref::ViewportFrame, rect: [f64; 4]) -> bool {
+    let to_paper = |x: f64, y: f64| {
+        let paper = frame.model_to_paper(glam::DVec3::new(x, y, 0.0));
+        [paper.x, paper.y]
+    };
     let wires = model.model_wires_for_viewport_arc(viewport, 0.0);
-    wires.iter().filter(|wire| wire.plot_visible).any(|wire| {
+    let lines = wires.iter().filter(|wire| wire.plot_visible).any(|wire| {
         let mut previous: Option<[f64; 2]> = None;
         (0..wire.points.len()).any(|index| {
             let [x, y, z] = wire.points[index];
@@ -228,16 +273,58 @@ fn shows_geometry(model: &crate::scene::Scene, viewport: Handle, frame: &crate::
                 return false;
             }
             let point = wire.point_world(index, 0.0);
-            let paper = frame.model_to_paper(point);
-            let here = [paper.x, paper.y];
-            let hit = match previous {
-                Some(before) => crosses(before, here, rect),
-                None => crosses(here, here, rect),
-            };
+            let here = to_paper(point.x, point.y);
+            let hit = crosses(previous.unwrap_or(here), here, rect);
             previous = Some(here);
             hit
         })
+    });
+    if lines {
+        return true;
+    }
+    let (hatches, wipeouts) = model.secureplan_viewport_fills(viewport);
+    let centre = [(rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0];
+    hatches.iter().chain(&wipeouts).any(|fill| {
+        let mut rings = vec![Vec::new()];
+        for point in fill.boundary.iter() {
+            if point[0].is_finite() && point[1].is_finite() {
+                let at = to_paper(fill.world_origin[0] + point[0] as f64, fill.world_origin[1] + point[1] as f64);
+                rings.last_mut().expect("a ring").push(at);
+            } else {
+                rings.push(Vec::new());
+            }
+        }
+        rings.retain(|ring| ring.len() >= 3);
+        // An edge crosses the viewport, or the fill covers it.
+        rings.iter().any(|ring| (0..ring.len()).any(|i| crosses(ring[i], ring[(i + 1) % ring.len()], rect))) || inside(&rings, centre)
     })
+}
+
+/// A viewport's model → paper map as it saves it, exactly, when the renderer
+/// shows that saved view (it fits a stale view to the drawing instead):
+/// `(to_paper, model_per_paper, twist)`.
+fn saved_view(viewport: &acadrust::entities::Viewport, frame: &crate::scene::viewport_ref::ViewportFrame) -> Option<([f64; 6], f64, f64)> {
+    use std::f64::consts::TAU;
+    // The renderer turns the model by ±twist; take the sign it uses.
+    let apart = |a: f64, b: f64| ((a - b).rem_euclid(TAU)).min((b - a).rem_euclid(TAU));
+    let twist = viewport.twist_angle;
+    let theta = [twist, -twist].into_iter().find(|t| apart(frame.twist, *t) <= 1e-4)?;
+    let k = viewport.view_height.abs() / viewport.height.abs();
+    let (sin, cos) = theta.sin_cos();
+    let (cx, cy) = (viewport.view_center.x, viewport.view_center.y);
+    // The model point at the centre: target plus the view centre along the
+    // model directions of paper +x (cos, −sin) and +y (sin, cos).
+    let target = [viewport.view_target.x + cos * cx + sin * cy, viewport.view_target.y - sin * cx + cos * cy];
+    let slack = 1e-5 * (1.0 + cx.abs() + cy.abs() + viewport.view_height.abs()) + 1e-9 * (target[0].abs() + target[1].abs());
+    let same = (frame.model_target.x - target[0]).abs() <= slack
+        && (frame.model_target.y - target[1]).abs() <= slack
+        && (frame.scale * k - 1.0).abs() <= 1e-5;
+    if !same {
+        return None;
+    }
+    let (a, b, c, d) = (cos / k, -sin / k, sin / k, cos / k);
+    let (px, py) = (viewport.center.x, viewport.center.y);
+    Some(([a, b, c, d, px - (a * target[0] + b * target[1]), py - (c * target[0] + d * target[1])], k, theta))
 }
 
 /// The paper layouts of the drawing, each with its reference viewport or
@@ -287,18 +374,18 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
         let handle = viewport.common.handle;
         let rect = rect_of(viewport);
         let frame = model.viewport_frame(handle);
-        let direction = viewport.view_direction;
-        let length = (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z).sqrt();
         let problem = if !(viewport.width.abs() > 0.0 && viewport.height.abs() > 0.0 && viewport.view_height.abs() > 0.0)
             || !rect.iter().all(|v| v.is_finite())
             || !viewport.view_height.is_finite()
         {
             Some(Problem::NoView)
+        } else if viewport.status.front_clipping || viewport.status.back_clipping {
+            Some(Problem::DepthClipped)
         } else if !viewport.clip_boundary_handle.is_null() {
             Some(Problem::Clipped)
         } else if viewport.status.perspective {
             Some(Problem::Perspective)
-        } else if !(length > 0.0 && direction.z > 0.0 && direction.x.abs() <= 1e-9 * length && direction.y.abs() <= 1e-9 * length)
+        } else if !looks_down(viewport)
             // The renderer's own frame: a mirrored or oblique view has none.
             || frame.is_none()
         {
@@ -316,6 +403,7 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
     let candidates: Vec<_> = judged.iter().filter(|(_, _, _, problem)| problem.is_none()).collect();
     let (viewport, rect, frame) = match candidates.as_slice() {
         [(viewport, rect, Some(frame), _)] => (*viewport, *rect, *frame),
+        [(viewport, ..)] => return refuse(format!("viewport {} {}.", hex(viewport.common.handle), Problem::NotPlan.text())),
         [] => {
             let reasons: Vec<String> =
                 judged.iter().filter_map(|(viewport, _, _, problem)| problem.map(|p| format!("viewport {} {}", hex(viewport.common.handle), p.text()))).collect();
@@ -372,6 +460,41 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
         return refuse(format!("viewport {} {}.", hex(viewport.common.handle), Problem::NoGeometry.text()));
     }
 
+    // The other viewports that show the drawing are drawn on the sheet as
+    // exactly as the reference: plan views only, without depth clipping.
+    let mut others = Vec::new();
+    let mut reference_position = 0;
+    for (other, other_rect, other_frame, problem) in &judged {
+        let handle = other.common.handle;
+        if handle == viewport.common.handle {
+            reference_position = others.len();
+            continue;
+        }
+        if *problem == Some(Problem::NoView) {
+            continue; // Nothing drawn.
+        }
+        if other.status.front_clipping || other.status.back_clipping {
+            return refuse(format!("viewport {} {}.", hex(handle), Problem::DepthClipped.text()));
+        }
+        let Some(frame) = other_frame.filter(|_| !other.status.perspective && looks_down(other)) else {
+            return refuse(format!(
+                "viewport {} shows a 3D view, which SecurePlan cannot draw on a published sheet. Turn it off to publish this layout.",
+                hex(handle)
+            ));
+        };
+        if !shows_geometry(model, handle, &frame, *other_rect) {
+            continue; // Nothing drawn.
+        }
+        let Some((to_paper, model_per_paper, _)) = saved_view(other, &frame) else {
+            return refuse(format!("viewport {} {}.", hex(handle), Problem::NoGeometry.text()));
+        };
+        let boundary = (!other.clip_boundary_handle.is_null()).then_some(other.clip_boundary_handle);
+        if boundary.is_some_and(|b| !matches!(paper.document.get_entity(b), Some(EntityType::Circle(_) | EntityType::LwPolyline(_) | EntityType::Polyline2D(_) | EntityType::Ellipse(_) | EntityType::Spline(_)))) {
+            return refuse(format!("viewport {} is clipped by a boundary SecurePlan cannot read.", hex(handle)));
+        }
+        others.push(SheetView { viewport: handle, rect: *other_rect, boundary, to_paper, model_per_paper });
+    }
+
     let Some(((x0, y0), (x1, y1))) = paper.paper_limits() else { return refuse("its sheet has no size.".into()) };
     let paper_units_per_mm = paper.paper_space_unit_factor();
     let reference = LayoutReference {
@@ -384,7 +507,8 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
         model_per_paper,
         model_center,
         basis,
-        frozen_layers: viewport.frozen_layers.clone(),
+        others,
+        reference_position,
     };
     let [width_mm, height_mm] = reference.sheet_mm();
     let side = |mm: f64| (mm * PT_PER_MM - 1e-9).ceil();
@@ -543,12 +667,48 @@ pub(crate) mod tests {
         off.status.is_on = false;
         assert_eq!(refusal(vec![off]), "Layout \"Sheet A1\": it has no viewport that is turned on.");
 
-        // A second, non-plan viewport beside the plan does not stop it.
+        // Depth clipping would publish and snap other storeys (PUB-03).
+        for (front, back) in [(true, false), (false, true)] {
+            let mut clipped = plan_viewport((420.0, 300.0), 0.0);
+            clipped.status.front_clipping = front;
+            clipped.status.back_clipping = back;
+            let refused = refusal(vec![clipped]);
+            assert!(refused.ends_with("uses front or back clipping, which SecurePlan cannot publish."), "{refused}");
+        }
+
+        // Another viewport can be drawn on the sheet only as a plan view
+        // without depth clipping.
         let mut iso = plan_viewport((740.0, 480.0), 0.0);
         iso.width = 100.0;
         iso.height = 100.0;
         iso.view_direction = Vector3::new(1.0, -1.0, 1.0);
-        assert!(found(&layout_scene(vec![plan_viewport((300.0, 300.0), 0.0), iso]).0).is_ok());
+        let refused = refusal(vec![plan_viewport((300.0, 300.0), 0.0), iso.clone()]);
+        assert!(refused.ends_with("shows a 3D view, which SecurePlan cannot draw on a published sheet. Turn it off to publish this layout."), "{refused}");
+        iso.status.back_clipping = true;
+        let refused = refusal(vec![plan_viewport((300.0, 300.0), 0.0), iso]);
+        assert!(refused.ends_with("uses front or back clipping, which SecurePlan cannot publish."), "{refused}");
+    }
+
+    #[test]
+    fn a_viewport_showing_only_a_solid_fill_shows_the_drawing() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use acadrust::types::Vector2;
+        // A 1:10 viewport onto a solid hatch far from everything else.
+        let mut viewport = plan_viewport((420.0, 300.0), 0.0);
+        viewport.view_target = Vector3::new(61000.0, 1000.0, 0.0);
+        viewport.view_height = 1800.0;
+        let (mut scene, _) = layout_scene(vec![viewport]);
+        assert!(found(&scene).unwrap_err().ends_with("shows none of the drawing's model geometry."));
+        let mut path = BoundaryPath::new();
+        let corners = [[59000.0, -1000.0], [63000.0, -1000.0], [63000.0, 3000.0], [59000.0, 3000.0]].map(|[x, y]| Vector2::new(x, y));
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(corners.to_vec(), true)));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        scene.add_entity(EntityType::Hatch(hatch));
+        scene.rebuild_derived_caches();
+        // The fill covers the whole viewport: no edge is in view.
+        assert!(found(&scene).is_ok(), "{:?}", found(&scene));
     }
 
     #[test]
@@ -631,8 +791,13 @@ pub(crate) mod tests {
         let expected = [paper.apply(270.0, 210.0), paper.apply(570.0, 390.0)];
         // Paper and page are both y up.
         assert_eq!(viewport_page, [expected[0].0, expected[0].1, expected[1].0, expected[1].1]);
+        // The model view is drawn inside a q … Q scope clipped exactly to the
+        // viewport, and the wall crossing its edge stays inside that scope.
         let ops = publish::tests::operations(&pdf);
-        assert!(ops.iter().filter(|op| op.operator == "W").count() >= 2, "no viewport clip");
+        let (open, close, depths) = clip_scope(&ops, viewport_page);
+        let wall = op_at(&ops, model.apply(-5000.0, 5000.0));
+        assert!(open < wall && wall < close, "the crossing wall escapes the viewport clip");
+        assert_eq!(depths[close + 1], depths[open], "the state is restored after the viewport");
 
         // Snaps: model geometry inside the viewport only.
         let snapped: Vec<[f64; 2]> = geometry.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
@@ -661,6 +826,187 @@ pub(crate) mod tests {
             let middle = ((s[0] + s[2]) as f64 / 2.0, (s[1] + s[3]) as f64 / 2.0);
             assert!(radius - (middle.0 - cx).hypot(middle.1 - cy) <= tolerance + 2.0 * r_pt);
         }
+    }
+
+    /// The q/Q depth before each operation.
+    fn depths(ops: &[lopdf::content::Operation]) -> Vec<i32> {
+        let mut depth = 0;
+        ops.iter()
+            .map(|op| {
+                let before = depth;
+                depth += match op.operator.as_str() {
+                    "q" => 1,
+                    "Q" => -1,
+                    _ => 0,
+                };
+                before
+            })
+            .collect()
+    }
+
+    /// The `q` opening the scope clipped to the page rectangle `rect` and the
+    /// `Q` closing it (the clip path is exactly the rectangle's corners).
+    fn clip_scope(ops: &[lopdf::content::Operation], rect: [f64; 4]) -> (usize, usize, Vec<i32>) {
+        let depths = depths(ops);
+        let number = |o: &lopdf::Object| o.as_float().map(f64::from).or_else(|_| o.as_i64().map(|v| v as f64)).unwrap();
+        for (w, _) in ops.iter().enumerate().filter(|(_, op)| op.operator == "W") {
+            let mut start = w;
+            let mut corners = Vec::new();
+            while start > 0 && matches!(ops[start - 1].operator.as_str(), "m" | "l" | "h") {
+                start -= 1;
+                if ops[start].operator != "h" {
+                    corners.push([number(&ops[start].operands[0]), number(&ops[start].operands[1])]);
+                }
+            }
+            let expected = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]]];
+            let exact = corners.len() == 4 && expected.iter().all(|e| corners.iter().any(|c| (c[0] - e[0]).abs() < 1e-3 && (c[1] - e[1]).abs() < 1e-3));
+            if !exact {
+                continue;
+            }
+            assert_eq!(ops[start - 1].operator, "q", "the viewport clip is not scoped");
+            let close = (w..ops.len()).find(|&i| ops[i].operator == "Q" && depths[i] == depths[w]).expect("the clip scope closes");
+            return (start - 1, close, depths);
+        }
+        panic!("no clip path is the viewport rectangle {rect:?}");
+    }
+
+    /// The index of the first path operation at `point` (page points).
+    fn op_at(ops: &[lopdf::content::Operation], (x, y): (f64, f64)) -> usize {
+        let number = |o: &lopdf::Object| o.as_float().map(f64::from).or_else(|_| o.as_i64().map(|v| v as f64)).unwrap();
+        ops.iter()
+            .position(|op| (op.operator == "m" || op.operator == "l") && (number(&op.operands[0]) - x).abs() < 1e-3 && (number(&op.operands[1]) - y).abs() < 1e-3)
+            .unwrap_or_else(|| panic!("nothing is drawn at ({x}, {y})"))
+    }
+
+    #[test]
+    fn paper_space_drawn_last_is_outside_the_viewport_clip() {
+        let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        for object in scene.document.objects.values_mut() {
+            if let acadrust::objects::ObjectType::Layout(layout) = object {
+                if layout.name == LAYOUT {
+                    layout.plot_flags.draw_viewports_first = true;
+                }
+            }
+        }
+        scene.rebuild_derived_caches();
+        let reference = found(&scene).unwrap();
+        let mapping = mm_mapping();
+        let (pdf, _, _) = publish_layout(&scene, &reference, &mapping);
+        let (_, paper) = reference.transforms(&mapping).unwrap();
+        let ops = publish::tests::operations(&pdf);
+        let (open, close, depths) = clip_scope(&ops, reference.viewport_on_page(&paper));
+        let title = op_at(&ops, paper.apply(20.0, 20.0));
+        assert!(title > close, "the title block is drawn inside the viewport clip");
+        assert_eq!(depths[close + 1], depths[open], "the state is restored after the viewport");
+    }
+
+    #[test]
+    fn the_viewport_annotation_scale_places_annotative_blocks() {
+        use acadrust::entities::Insert;
+        use acadrust::xdata::ExtendedDataRecord;
+        let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        // The drawing's own annotation scale is 1:1; the 1:100 viewport's is 1:100.
+        scene.set_annotation_scale_named("1:100").unwrap();
+        scene.set_annotation_scale_named("1:1").unwrap();
+        // A 10-unit annotative symbol at (15000, 3000): 1000 units at 1:100.
+        snap::tests::block(&mut scene.document, "SYMBOL", vec![line(0.0, 0.0, 10.0, 0.0)]);
+        let mut insert = Insert::new("SYMBOL", Vector3::new(15000.0, 3000.0, 0.0));
+        insert.common.extended_data.add_record(ExtendedDataRecord::new("AcAnnotativeData"));
+        scene.document.add_entity(EntityType::Insert(insert)).unwrap();
+        scene.rebuild_derived_caches();
+        let reference = found(&scene).unwrap();
+        let mapping = mm_mapping();
+        let (pdf, _, geometry) = publish_layout(&scene, &reference, &mapping);
+        let (model, _) = reference.transforms(&mapping).unwrap();
+        let drawn = publish::tests::content_points(&pdf);
+        let ends: Vec<[f64; 2]> = geometry.segments.iter().flat_map(|s| [[s[0] as f64, s[1] as f64], [s[2] as f64, s[3] as f64]]).collect();
+        let (scaled, unscaled) = (model.apply(16000.0, 3000.0), model.apply(15010.0, 3000.0));
+        assert!(near(&drawn, scaled, 1e-3) && near(&ends, scaled, 1e-3), "the symbol is not at the viewport's 1:100 size");
+        assert!(!near(&drawn, unscaled, 1e-3) && !near(&ends, unscaled, 1e-3), "the symbol is at the drawing's 1:1 size");
+    }
+
+    /// A circular 1:10 detail viewport onto the column at (5000, 5000), beside
+    /// the plan: clipped to a circle on the sheet, so not a second plan.
+    fn with_detail(scene: &mut Scene) -> Handle {
+        scene.set_current_layout(LAYOUT.into());
+        let mut outline = acadrust::entities::Circle::new();
+        outline.center = Vector3::new(720.0, 470.0, 0.0);
+        outline.radius = 100.0;
+        let outline = scene.add_entity(EntityType::Circle(outline));
+        let mut detail = plan_viewport((720.0, 470.0), 0.0);
+        detail.id = 3;
+        (detail.width, detail.height, detail.view_height) = (200.0, 200.0, 2000.0);
+        detail.view_target = Vector3::new(5000.0, 5000.0, 0.0);
+        detail.clip_boundary_handle = outline;
+        let detail = scene.add_entity(EntityType::Viewport(detail));
+        scene.set_current_layout("Model".into());
+        scene.rebuild_derived_caches();
+        detail
+    }
+
+    #[test]
+    fn an_enlarged_detail_viewport_is_drawn_exactly_within_the_page_precision() {
+        let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        let detail = with_detail(&mut scene);
+        let reference = found(&scene).unwrap();
+        assert_eq!(reference.others.len(), 1);
+        assert_eq!((reference.others[0].viewport, reference.others[0].model_per_paper), (detail, 10.0));
+        let mapping = mm_mapping();
+        let (pdf, publication, geometry) = publish_layout(&scene, &reference, &mapping);
+        let (model, paper) = reference.transforms(&mapping).unwrap();
+        let place = |x: f64, y: f64| {
+            let [a, b, c, d, e, f] = reference.others[0].to_paper;
+            paper.apply(a * x + b * y + e, c * x + d * y + f)
+        };
+        let (cx, cy) = place(5000.0, 5000.0);
+        assert!((cx - paper.apply(720.0, 470.0).0).abs() < 1e-9 && (cy - paper.apply(720.0, 470.0).1).abs() < 1e-9);
+        // Every chord of the column, 10× enlarged, within the page's chord
+        // tolerance, and every vertex where the f64 transform puts it.
+        let radius = place(5300.0, 5000.0).0 - cx;
+        let tolerance = model.placement.chord_tolerance_mm / model.placement.mm_per_pt;
+        let r_pt = model.placement.rounding_bound_mm / model.placement.mm_per_pt;
+        let drawn = publish::tests::content_points(&pdf);
+        let column: Vec<[f64; 2]> = drawn.iter().copied().filter(|p| ((p[0] - cx).hypot(p[1] - cy) - radius).abs() < 0.01).collect();
+        assert!(column.len() > 300, "{} vertices", column.len());
+        let mut chords = 0;
+        for pair in column.windows(2) {
+            if (pair[0][0] - pair[1][0]).hypot(pair[0][1] - pair[1][1]) < 5.0 {
+                let middle = [(pair[0][0] + pair[1][0]) / 2.0, (pair[0][1] + pair[1][1]) / 2.0];
+                assert!(radius - (middle[0] - cx).hypot(middle[1] - cy) <= tolerance + 2.0 * r_pt, "a chord misses the page precision");
+                chords += 1;
+            }
+        }
+        assert!(chords > 300);
+        let column_polyline = publication
+            .scene
+            .document
+            .entities()
+            .find_map(|entity| match entity {
+                EntityType::LwPolyline(p) if p.vertices.iter().all(|v| ((v.location.x - 5000.0).hypot(v.location.y - 5000.0) - 300.0).abs() < 1e-6) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("the column is re-tessellated");
+        let worst = column_polyline
+            .vertices
+            .iter()
+            .map(|vertex| {
+                let (x, y) = place(vertex.location.x, vertex.location.y);
+                drawn.iter().map(|p| (p[0] - x).hypot(p[1] - y)).fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0, f64::max);
+        // One f32 rounding per coordinate: within √2·r.
+        assert!(worst <= r_pt * std::f64::consts::SQRT_2, "the detail is {worst} pt from where its f64 transform puts it (r = {r_pt} pt)");
+        // Clipped to its circle on the sheet.
+        let ops = publish::tests::operations(&pdf);
+        let paths: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.operator == "W")
+            .map(|(w, _)| ops[..w].iter().rev().take_while(|op| matches!(op.operator.as_str(), "m" | "l" | "h")).filter(|op| op.operator == "l").count())
+            .collect();
+        assert!(paths.iter().any(|&edges| edges > 32), "no circular clip: {paths:?}");
+        let snapped: Vec<[f64; 2]> = geometry.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
+        assert!(!near(&snapped, (cx, cy), radius * 1.5), "the detail gives snaps");
     }
 
     #[test]
