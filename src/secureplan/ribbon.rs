@@ -3,7 +3,7 @@
 //! Every button runs a command, so each is also reachable from the keyboard
 //! by typing it at the command line:
 //! `SECUREPLANIMPORT`, `SECUREPLANALIGN`, `SECUREPLANAPPLY`,
-//! `SECUREPLANOVERLAY`, `SECUREPLANTRUST`, `SECUREPLANREVOKE` and
+//! `SECUREPLANCONVERT`, `SECUREPLANOVERLAY`, `SECUREPLANTRUST`, `SECUREPLANREVOKE` and
 //! `SECUREPLANDEVORIGINS`. The command `SECUREPLAN` opens the same actions as
 //! a keyboard menu with visible focus (the upstream ribbon has no keyboard
 //! focus of its own). Labels are text, never colour alone.
@@ -15,10 +15,11 @@ use crate::modules::{CadModule, IconKind, ModuleEvent, RibbonGroup, RibbonItem, 
 pub struct SecurePlanModule;
 
 /// The SecurePlan commands, in ribbon order: (command, label, glyph).
-pub const COMMANDS: [(&str, &str, &str); 7] = [
+pub const COMMANDS: [(&str, &str, &str); 8] = [
     ("SECUREPLANIMPORT", "Import drawing", "⤓"),
     ("SECUREPLANALIGN", "Align", "⌖"),
     ("SECUREPLANAPPLY", "Apply", "✓"),
+    ("SECUREPLANCONVERT", "Convert selection", "⇄"),
     ("SECUREPLANOVERLAY", "Design overlay", "◫"),
     ("SECUREPLANTRUST", "Trusted websites", "☰"),
     ("SECUREPLANREVOKE", "Revoke trust", "✕"),
@@ -38,10 +39,10 @@ fn groups() -> &'static [RibbonGroup] {
                 title: "Survey drawing",
                 tools: vec![RibbonItem::LargeTool(tool(0)), RibbonItem::LargeTool(tool(1)), RibbonItem::LargeTool(tool(2))],
             },
-            RibbonGroup { title: "SecurePlan design", tools: vec![RibbonItem::LabeledTool(tool(3))] },
+            RibbonGroup { title: "SecurePlan design", tools: vec![RibbonItem::LabeledTool(tool(3)), RibbonItem::LabeledTool(tool(4))] },
             RibbonGroup {
                 title: "Trust",
-                tools: vec![RibbonItem::LabeledTool(tool(4)), RibbonItem::LabeledTool(tool(5)), RibbonItem::LabeledTool(tool(6))],
+                tools: vec![RibbonItem::LabeledTool(tool(5)), RibbonItem::LabeledTool(tool(6)), RibbonItem::LabeledTool(tool(7))],
             },
         ]
     })

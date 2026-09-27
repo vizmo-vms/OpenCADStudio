@@ -220,6 +220,8 @@ pub struct ApplyInFlight {
     pub drawing: Drawing,
     /// Whether it is the writer's output (not the verbatim loaded bytes).
     pub written: bool,
+    /// The alignment sent: the survey's stored mapping once committed.
+    pub alignment: Alignment,
 }
 
 /// The survey's plan as `openSession` or `planUpdate` describe it. It is
@@ -288,6 +290,13 @@ pub struct Bound {
     pub survey_empty: bool,
     /// The mapping the next Apply uses (stored or newly aligned).
     pub alignment: Option<Alignment>,
+    /// The survey's stored mapping (its current `cadPlan`), never a local
+    /// re-alignment: conversion and export map with it (CNV-02, EXP-02).
+    pub plan_alignment: Option<Alignment>,
+    /// `convertRequest`s waiting for their `convertResult`.
+    pub converts: Vec<String>,
+    /// The CAD export under way, if any (EXP-01..03).
+    pub export: Option<super::export::ExportJob>,
     /// The user re-aligned a plan that already had a stored mapping.
     pub realigned: bool,
     pub busy: Option<Busy>,
@@ -333,6 +342,9 @@ impl Bound {
             overlay: None,
             survey_empty: false,
             alignment: None,
+            plan_alignment: None,
+            converts: Vec::new(),
+            export: None,
             realigned: false,
             busy: None,
             error: None,
@@ -352,6 +364,7 @@ impl Bound {
         self.plan_version = meta.plan_version;
         self.has_plan = meta.has_plan;
         self.alignment = meta.alignment;
+        self.plan_alignment = meta.alignment;
         self.realigned = false;
         self.staged = None;
         self.unresolved = false;
@@ -513,7 +526,10 @@ impl OpenCADStudio {
             let body = json!({
                 "dirty": tab.dirty || bound.unapplied(),
                 "activeView": active_view(&tab.scene),
-                "busy": bound.busy.map(|busy| json!({ "operation": busy.operation, "progress": busy.progress })),
+                "busy": bound
+                    .busy
+                    .or(bound.export.as_ref().map(|_| Busy { operation: "export", progress: None }))
+                    .map(|busy| json!({ "operation": busy.operation, "progress": busy.progress })),
                 "error": bound.error.map(|code| json!({ "code": code.as_str() })),
             });
             if bound.last_state.as_ref() != Some(&body) {
@@ -601,8 +617,11 @@ impl OpenCADStudio {
             bound.session = None;
             bound.busy = None;
             bound.apply = None;
+            bound.converts.clear();
             bound.last_state = None;
             let tab_id = bound.tab_id;
+            // An export answers its session only: it ends with it.
+            self.secureplan_drop_export(tab_id);
             self.secureplan_release_held(tab_id);
         }
         super::testdriver_event("closed", "");
@@ -719,21 +738,11 @@ impl OpenCADStudio {
             }
             "applyResult" => self.secureplan_apply_result(session, &request_id, &body),
             "planUpdate" => self.secureplan_plan_update(session, &body),
-            "exportRequest" => {
-                // CAD export arrives in a later version (EXP-01..03).
-                for key in ["drawingTransferId", "payloadTransferId"] {
-                    if let Some(id) = body[key].as_u64() {
-                        self.secureplan_take_transfer(session, id as u32);
-                    }
-                }
-                self.command_line.push_error("SecurePlan: CAD export is not available in this version of SecurePlan CAD.");
-                self.secureplan_send(
-                    session,
-                    json!({ "type": "exportResult", "requestId": request_id, "status": "error", "code": "INVALID" }),
-                );
+            "exportRequest" => self.secureplan_export_request(session, &request_id, &body),
+            "convertResult" => {
+                self.secureplan_convert_result(session, &request_id, &body);
                 Task::none()
             }
-            // Conversion arrives in a later version (CNV-01..03).
             _ => Task::none(),
         };
         self.secureplan_report_states();
@@ -818,6 +827,7 @@ impl OpenCADStudio {
             bound.error = None;
             bound.last_state = None;
             bound.apply = None;
+            bound.converts.clear();
             if keep_local {
                 bound.plan_version = meta.plan_version;
                 bound.has_plan = meta.has_plan;
@@ -1003,6 +1013,7 @@ impl OpenCADStudio {
 
     /// Forget a bound tab: its session ends with `documentClosed`.
     pub(crate) fn secureplan_unbind(&mut self, tab_id: u64) {
+        self.secureplan_drop_export(tab_id);
         let Some(position) = self.secureplan.sessions.bound.iter().position(|b| b.tab_id == tab_id) else { return };
         let bound = self.secureplan.sessions.bound.remove(position);
         self.secureplan.command_guard.unbind_tab(tab_id);
@@ -1286,7 +1297,13 @@ impl OpenCADStudio {
             return fail(self, Some(ErrorCode::TransferFailed), "The request could not be sent to SecurePlan.".into());
         }
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(built.tab_id) {
-            bound.apply = Some(ApplyInFlight { request_id, snapshot_revision: built.snapshot_revision, drawing: outputs.drawing, written: outputs.written });
+            bound.apply = Some(ApplyInFlight {
+                request_id,
+                snapshot_revision: built.snapshot_revision,
+                drawing: outputs.drawing,
+                written: outputs.written,
+                alignment: built.alignment,
+            });
             bound.alignment = Some(built.alignment);
         }
         let mut note = "SecurePlan: sent. Confirm the Apply in SecurePlan.".to_string();
@@ -1330,6 +1347,7 @@ impl OpenCADStudio {
             bound.recovered_base = None;
             bound.replace_confirmed = false;
             bound.realigned = false;
+            bound.plan_alignment = Some(apply.alignment);
             // Written by the writer, the stored drawing no longer holds the
             // damaged items the reader dropped.
             if apply.written {
@@ -1911,10 +1929,13 @@ pub(crate) mod tests {
         let _ = h.app.dispatch_command("SECUREPLAN");
         let Some(Dialog::Choice { form, .. }) = &h.app.secureplan.dialog else { panic!("no menu") };
         let labels: Vec<&str> = form.buttons.iter().map(|(label, _)| label.as_str()).collect();
-        assert_eq!(labels, ["Import drawing", "Align", "Apply", "Design overlay", "Trusted websites", "Revoke trust", "Developer origins", "Close"]);
+        assert_eq!(
+            labels,
+            ["Import drawing", "Align", "Apply", "Convert selection", "Design overlay", "Trusted websites", "Revoke trust", "Developer origins", "Close"]
+        );
         assert_eq!(form.focus, 0, "focus starts on the first action");
         // Down to "Developer origins", then Enter.
-        for _ in 0..6 {
+        for _ in 0..7 {
             h.key(DialogKey::Next);
         }
         h.key(DialogKey::Activate);
@@ -2153,9 +2174,12 @@ pub(crate) mod tests {
         assert!(!near(late, &points) && !near(late, &snaps), "the edit leaked into the outputs");
         // Committed: the edit made after the snapshot keeps the document dirty.
         let request_id = request["requestId"].clone();
+        assert_eq!(h.bound().plan_alignment, None, "nothing stored before the commit");
         h.send(json!({ "type": "applyResult", "requestId": request_id, "status": "committed", "planVersion": 1, "baseIdentity": BASE }));
         assert_eq!(h.bound().base_identity, BASE);
         assert_eq!(h.bound().plan_version, Some(1));
+        // The applied mapping is the survey's stored one now (conversion and export map with it).
+        assert_eq!(h.bound().plan_alignment.map(|a| a.mapping_json()), Some(request["mapping"].clone()));
         assert!(h.app.tabs[h.app.active_tab].dirty);
         assert!(h.bound().apply.is_none() && h.bound().busy.is_none());
     }

@@ -375,7 +375,7 @@ pub fn welcome(request_id: &str) -> Value {
         "requestId": request_id,
         "desktopVersion": super::VERSION,
         "protocol": super::PROTOCOL,
-        "capabilities": ["overlay", "import", "apply", "layoutView"],
+        "capabilities": ["overlay", "import", "apply", "layoutView", "convert", "export"],
     })
 }
 
@@ -420,6 +420,14 @@ mod tests {
 
     fn direction(name: &str) -> Direction {
         if name == "webToDesktop" { Direction::WebToDesktop } else { Direction::DesktopToWeb }
+    }
+
+    #[test]
+    fn welcome_offers_conversion_and_export() {
+        let welcome = welcome("w1");
+        validate_message(Direction::DesktopToWeb, &welcome).unwrap();
+        let capabilities: Vec<&str> = welcome["capabilities"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(capabilities, ["overlay", "import", "apply", "layoutView", "convert", "export"]);
     }
 
     #[test]

@@ -65,6 +65,12 @@ pub enum Msg {
     Loaded(super::import::LoadDone),
     /// Apply's outputs finished building on a worker.
     ApplyBuilt(super::session::ApplyBuilt),
+    /// An export's drawing was read and the design added, on a worker.
+    ExportComposed(super::export::ComposeDone),
+    /// An export was written and checked, on a worker.
+    ExportWritten(super::export::WriteDone),
+    /// The export's Save dialog closed (tab id, request id, chosen file).
+    ExportPicked(u64, String, Option<Redacted<PathBuf>>),
     /// The import file dialog closed (tab id, chosen file).
     ImportPicked(u64, Option<Redacted<PathBuf>>),
     /// Mouse input in a dialog field.
@@ -362,6 +368,7 @@ impl OpenCADStudio {
                     self.command_line.push_info(&notice);
                 }
                 self.secureplan_expire_waiting();
+                self.secureplan_show_waiting_export();
                 self.secureplan_report_states();
                 Task::none()
             }
@@ -372,6 +379,17 @@ impl OpenCADStudio {
             Msg::ApplyBuilt(built) => {
                 self.secureplan_worker_done();
                 self.secureplan_apply_built(built)
+            }
+            Msg::ExportComposed(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_export_composed(done)
+            }
+            Msg::ExportWritten(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_export_written(done)
+            }
+            Msg::ExportPicked(tab_id, request_id, path) => {
+                self.secureplan_export_picked(tab_id, &request_id, path.map(|path| path.expose().clone()))
             }
             Msg::ImportPicked(tab_id, Some(path)) => {
                 // The tab the picker was opened for, if it may still import.
@@ -669,6 +687,7 @@ impl OpenCADStudio {
         match self.secureplan.dialog.as_mut() {
             Some(Dialog::Align(dialog)) => dialog.refresh(),
             Some(Dialog::Apply(dialog)) => dialog.refresh(),
+            Some(Dialog::Export(dialog)) => dialog.refresh(),
             _ => {}
         }
     }
@@ -676,7 +695,8 @@ impl OpenCADStudio {
     /// Carry out a dialog button.
     pub(crate) fn secureplan_action(&mut self, action: Action) -> Task<Message> {
         // The dialog that asked closes, unless the action keeps it.
-        let keeps_dialog = matches!(action, Action::AlignConfirm | Action::ApplyConfirm | Action::ApplyReset);
+        let keeps_dialog =
+            matches!(action, Action::AlignConfirm | Action::ApplyConfirm | Action::ApplyReset | Action::ExportSave | Action::ExportCancel);
         if !keeps_dialog {
             self.secureplan.dialog = None;
         }
@@ -686,7 +706,7 @@ impl OpenCADStudio {
             self.secureplan.quitting = false;
             self.pending_tab_closes.clear();
         }
-        match action {
+        let task = match action {
             Action::Dismiss => Task::none(),
             Action::CancelLoad(tab_id) => {
                 self.secureplan_cancel_load(tab_id);
@@ -744,7 +764,16 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
-        }
+            Action::Convert(tab_id, kind) => self.secureplan_convert(tab_id, kind),
+            Action::ExportSave => self.secureplan_export_save(),
+            Action::ExportCancel => {
+                self.secureplan_export_cancel();
+                Task::none()
+            }
+        };
+        // An export dialog that waited for this one comes up now.
+        self.secureplan_show_waiting_export();
+        task
     }
 
     /// Run a SecurePlan command, or refuse a guarded one. `None` lets the
@@ -814,6 +843,11 @@ impl OpenCADStudio {
             "SECUREPLANIMPORT" => return Some(self.secureplan_start_import(self.tabs[self.active_tab].id)),
             "SECUREPLANALIGN" => self.secureplan_open_align(false),
             "SECUREPLANAPPLY" => return Some(self.secureplan_begin_apply()),
+            "SECUREPLANCONVERT" => match argument.map(super::convert::Kind::parse) {
+                None => return Some(self.secureplan_open_convert(None)),
+                Some(Some(kind)) => return Some(self.secureplan_open_convert(Some(kind))),
+                Some(None) => self.command_line.push_error("Usage: SECUREPLANCONVERT [WALLS|ROUTE]"),
+            },
             "SECUREPLANOVERLAY" => {
                 self.secureplan.overlay_visible = !self.secureplan.overlay_visible;
                 let state = if self.secureplan.overlay_visible { "shown" } else { "hidden" };

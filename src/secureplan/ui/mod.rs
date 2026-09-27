@@ -42,6 +42,11 @@ pub enum Action {
     AlignConfirm,
     ApplyConfirm,
     ApplyReset,
+    /// Convert tab `.0`'s selection (CNV-01).
+    Convert(u64, crate::app::secureplan::convert::Kind),
+    /// The export dialog's **Export…** and Cancel (EXP-03).
+    ExportSave,
+    ExportCancel,
     /// Run a SecurePlan ribbon command (the keyboard menu of the tab).
     Command(&'static str),
 }
@@ -194,6 +199,7 @@ pub enum Dialog {
     Progress { tab_id: u64, title: String, text: String, started: std::time::Instant, form: Form },
     Align(Box<align_dialog::AlignDialog>),
     Apply(Box<apply_dialog::ApplyDialog>),
+    Export(Box<export_dialog::ExportDialog>),
 }
 
 impl Dialog {
@@ -221,6 +227,7 @@ impl Dialog {
             Dialog::Choice { form, .. } | Dialog::Progress { form, .. } => form,
             Dialog::Align(dialog) => &mut dialog.form,
             Dialog::Apply(dialog) => &mut dialog.form,
+            Dialog::Export(dialog) => &mut dialog.form,
         }
     }
 
@@ -229,6 +236,7 @@ impl Dialog {
             Dialog::Choice { form, .. } | Dialog::Progress { form, .. } => form,
             Dialog::Align(dialog) => &dialog.form,
             Dialog::Apply(dialog) => &dialog.form,
+            Dialog::Export(dialog) => &dialog.form,
         }
     }
 }
@@ -356,6 +364,7 @@ pub fn view<'a>(base: Element<'a, Message>, dialog: &'a Dialog) -> Element<'a, M
         }
         Dialog::Align(dialog) => ("Align the drawing to the survey", align_dialog::view(dialog)),
         Dialog::Apply(dialog) => ("Apply to SecurePlan", apply_dialog::view(dialog)),
+        Dialog::Export(dialog) => ("Export CAD with the SecurePlan design", export_dialog::view(dialog)),
     };
     crate::ui::modal::modal(
         base,

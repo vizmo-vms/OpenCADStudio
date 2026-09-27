@@ -274,8 +274,18 @@ where
 /// [`walk_model`] for the entities of `block` (model or a paper space), in
 /// the drawing's own annotation context or, for model space seen through a
 /// paper viewport, in that viewport's (`view`).
-pub(crate) fn walk_block<F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, plot_only: bool, mut leaf: F)
+pub(crate) fn walk_block<F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, plot_only: bool, leaf: F)
 where
+    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+{
+    walk_block_where(scene, block, view, |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context), leaf);
+}
+
+/// [`walk_block`] that descends only into what `keep` accepts (a block
+/// reference it refuses is not walked at all).
+pub(crate) fn walk_block_where<K, F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, keep: K, mut leaf: F)
+where
+    K: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext) -> bool,
     F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
 {
     use crate::scene::render_graph::{BlockRoot, BlockRootRole, RenderSceneGraph, SceneRoot};
@@ -297,7 +307,7 @@ where
     let root = SceneRoot::Block(BlockRoot { record: block, role: BlockRootRole::ModelSpace });
     graph.walk_root(
         root,
-        |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context),
+        keep,
         |entity, context| {
             let owned_content = !context.root_handle.is_null()
                 && !matches!(document.get_entity(context.root_handle), Some(acadrust::EntityType::Insert(_)));
@@ -495,7 +505,7 @@ fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64) -> Re
 }
 
 /// OCS → WCS for a point with the given extrusion normal.
-fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
+pub(crate) fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
     let (wx, wy, wz) = crate::scene::view::transform::ocs_point_to_wcs((x, y, elevation), (normal.x, normal.y, normal.z));
     [wx, wy, wz]
 }
@@ -504,9 +514,9 @@ fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f
 /// (normal and elevation kept, so every enclosing transform still applies
 /// to its true 3D position), and its snap end points in block coordinates.
 /// A replacement polyline and its snap end points in block coordinates.
-type Flattened = (acadrust::entities::LwPolyline, Vec<[f64; 3]>);
+pub(crate) type Flattened = (acadrust::entities::LwPolyline, Vec<[f64; 3]>);
 
-fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
+pub(crate) fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
     use crate::scene::model::wire_model::SnapHint;
     use acadrust::entities::{LwPolyline, LwVertex};
     use acadrust::types::{Vector2, Vector3};

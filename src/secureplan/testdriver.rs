@@ -24,12 +24,27 @@
 //!   `apply-failed <reason>`. `damaged=publish` ticks "Publish without N
 //!   damaged items", which a drawing with damaged items needs on every Apply.
 //! - `status`: print the state of the most recently opened drawing.
+//! - `select all|none|layer=<name>`: select every visible model-space
+//!   object, none, or those on one layer (the name is the rest of the line).
+//! - `convert walls|route`: convert the selection as **Create SecurePlan
+//!   walls** or **Create cable route** would (CNV-01, CNV-02).
+//! - `export [format=dwg|dxf] [version=AC10nn] [loss=accept] path=<file>`:
+//!   answer the export dialog of the web's `exportRequest`: the format and
+//!   version (the applied drawing's own by default), "Export without the
+//!   objects listed", and the file to write instead of the native Save
+//!   dialog. `path=` comes last: the path is the rest of the line.
+//!   `export cancel` cancels it.
 //!
 //! Outcomes arrive later as `secureplan-test: event <name> [detail]` lines:
 //! `opened edit|view`, `loaded`, `imported <format> <version>`,
 //! `import-failed <code>`, `aligned <units>`, `apply-sent`,
-//! `applied <plan version>`, `apply-failed <code>`, `closed`, and
-//! `status …` / `error <reason>` for driver requests.
+//! `applied <plan version>`, `apply-failed <code>`, `closed`,
+//! `selected <n>`, `convert-sent <walls|route> <n> rejected=<n>`,
+//! `convert-refused <reason>`, `converted <n>`, `convert-cancelled`,
+//! `convert-failed <code>`, `export-ready`, `export-loss <n>`,
+//! `exported <format> <version>`, `export-cancelled`, `export-failed <code>`,
+//! and `status …` / `error <reason>` for driver requests. No event carries a
+//! path, a file name or drawing content.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -55,6 +70,11 @@ pub enum Command {
     /// `layout`: publish that paper layout instead of model space.
     Apply { window: Option<[f64; 4]>, publish_damaged: bool, layout: Option<String> },
     Status,
+    /// `None`: nothing; `Some(None)`: everything visible; `Some(Some(layer))`: one layer.
+    Select(Option<Option<String>>),
+    Convert(super::convert::Kind),
+    /// Answer the export dialog: save to `path`, or cancel when `None`.
+    Export { path: Option<PathBuf>, format: Option<super::session::Format>, version: Option<acadrust::DxfVersion>, accept_loss: bool },
 }
 
 struct Inbox {
@@ -160,6 +180,37 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Apply { window: window_cad, publish_damaged, layout })
         }
         "status" if rest.is_empty() => Ok(Command::Status),
+        "select" => match rest.trim() {
+            "all" => Ok(Command::Select(Some(None))),
+            "none" => Ok(Command::Select(None)),
+            layer => match layer.strip_prefix("layer=") {
+                Some(name) if !name.is_empty() => Ok(Command::Select(Some(Some(name.to_string())))),
+                _ => Err("select all, none or layer=<name>".into()),
+            },
+        },
+        "convert" => super::convert::Kind::parse(rest.trim()).map(Command::Convert).ok_or_else(|| "convert walls or route".into()),
+        "export" if rest.trim() == "cancel" => Ok(Command::Export { path: None, format: None, version: None, accept_loss: false }),
+        "export" => {
+            // `path=` comes last; the path may contain spaces.
+            let (rest, path) = match rest.split_once("path=") {
+                Some((before, path)) if !path.trim().is_empty() => (before, PathBuf::from(path.trim())),
+                _ => return Err("export needs path=<file> (last)".into()),
+            };
+            let (mut format, mut version, mut accept_loss) = (None, None, false);
+            for option in rest.split_whitespace().map(|option| option.split_once('=').ok_or(format!("bad option {option}"))) {
+                match option? {
+                    ("format", "dwg") => format = Some(super::session::Format::Dwg),
+                    ("format", "dxf") => format = Some(super::session::Format::Dxf),
+                    ("version", value) => version = Some(acadrust::DxfVersion::parse(value).ok_or("bad version")?),
+                    ("loss", "accept") => accept_loss = true,
+                    (other, _) => return Err(format!("unknown option {other}")),
+                }
+            }
+            if version.is_some() && format.is_none() {
+                return Err("version needs format".into());
+            }
+            Ok(Command::Export { path: Some(path), format, version, accept_loss })
+        }
         _ => Err("unknown command".into()),
     }
 }
@@ -199,6 +250,45 @@ impl OpenCADStudio {
         };
         self.active_tab = index;
         match command {
+            Command::Select(which) => {
+                let scene = &mut self.tabs[index].scene;
+                scene.deselect_all();
+                let count = match which {
+                    None => 0,
+                    Some(None) => scene.select_all_visible(),
+                    Some(Some(layer)) => {
+                        let handles: Vec<_> = scene
+                            .document
+                            .entities()
+                            .filter(|e| e.common().owner_handle == scene.document.header.model_space_block_handle && e.common().layer == layer)
+                            .map(|e| e.common().handle)
+                            .collect();
+                        scene.select_entities(&handles);
+                        scene.selected.len()
+                    }
+                };
+                event("selected", &count.to_string());
+                Task::none()
+            }
+            Command::Convert(kind) => self.secureplan_open_convert(Some(kind)),
+            Command::Export { path: None, .. } => {
+                self.secureplan_show_waiting_export();
+                if matches!(self.secureplan.dialog, Some(super::ui::Dialog::Export(_))) {
+                    self.secureplan_export_cancel();
+                } else {
+                    event("error", "no export is waiting");
+                }
+                Task::none()
+            }
+            Command::Export { path: Some(path), format, version, accept_loss } => {
+                match self.secureplan_export_to(path, format, version, accept_loss) {
+                    Ok(task) => task,
+                    Err(reason) => {
+                        event("error", &reason);
+                        Task::none()
+                    }
+                }
+            }
             Command::Status => {
                 let bound = self.secureplan.sessions.by_tab(tab_id).expect("found above");
                 let detail = format!(
@@ -387,6 +477,39 @@ mod tests {
     }
 
     #[test]
+    fn the_driver_converts_a_selection_and_exports_to_a_path() {
+        use crate::app::secureplan::session::tests::{sample, Harness, BASE};
+        use crate::app::secureplan::session::Format;
+        use crate::app::secureplan::{export, overlay, testutil};
+        use serde_json::json;
+        let mut h = Harness::new("driver_convert_export");
+        h.survey_empty = false;
+        let mut plan = sample("openSession-edit")["cadPlan"].clone();
+        plan["mapping"] = json!({ "cadOrigin": [0.0, 18000.0], "anchorMm": [0.0, 0.0], "scaleMmPerCadUnit": 1.0, "quarterTurns": 0 });
+        h.open(Some(("synthetic.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", plan, BASE, "edit");
+        let _ = h.app.secureplan_driver(parse("select all").unwrap());
+        assert!(!h.app.tabs[h.app.active_tab].scene.selected.is_empty());
+        let _ = h.app.secureplan_driver(parse("convert walls").unwrap());
+        let (request, _) = h.receive("convertRequest");
+        // The outline's four sides, the room's four and the diagonal; the
+        // column and the door swing are cut into chords under 150 mm.
+        assert_eq!(request["candidates"]["walls"].as_array().unwrap().len(), 9);
+        assert!(request["candidates"]["rejected"].as_array().unwrap().iter().all(|r| r["reason"] == "tooShort"));
+
+        let payload = export::tests::sample_payload();
+        let drawing_id = h.transfer("plan.dxf", "image/vnd.dxf", &testutil::synthetic_dxf());
+        let payload_id = h.transfer("export.json", export::MEDIA_TYPE, payload.to_string().as_bytes());
+        h.send(json!({ "type": "exportRequest", "requestId": "x1", "snapshot": payload["snapshot"], "drawingTransferId": drawing_id, "payloadTransferId": payload_id }));
+        let file = h.dir().join("driver export.dwg");
+        let _ = h.app.secureplan_driver(parse(&format!("export format=dwg version=AC1027 path={}", file.display())).unwrap());
+        let (result, _) = h.receive("exportResult");
+        assert_eq!((result["status"].as_str(), result["format"].as_str(), result["formatVersion"].as_str()), (Some("written"), Some("dwg"), Some("AC1027")));
+        let bytes = std::fs::read(&file).unwrap();
+        assert_eq!(&bytes[..6], b"AC1027");
+        assert!(crate::io::load_bytes("x.dwg", bytes).unwrap().layers.contains("SECUREPLAN-CAMERA"));
+    }
+
+    #[test]
     fn import_align_and_apply_commands_parse() {
         assert_eq!(parse("import /tmp/synthetic plan.dxf"), Ok(Command::Import(PathBuf::from("/tmp/synthetic plan.dxf"))));
         assert_eq!(
@@ -402,6 +525,19 @@ mod tests {
             Ok(Command::Apply { window: None, publish_damaged: true, layout: Some("Sheet A1 – Ground floor".into()) })
         );
         assert_eq!(parse("status"), Ok(Command::Status));
+        assert_eq!(parse("select all"), Ok(Command::Select(Some(None))));
+        assert_eq!(parse("select layer=Walls and doors"), Ok(Command::Select(Some(Some("Walls and doors".into())))));
+        assert_eq!(parse("convert route"), Ok(Command::Convert(crate::app::secureplan::convert::Kind::Route)));
+        assert_eq!(
+            parse("export format=dwg version=AC1018 loss=accept path=/tmp/my export.dwg"),
+            Ok(Command::Export {
+                path: Some(PathBuf::from("/tmp/my export.dwg")),
+                format: Some(crate::app::secureplan::session::Format::Dwg),
+                version: Some(acadrust::DxfVersion::AC1018),
+                accept_loss: true
+            })
+        );
+        assert_eq!(parse("export cancel"), Ok(Command::Export { path: None, format: None, version: None, accept_loss: false }));
         for bad in [
             "align",
             "align units=furlong",
@@ -412,6 +548,12 @@ mod tests {
             "apply window=0,0,1,1 view=layout:Sheet A1",
             "import",
             "status now",
+            "select some",
+            "convert rooms",
+            "export",
+            "export format=dwg",
+            "export version=AC1018 path=/tmp/x.dwg",
+            "export format=pdf path=/tmp/x.pdf",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
