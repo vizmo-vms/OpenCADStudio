@@ -485,7 +485,8 @@ mod tests {
         let mut h = Harness::new("driver_convert_export");
         h.survey_empty = false;
         let mut plan = sample("openSession-edit")["cadPlan"].clone();
-        plan["mapping"] = json!({ "cadOrigin": [0.0, 18000.0], "anchorMm": [0.0, 0.0], "scaleMmPerCadUnit": 1.0, "quarterTurns": 0 });
+        let plan_mapping = json!({ "cadOrigin": [0.0, 18000.0], "anchorMm": [0.0, 0.0], "scaleMmPerCadUnit": 1.0, "quarterTurns": 0 });
+        plan["mapping"] = plan_mapping.clone();
         h.open(Some(("synthetic.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", plan, BASE, "edit");
         let _ = h.app.secureplan_driver(parse("select all").unwrap());
         assert!(!h.app.tabs[h.app.active_tab].scene.selected.is_empty());
@@ -499,7 +500,7 @@ mod tests {
         let payload = export::tests::sample_payload();
         let drawing_id = h.transfer("plan.dxf", "image/vnd.dxf", &testutil::synthetic_dxf());
         let payload_id = h.transfer("export.json", export::MEDIA_TYPE, payload.to_string().as_bytes());
-        h.send(json!({ "type": "exportRequest", "requestId": "x1", "snapshot": payload["snapshot"], "drawingTransferId": drawing_id, "payloadTransferId": payload_id }));
+        h.send(json!({ "type": "exportRequest", "requestId": "x1", "snapshot": payload["snapshot"], "mapping": plan_mapping, "drawingTransferId": drawing_id, "payloadTransferId": payload_id }));
         let file = h.dir().join("driver export.dwg");
         let _ = h.app.secureplan_driver(parse(&format!("export format=dwg version=AC1027 path={}", file.display())).unwrap());
         let (result, _) = h.receive("exportResult");

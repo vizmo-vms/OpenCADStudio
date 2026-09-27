@@ -89,17 +89,7 @@ pub struct Alignment {
 impl Alignment {
     /// The stored alignment of a `cadPlan`, reused by later Applies.
     pub fn from_cad_plan(plan: &Value) -> Option<Self> {
-        let mapping = &plan["mapping"];
-        let pair = |value: &Value| Some([value[0].as_f64()?, value[1].as_f64()?]);
-        Some(Self {
-            units: Units::parse(plan["cadUnits"].as_str()?)?,
-            mapping: Mapping {
-                cad_origin: pair(&mapping["cadOrigin"])?,
-                anchor_mm: pair(&mapping["anchorMm"])?,
-                scale_mm_per_cad_unit: mapping["scaleMmPerCadUnit"].as_f64().filter(|s| *s > 0.0 && s.is_finite())?,
-                quarter_turns: u8::try_from(mapping["quarterTurns"].as_u64()?).ok().filter(|q| *q < 4)?,
-            },
-        })
+        Some(Self { units: Units::parse(plan["cadUnits"].as_str()?)?, mapping: mapping_from_json(&plan["mapping"])? })
     }
 
     pub fn mapping_json(&self) -> Value {
@@ -111,6 +101,17 @@ impl Alignment {
             "quarterTurns": m.quarter_turns,
         })
     }
+}
+
+/// A `mapping` (`common.schema.json#/$defs/mapping`).
+pub fn mapping_from_json(mapping: &Value) -> Option<Mapping> {
+    let pair = |value: &Value| Some([value[0].as_f64()?, value[1].as_f64()?]);
+    Some(Mapping {
+        cad_origin: pair(&mapping["cadOrigin"])?,
+        anchor_mm: pair(&mapping["anchorMm"])?,
+        scale_mm_per_cad_unit: mapping["scaleMmPerCadUnit"].as_f64().filter(|s| *s > 0.0 && s.is_finite())?,
+        quarter_turns: u8::try_from(mapping["quarterTurns"].as_u64()?).ok().filter(|q| *q < 4)?,
+    })
 }
 
 /// World mm → CAD model coordinates: the inverse of [`Mapping::cad_to_world`].

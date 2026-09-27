@@ -17,7 +17,7 @@ use serde_json::json;
 
 use super::{Action, Dialog, Field, FieldKind, Form};
 use crate::app::secureplan::bridge::SessionId;
-use crate::app::secureplan::export::{self, Composed, ComposeDone, ExportJob, Stage, WriteDone, WriteError};
+use crate::app::secureplan::export::{self, ComposeDone, Composed, ExportJob, JobKey, SaveDone, Stage, WriteDone, WriteError};
 use crate::app::secureplan::session::{Drawing, Format};
 use crate::app::secureplan::{Carry, Msg};
 use crate::app::{Message, OpenCADStudio};
@@ -28,6 +28,8 @@ const ACKNOWLEDGE: usize = 1;
 #[derive(Debug, Clone)]
 pub struct ExportDialog {
     pub tab_id: u64,
+    /// The export this dialog answers.
+    pub key: JobKey,
     pub request_id: String,
     pub form: Form,
     /// The applied drawing with the design added.
@@ -44,7 +46,7 @@ pub struct ExportDialog {
 }
 
 impl ExportDialog {
-    pub fn new(tab_id: u64, request_id: String, composed: Composed) -> Self {
+    pub fn new(tab_id: u64, key: JobKey, request_id: String, composed: Composed) -> Self {
         let default = export::default_choice(composed.format, &composed.version);
         let formats = export::choices().iter().map(|choice| choice.to_string()).collect();
         let mut acknowledge = Field::choice("Export without the objects listed", vec!["No".into(), "Yes".into()], 0);
@@ -53,6 +55,7 @@ impl ExportDialog {
         let buttons = vec![("Export…".to_string(), Action::ExportSave), ("Cancel".to_string(), Action::ExportCancel)];
         let mut dialog = Self {
             tab_id,
+            key,
             request_id,
             form: Form::new(fields, buttons, Action::ExportCancel),
             summary: composed.composition.summary(),
@@ -155,13 +158,10 @@ pub fn view(dialog: &ExportDialog) -> Element<'_, Message> {
     content.push(super::keys_hint()).into()
 }
 
-fn export_result(request_id: &str, status: &str) -> serde_json::Value {
-    json!({ "type": "exportResult", "requestId": request_id, "status": status })
-}
-
 impl OpenCADStudio {
     /// `exportRequest` (EXP-01): read the snapshot's drawing and add the
-    /// design on a worker, then show the export dialog.
+    /// design on a worker, with the snapshot's own mapping, then show the
+    /// export dialog.
     pub(crate) fn secureplan_export_request(&mut self, session: SessionId, request_id: &str, body: &serde_json::Value) -> Task<Message> {
         let take = |app: &mut Self, key: &str| body[key].as_u64().and_then(|id| app.secureplan_take_transfer(session, id as u32));
         let (drawing, payload) = (take(self, "drawingTransferId"), take(self, "payloadTransferId"));
@@ -171,21 +171,25 @@ impl OpenCADStudio {
             crate::app::secureplan::testdriver_event("export-failed", "INVALID");
             Task::none()
         };
+        // The mapping of the snapshot the drawing and the design come from,
+        // never the desktop's own stored one.
+        let Some(mapping) = crate::app::secureplan::align::mapping_from_json(&body["mapping"]) else {
+            return refuse(self, "the export request has no usable mapping.");
+        };
+        self.secureplan.next_job += 1;
+        let key = JobKey { session, serial: self.secureplan.next_job };
         let Some(bound) = self.secureplan.sessions.by_session_mut(session) else {
             return refuse(self, "open the survey from SecurePlan before exporting.");
         };
         if bound.export.is_some() {
             return refuse(self, "an export is already under way for this survey.");
         }
-        let Some(alignment) = bound.plan_alignment else {
-            return refuse(self, "the survey has no applied CAD plan to export.");
-        };
         let drawing = drawing.and_then(|t| Format::from_media_type(&t.media_type).map(|format| (t, format)));
         let (Some((drawing, format)), Some(payload)) = (drawing, payload.filter(|t| t.media_type == export::MEDIA_TYPE)) else {
             return refuse(self, "the export request was incomplete.");
         };
         let tab_id = bound.tab_id;
-        bound.export = Some(ExportJob { request_id: request_id.to_string(), stage: Stage::Composing, waiting: None, shown: None, target: None });
+        bound.export = Some(ExportJob { key, request_id: request_id.to_string(), stage: Stage::Composing, waiting: None, shown: None, target: None });
         let drawing = Drawing {
             bytes: Arc::new(drawing.bytes.expose().clone()),
             name: crate::app::secureplan::session::file_name(drawing.name.expose()).into(),
@@ -194,28 +198,31 @@ impl OpenCADStudio {
         };
         let payload = payload.bytes.expose().clone();
         let snapshot = body["snapshot"].clone();
-        let request_id = request_id.to_string();
         self.secureplan_report_states();
         self.command_line.push_info("SecurePlan: preparing the CAD export…");
         self.secureplan_run_job(move || {
-            let result = export::prepare(&drawing, &payload, &snapshot, &alignment.mapping);
-            Msg::ExportComposed(ComposeDone { tab_id, request_id, result: Carry::new(result) })
+            let result = export::prepare(&drawing, &payload, &snapshot, &mapping);
+            Msg::ExportComposed(ComposeDone { tab_id, key, result: Carry::new(result) })
         })
     }
 
-    /// The export job of tab `tab_id` for `request_id`, if it is still wanted.
-    fn secureplan_export_job(&mut self, tab_id: u64, request_id: &str) -> Option<&mut ExportJob> {
-        self.secureplan.sessions.by_tab_mut(tab_id)?.export.as_mut().filter(|job| job.request_id == request_id)
+    /// Tab `tab_id`'s export job `key`, if it is still wanted: the tab is
+    /// still bound to the session that asked for it.
+    fn secureplan_export_job(&mut self, tab_id: u64, key: JobKey) -> Option<&mut ExportJob> {
+        let bound = self.secureplan.sessions.by_tab_mut(tab_id).filter(|b| b.session == Some(key.session))?;
+        bound.export.as_mut().filter(|job| job.key == key)
     }
 
-    /// Answer the export with `message` and forget it.
-    fn secureplan_finish_export(&mut self, tab_id: u64, message: serde_json::Value) {
-        let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) else { return };
-        let session = bound.session;
-        bound.export = None;
-        if let Some(session) = session {
-            self.secureplan_send(session, message);
+    /// Answer export `key` with `message` (its request id is added) and
+    /// forget it.
+    fn secureplan_finish_export(&mut self, tab_id: u64, key: JobKey, mut message: serde_json::Value) {
+        let Some(job) = self.secureplan_export_job(tab_id, key) else { return };
+        message["type"] = json!("exportResult");
+        message["requestId"] = json!(job.request_id);
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            bound.export = None;
         }
+        self.secureplan_send(key.session, message);
         self.secureplan_close_export_dialog(tab_id);
         self.secureplan_report_states();
     }
@@ -226,7 +233,8 @@ impl OpenCADStudio {
         }
     }
 
-    /// The session ended or the tab closed: the export is dropped unanswered.
+    /// The session ended, the tab closed or is rebinding to another session:
+    /// the export is dropped unanswered, and its workers' results are ignored.
     pub(crate) fn secureplan_drop_export(&mut self, tab_id: u64) {
         if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
             bound.export = None;
@@ -234,29 +242,28 @@ impl OpenCADStudio {
         self.secureplan_close_export_dialog(tab_id);
     }
 
-    fn secureplan_export_failed(&mut self, tab_id: u64, request_id: &str, code: &str, lines: Vec<String>) {
-        let mut message = export_result(request_id, "error");
-        message["code"] = json!(code);
-        self.secureplan_finish_export(tab_id, message);
+    fn secureplan_export_failed(&mut self, tab_id: u64, key: JobKey, code: &str, lines: Vec<String>) {
+        self.secureplan_finish_export(tab_id, key, json!({ "status": "error", "code": code }));
         self.secureplan.dialog = Some(Dialog::notice("Export failed", lines));
         crate::app::secureplan::testdriver_event("export-failed", code);
     }
 
     pub(crate) fn secureplan_export_composed(&mut self, done: ComposeDone) -> Task<Message> {
-        let Some(job) = self.secureplan_export_job(done.tab_id, &done.request_id) else { return Task::none() };
+        let Some(job) = self.secureplan_export_job(done.tab_id, done.key) else { return Task::none() };
         if !matches!(job.stage, Stage::Composing) {
             return Task::none();
         }
+        let request_id = job.request_id.clone();
         let Some(result) = done.result.take() else { return Task::none() };
         let composed = match result {
             Ok(composed) => composed,
             Err(message) => {
-                self.secureplan_export_failed(done.tab_id, &done.request_id, "INVALID", vec![message, "Nothing was written.".into()]);
+                self.secureplan_export_failed(done.tab_id, done.key, "INVALID", vec![message, "Nothing was written.".into()]);
                 return Task::none();
             }
         };
-        let dialog = Box::new(ExportDialog::new(done.tab_id, done.request_id, composed));
-        let job = self.secureplan_export_job(done.tab_id, &dialog.request_id).expect("found above");
+        let dialog = Box::new(ExportDialog::new(done.tab_id, done.key, request_id, composed));
+        let job = self.secureplan_export_job(done.tab_id, done.key).expect("found above");
         job.stage = Stage::Choosing;
         job.waiting = Some(dialog);
         self.secureplan_show_waiting_export();
@@ -268,12 +275,12 @@ impl OpenCADStudio {
     /// that another dialog replaced before the user answered it.
     pub(crate) fn secureplan_show_waiting_export(&mut self) {
         let showing = match &self.secureplan.dialog {
-            Some(Dialog::Export(dialog)) => Some(dialog.tab_id),
+            Some(Dialog::Export(dialog)) => Some(dialog.key),
             _ => None,
         };
         for bound in &mut self.secureplan.sessions.bound {
             if let Some(job) = bound.export.as_mut() {
-                if matches!(job.stage, Stage::Choosing) && job.waiting.is_none() && showing != Some(bound.tab_id) {
+                if matches!(job.stage, Stage::Choosing) && job.waiting.is_none() && showing != Some(job.key) {
                     job.waiting = job.shown.take();
                 }
             }
@@ -307,26 +314,27 @@ impl OpenCADStudio {
             }
         };
         dialog.writing = true;
-        let (tab_id, request_id, document) = (dialog.tab_id, dialog.request_id.clone(), Arc::clone(&dialog.document));
-        let Some(job) = self.secureplan_export_job(tab_id, &request_id) else { return Task::none() };
+        let (tab_id, key, document) = (dialog.tab_id, dialog.key, Arc::clone(&dialog.document));
+        let Some(job) = self.secureplan_export_job(tab_id, key) else { return Task::none() };
         job.stage = Stage::Writing;
         self.secureplan_run_job(move || {
             let result = export::write(&document, format, version);
-            Msg::ExportWritten(WriteDone { tab_id, request_id, format, version, result: Carry::new(result) })
+            Msg::ExportWritten(WriteDone { tab_id, key, format, version, result: Carry::new(result) })
         })
     }
 
     /// Cancel: nothing is written.
     pub(crate) fn secureplan_export_cancel(&mut self) {
         let Some(Dialog::Export(dialog)) = &self.secureplan.dialog else { return };
-        let (tab_id, request_id) = (dialog.tab_id, dialog.request_id.clone());
-        self.secureplan_finish_export(tab_id, export_result(&request_id, "cancelled"));
+        let (tab_id, key) = (dialog.tab_id, dialog.key);
+        self.secureplan_finish_export(tab_id, key, json!({ "status": "cancelled" }));
+        self.secureplan_close_export_dialog(tab_id);
         self.command_line.push_info("SecurePlan: export cancelled. Nothing was written.");
         crate::app::secureplan::testdriver_event("export-cancelled", "");
     }
 
     pub(crate) fn secureplan_export_written(&mut self, done: WriteDone) -> Task<Message> {
-        let Some(job) = self.secureplan_export_job(done.tab_id, &done.request_id) else { return Task::none() };
+        let Some(job) = self.secureplan_export_job(done.tab_id, done.key) else { return Task::none() };
         if !matches!(job.stage, Stage::Writing) {
             return Task::none();
         }
@@ -338,23 +346,27 @@ impl OpenCADStudio {
                     WriteError::Writer => "The drawing could not be written in that format and version.",
                     WriteError::Header => "The written drawing does not have the format and version that were chosen.",
                 };
-                self.secureplan_export_failed(done.tab_id, &done.request_id, error.code(), vec![reason.into(), "Nothing was saved.".into()]);
+                self.secureplan_export_failed(done.tab_id, done.key, error.code(), vec![reason.into(), "Nothing was saved.".into()]);
                 return Task::none();
             }
         };
         let target = job.target.clone();
         job.stage = Stage::Saving { bytes, format: done.format, version: done.version };
         let stem = match &self.secureplan.dialog {
-            Some(Dialog::Export(dialog)) if dialog.tab_id == done.tab_id => dialog.stem.clone(),
+            Some(Dialog::Export(dialog)) if dialog.key == done.key => dialog.stem.clone(),
             _ => "drawing".into(),
         };
         self.secureplan_close_export_dialog(done.tab_id);
-        let (tab_id, request_id) = (done.tab_id, done.request_id);
+        let (tab_id, key) = (done.tab_id, done.key);
         if let Some(path) = target {
-            return self.secureplan_export_picked(tab_id, &request_id, Some(path));
+            return self.secureplan_export_picked(tab_id, key, Some(path));
+        }
+        #[cfg(test)]
+        if self.secureplan.test_hold_save {
+            return Task::none();
         }
         if !crate::app::secureplan::native_dialogs_allowed() {
-            self.secureplan_finish_export(tab_id, export_result(&request_id, "cancelled"));
+            self.secureplan_finish_export(tab_id, key, json!({ "status": "cancelled" }));
             self.command_line.push_error("SecurePlan: file dialogs are disabled in this session.");
             crate::app::secureplan::testdriver_event("export-cancelled", "");
             return Task::none();
@@ -371,37 +383,49 @@ impl OpenCADStudio {
                     .await
                     .map(|handle| crate::sys::handle_path(&handle))
             },
-            move |path: Option<std::path::PathBuf>| Message::SecurePlan(Msg::ExportPicked(tab_id, request_id.clone(), path.map(Into::into))),
+            move |path: Option<std::path::PathBuf>| Message::SecurePlan(Msg::ExportPicked(tab_id, key, path.map(Into::into))),
         )
     }
 
-    /// The Save dialog closed: write the file there, the export's only write.
-    pub(crate) fn secureplan_export_picked(&mut self, tab_id: u64, request_id: &str, path: Option<std::path::PathBuf>) -> Task<Message> {
-        let Some(job) = self.secureplan_export_job(tab_id, request_id) else { return Task::none() };
+    /// The Save dialog closed: write the file there on a worker, the
+    /// export's only write.
+    pub(crate) fn secureplan_export_picked(&mut self, tab_id: u64, key: JobKey, path: Option<std::path::PathBuf>) -> Task<Message> {
+        let Some(job) = self.secureplan_export_job(tab_id, key) else { return Task::none() };
         let Stage::Saving { bytes, format, version } = job.stage.clone() else { return Task::none() };
         let Some(path) = path else {
-            self.secureplan_finish_export(tab_id, export_result(request_id, "cancelled"));
+            self.secureplan_finish_export(tab_id, key, json!({ "status": "cancelled" }));
             self.command_line.push_info("SecurePlan: export cancelled. Nothing was written.");
             crate::app::secureplan::testdriver_event("export-cancelled", "");
             return Task::none();
         };
-        if std::fs::write(&path, bytes.as_ref()).is_err() {
+        job.stage = Stage::Storing;
+        let name = export::result_name(&path);
+        self.secureplan_run_job(move || {
+            let saved = std::fs::write(&path, bytes.as_ref()).is_ok();
+            Msg::ExportSaved(SaveDone { tab_id, key, name, format, version, saved })
+        })
+    }
+
+    /// The file was written, or could not be.
+    pub(crate) fn secureplan_export_saved(&mut self, done: SaveDone) {
+        let Some(job) = self.secureplan_export_job(done.tab_id, done.key) else { return };
+        if !matches!(job.stage, Stage::Storing) {
+            return;
+        }
+        if !done.saved {
             self.secureplan_export_failed(
-                tab_id,
-                request_id,
+                done.tab_id,
+                done.key,
                 "WRITER_ERROR",
                 vec!["The file could not be saved there. Check the folder and try the export again.".into()],
             );
-            return Task::none();
+            return;
         }
-        let mut message = export_result(request_id, "written");
-        message["fileName"] = json!(export::result_name(&path));
-        message["format"] = json!(format.ext());
-        message["formatVersion"] = json!(version.as_str());
-        self.secureplan_finish_export(tab_id, message);
+        let (format, version) = (done.format, done.version);
+        let message = json!({ "status": "written", "fileName": done.name, "format": format.ext(), "formatVersion": version.as_str() });
+        self.secureplan_finish_export(done.tab_id, done.key, message);
         self.command_line.push_info(&format!("SecurePlan: exported as {} {}.", format.ext().to_ascii_uppercase(), version.as_str()));
         crate::app::secureplan::testdriver_event("exported", &format!("{} {}", format.ext(), version.as_str()));
-        Task::none()
     }
 
     /// Confirm the export dialog without the Save dialog, saving to `path`
@@ -424,8 +448,8 @@ impl OpenCADStudio {
         if accept_loss {
             dialog.acknowledge();
         }
-        let (tab_id, request_id) = (dialog.tab_id, dialog.request_id.clone());
-        if let Some(job) = self.secureplan_export_job(tab_id, &request_id) {
+        let (tab_id, key) = (dialog.tab_id, dialog.key);
+        if let Some(job) = self.secureplan_export_job(tab_id, key) {
             job.target = Some(path);
         }
         Ok(self.secureplan_export_save())
@@ -453,12 +477,21 @@ mod tests {
         h
     }
 
+    /// The survey's stored mapping in [`exporting`].
+    fn stored() -> serde_json::Value {
+        json!({ "cadOrigin": [0.0, 18000.0], "anchorMm": [0.0, 0.0], "scaleMmPerCadUnit": 1.0, "quarterTurns": 0 })
+    }
+
     fn request(h: &mut Harness, drawing: &[u8], payload: &serde_json::Value) {
+        request_with(h, "x1", drawing, payload, stored());
+    }
+
+    fn request_with(h: &mut Harness, id: &str, drawing: &[u8], payload: &serde_json::Value, mapping: serde_json::Value) {
         let drawing_id = h.transfer("plan.dxf", "image/vnd.dxf", drawing);
         let payload_id = h.transfer("export.json", export::MEDIA_TYPE, payload.to_string().as_bytes());
         h.send(json!({
-            "type": "exportRequest", "requestId": "x1",
-            "snapshot": payload["snapshot"],
+            "type": "exportRequest", "requestId": id,
+            "snapshot": payload["snapshot"], "mapping": mapping,
             "drawingTransferId": drawing_id, "payloadTransferId": payload_id,
         }));
     }
@@ -495,23 +528,32 @@ mod tests {
         assert!(h.app.tabs[h.app.active_tab].scene.document.layers.iter().all(|l| !l.name.starts_with("SECUREPLAN")));
     }
 
-    #[test]
-    fn known_loss_needs_the_acknowledgement() {
-        let mut h = exporting("export_loss", "edit");
-        request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
-        // The applied drawing lost two damaged items when it was read.
-        let Some(Dialog::Export(dialog)) = h.app.secureplan.dialog.as_mut() else { panic!("no export dialog") };
-        dialog.lost_entities = 2;
-        dialog.loss.0 = usize::MAX;
-        dialog.refresh();
-        assert_eq!(dialog.known_loss(), 2);
-        assert!(dialog.form.fields[ACKNOWLEDGE].enabled);
-        assert!(dialog.lines().iter().any(|line| line.contains("2 damaged item(s)")));
-        // Export… without Yes writes nothing.
-        let file = h.dir().join("lossy.dxf");
-        h.key(DialogKey::Next);
-        h.key(DialogKey::Next);
+    /// Press **Export…** from the keyboard: to the button, then Enter.
+    fn press_export(h: &mut Harness) {
+        let Some(Dialog::Export(dialog)) = &h.app.secureplan.dialog else { panic!("no export dialog") };
+        let steps = dialog.form.fields.iter().filter(|f| f.enabled).count() - usize::from(dialog.form.focus > 0);
+        for _ in 0..steps {
+            h.key(DialogKey::Next);
+        }
         h.key(DialogKey::Activate);
+    }
+
+    #[test]
+    fn damaged_items_the_reader_dropped_need_the_acknowledgement() {
+        let mut h = exporting("export_damage", "edit");
+        // The applied drawing itself has a damaged item: reading it drops it.
+        request(&mut h, &crate::app::secureplan::session::tests::damaged_dxf(), &sample_payload());
+        let Some(Dialog::Export(dialog)) = &h.app.secureplan.dialog else { panic!("no export dialog") };
+        assert_eq!(dialog.lost_entities, 1, "the reader's count reaches the dialog");
+        assert_eq!(dialog.known_loss(), 1);
+        assert!(dialog.form.fields[ACKNOWLEDGE].enabled);
+        assert!(dialog.lines().iter().any(|line| line.contains("1 damaged item(s)")));
+        // Export… without Yes writes nothing.
+        let file = h.dir().join("damaged.dxf");
+        if let Some(job) = h.app.secureplan.sessions.bound[0].export.as_mut() {
+            job.target = Some(file.clone());
+        }
+        press_export(&mut h);
         assert!(!file.exists());
         assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Export(d)) if !d.writing), "still choosing");
         assert!(h.app.command_line.last_error.clone().unwrap_or_default().contains("Choose Yes"));
@@ -520,6 +562,168 @@ mod tests {
         let (result, _) = h.receive("exportResult");
         assert_eq!(result["status"], "written");
         assert!(file.exists());
+    }
+
+    /// The synthetic plan as DXF with an object of a type the reader does
+    /// not know: kept as DXF codes, it can be written back to DXF, not DWG.
+    fn dxf_with_unknown_object() -> Vec<u8> {
+        let text = String::from_utf8(testutil::synthetic_dxf()).unwrap();
+        // Before the group-code line of the ENTITIES section's ENDSEC.
+        let entities = text.find("ENTITIES").unwrap();
+        let end = entities + text[entities..].find("ENDSEC").unwrap();
+        let cut = text[..text[..end].rfind('\n').unwrap()].rfind('\n').unwrap() + 1;
+        let unknown = "  0\nSECUREPLANTESTOBJECT\n  5\nFFF0\n100\nAcDbEntity\n  8\n0\n";
+        format!("{}{unknown}{}", &text[..cut], &text[cut..]).into_bytes()
+    }
+
+    #[test]
+    fn a_format_that_cannot_hold_the_drawing_needs_the_acknowledgement() {
+        let mut h = exporting("export_format_loss", "edit");
+        request(&mut h, &dxf_with_unknown_object(), &sample_payload());
+        let Some(Dialog::Export(dialog)) = h.app.secureplan.dialog.as_mut() else { panic!("no export dialog") };
+        assert_eq!(dialog.lost_entities, 0);
+        // DXF keeps the object: nothing lost, nothing to acknowledge.
+        assert_eq!(dialog.choice().0, Format::Dxf);
+        assert_eq!(dialog.known_loss(), 0);
+        assert!(!dialog.form.fields[ACKNOWLEDGE].enabled);
+        // DWG 2018 cannot hold it: the loss is counted and must be acknowledged.
+        assert!(dialog.select(Format::Dwg, Some(acadrust::DxfVersion::AC1032)));
+        assert_eq!(dialog.known_loss(), 1);
+        assert!(dialog.lines().iter().any(|line| line.contains("1 object(s) DWG AC1032 cannot hold")), "{:?}", dialog.lines());
+        let file = h.dir().join("lossy.dwg");
+        if let Some(job) = h.app.secureplan.sessions.bound[0].export.as_mut() {
+            job.target = Some(file.clone());
+        }
+        press_export(&mut h);
+        assert!(!file.exists(), "not saved before the acknowledgement");
+        // Back to DXF and to DWG again: the acknowledgement is asked again.
+        let Some(Dialog::Export(dialog)) = h.app.secureplan.dialog.as_mut() else { panic!("no export dialog") };
+        dialog.acknowledge();
+        assert!(dialog.select(Format::Dxf, None));
+        assert!(dialog.select(Format::Dwg, Some(acadrust::DxfVersion::AC1032)));
+        assert!(dialog.plan().is_err(), "a new choice needs its own Yes");
+        let _ = h.app.secureplan_export_to(file.clone(), Some(Format::Dwg), Some(acadrust::DxfVersion::AC1032), true).unwrap();
+        let (result, _) = h.receive("exportResult");
+        assert_eq!((result["status"].as_str(), result["format"].as_str()), (Some("written"), Some("dwg")));
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn the_export_uses_the_requests_mapping_not_the_stored_one() {
+        let mut h = exporting("export_mapping", "edit");
+        // The snapshot was applied with another alignment than the one the
+        // desktop holds: a quarter turn, centimetres and an anchor.
+        let snapshot = json!({ "cadOrigin": [100.0, 500.0], "anchorMm": [1000.0, 2000.0], "scaleMmPerCadUnit": 10.0, "quarterTurns": 1 });
+        request_with(&mut h, "x1", &testutil::synthetic_dxf(), &sample_payload(), snapshot.clone());
+        let Some(Dialog::Export(dialog)) = &h.app.secureplan.dialog else { panic!("no export dialog") };
+        let mapping = crate::app::secureplan::align::mapping_from_json(&snapshot).unwrap();
+        let camera = dialog
+            .document
+            .entities()
+            .find_map(|e| match e {
+                acadrust::EntityType::Insert(i) if i.common.layer == "SECUREPLAN-CAMERA" => Some(i.insert_point),
+                _ => None,
+            })
+            .expect("the camera");
+        let expected = crate::app::secureplan::align::world_to_cad(&mapping, [6000.0, 3000.0]);
+        assert!((camera.x - expected[0]).abs() < 1e-9 && (camera.y - expected[1]).abs() < 1e-9, "{camera:?} {expected:?}");
+        assert_ne!(h.bound().plan_alignment.map(|a| a.mapping), Some(mapping), "the stored mapping differs");
+        // A request without a usable mapping never reaches the desktop: the schema requires it.
+        assert!(crate::app::secureplan::protocol::validate_message(
+            crate::app::secureplan::protocol::Direction::WebToDesktop,
+            &json!({ "type": "exportRequest", "requestId": "x9", "snapshot": sample_payload()["snapshot"], "drawingTransferId": 1, "payloadTransferId": 2 })
+        )
+        .is_err());
+    }
+
+    /// Re-pair the survey from a new page and open it there, before the old
+    /// session's close arrives; the reopened drawing's load is run at once.
+    fn re_pair(h: &mut Harness, pairing: u8) {
+        let mut plan = crate::app::secureplan::session::tests::sample("openSession-edit")["cadPlan"].clone();
+        plan["mapping"] = stored();
+        plan["cadUnits"] = json!("mm");
+        let old = h.session;
+        h.pair_again_overtaking(pairing);
+        assert_eq!(h.bound().session, Some(old), "the old session's close has not been handled");
+        let held = h.held();
+        h.open(Some(("synthetic.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", plan, BASE, "export");
+        if h.held() > held {
+            h.release(h.held() - 1);
+        }
+    }
+
+    #[test]
+    fn a_re_pair_ends_the_old_export_at_every_stage() {
+        for (pairing, stage) in [(40u8, "composing"), (41, "writing"), (42, "saving")] {
+            let mut h = exporting(&format!("export_repair_{stage}"), "edit");
+            h.hold_jobs();
+            let old_file = h.dir().join("old.dxf");
+            request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
+            let old_key = h.bound().export.as_ref().unwrap().key;
+            if stage != "composing" {
+                h.release(0);
+                if stage == "writing" {
+                    let _ = h.app.secureplan_export_to(old_file.clone(), None, None, false).unwrap();
+                } else {
+                    // Written, and its Save dialog stands open.
+                    h.app.secureplan.test_hold_save = true;
+                    press_export(&mut h);
+                    h.release(0);
+                    assert!(matches!(h.bound().export.as_ref().unwrap().stage, Stage::Saving { .. }), "{stage}");
+                }
+            }
+            // A new page opens the survey and asks for an export with the same request id.
+            re_pair(&mut h, pairing);
+            assert!(h.bound().export.is_none(), "{stage}: the old export ended with the rebinding");
+            assert!(!matches!(h.app.secureplan.dialog, Some(Dialog::Export(_))), "{stage}: its dialog closed");
+            request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
+            let new_key = h.bound().export.as_ref().expect("the new export started").key;
+            assert_ne!(new_key, old_key);
+            // The old worker or Save dialog finishes now: nothing happens.
+            match stage {
+                "saving" => {
+                    let _ = h.app.update(Message::SecurePlan(Msg::ExportPicked(h.tab_id(), old_key, Some(old_file.clone().into()))));
+                }
+                _ => h.release(0),
+            }
+            assert!(!old_file.exists(), "{stage}: the old export wrote a file");
+            assert_eq!(h.bound().export.as_ref().map(|job| job.key), Some(new_key), "{stage}");
+            assert!(matches!(h.bound().export.as_ref().unwrap().stage, Stage::Composing), "{stage}: the new export is untouched");
+            h.send_state_probe();
+            let seen = h.types_until("sessionState");
+            assert!(!seen.iter().any(|t| t == "exportResult"), "{stage}: the new page got an answer for the old export: {seen:?}");
+            // The new export goes on and answers the new page.
+            h.release(h.held() - 1);
+            h.app.secureplan.test_hold_save = false;
+            let new_file = h.dir().join("new.dxf");
+            let _ = h.app.secureplan_export_to(new_file.clone(), None, None, false).unwrap();
+            h.release(0);
+            h.release(0);
+            let (result, _) = h.receive("exportResult");
+            assert_eq!((result["requestId"].as_str(), result["status"].as_str()), (Some("x1"), Some("written")), "{stage}");
+            assert!(new_file.exists() && !old_file.exists(), "{stage}");
+            // The old session's close, late, changes nothing for the new one.
+            h.deliver_held_close();
+            assert_eq!(h.bound().session, Some(h.session), "{stage}");
+        }
+    }
+
+    #[test]
+    fn the_file_is_written_on_a_worker() {
+        let mut h = exporting("export_worker_write", "edit");
+        request(&mut h, &testutil::synthetic_dxf(), &sample_payload());
+        h.hold_jobs();
+        let file = h.dir().join("slow target.dxf");
+        let _ = h.app.secureplan_export_to(file.clone(), None, None, false).unwrap();
+        h.release(0);
+        // Written and checked in memory; the file write itself waits for its worker.
+        assert!(matches!(h.bound().export.as_ref().unwrap().stage, Stage::Storing));
+        assert_eq!(h.held(), 1);
+        assert!(!file.exists(), "not written on the UI thread");
+        h.release(0);
+        assert!(file.exists());
+        let (result, _) = h.receive("exportResult");
+        assert_eq!((result["status"].as_str(), result["fileName"].as_str()), (Some("written"), Some("slow target.dxf")));
     }
 
     #[test]
@@ -535,7 +739,7 @@ mod tests {
         other["snapshot"]["version"] = json!(13);
         let drawing_id = h.transfer("plan.dxf", "image/vnd.dxf", &testutil::synthetic_dxf());
         let payload_id = h.transfer("export.json", export::MEDIA_TYPE, other.to_string().as_bytes());
-        h.send(json!({ "type": "exportRequest", "requestId": "x2", "snapshot": sample_payload()["snapshot"], "drawingTransferId": drawing_id, "payloadTransferId": payload_id }));
+        h.send(json!({ "type": "exportRequest", "requestId": "x2", "snapshot": sample_payload()["snapshot"], "mapping": stored(), "drawingTransferId": drawing_id, "payloadTransferId": payload_id }));
         let (result, _) = h.receive("exportResult");
         assert_eq!((result["requestId"].as_str(), result["code"].as_str()), (Some("x2"), Some("INVALID")));
         request(&mut h, b"0\nSECTION\n2\nHEADER\n", &sample_payload());

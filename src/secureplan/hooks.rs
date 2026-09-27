@@ -65,12 +65,16 @@ pub enum Msg {
     Loaded(super::import::LoadDone),
     /// Apply's outputs finished building on a worker.
     ApplyBuilt(super::session::ApplyBuilt),
+    /// Conversion candidates were assembled on a worker.
+    Converted(super::convert::Done),
     /// An export's drawing was read and the design added, on a worker.
     ExportComposed(super::export::ComposeDone),
     /// An export was written and checked, on a worker.
     ExportWritten(super::export::WriteDone),
-    /// The export's Save dialog closed (tab id, request id, chosen file).
-    ExportPicked(u64, String, Option<Redacted<PathBuf>>),
+    /// The export's Save dialog closed (tab id, export, chosen file).
+    ExportPicked(u64, super::export::JobKey, Option<Redacted<PathBuf>>),
+    /// An export was written to its file, on a worker.
+    ExportSaved(super::export::SaveDone),
     /// The import file dialog closed (tab id, chosen file).
     ImportPicked(u64, Option<Redacted<PathBuf>>),
     /// Mouse input in a dialog field.
@@ -127,6 +131,10 @@ pub struct State {
     /// Unit tests can hold worker jobs to interleave their completions.
     #[cfg(test)]
     pub held_jobs: Option<HeldJobs>,
+    /// Unit tests stand in for an open export Save dialog: a written export
+    /// with no file waits in `Saving`.
+    #[cfg(test)]
+    pub test_hold_save: bool,
     /// A notice for the command line once the editor runs (expired recovery copies).
     pub notice: Option<String>,
     /// The main window is closing and SecurePlan drawings are being decided.
@@ -162,6 +170,8 @@ impl Default for State {
             test_pick: None,
             #[cfg(test)]
             held_jobs: None,
+            #[cfg(test)]
+            test_hold_save: false,
             notice: None,
             quitting: false,
         };
@@ -380,6 +390,10 @@ impl OpenCADStudio {
                 self.secureplan_worker_done();
                 self.secureplan_apply_built(built)
             }
+            Msg::Converted(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_converted(done)
+            }
             Msg::ExportComposed(done) => {
                 self.secureplan_worker_done();
                 self.secureplan_export_composed(done)
@@ -388,8 +402,11 @@ impl OpenCADStudio {
                 self.secureplan_worker_done();
                 self.secureplan_export_written(done)
             }
-            Msg::ExportPicked(tab_id, request_id, path) => {
-                self.secureplan_export_picked(tab_id, &request_id, path.map(|path| path.expose().clone()))
+            Msg::ExportPicked(tab_id, key, path) => self.secureplan_export_picked(tab_id, key, path.map(|path| path.expose().clone())),
+            Msg::ExportSaved(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_export_saved(done);
+                Task::none()
             }
             Msg::ImportPicked(tab_id, Some(path)) => {
                 // The tab the picker was opened for, if it may still import.

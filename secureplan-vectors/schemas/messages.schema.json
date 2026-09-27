@@ -320,10 +320,10 @@
       }
     },
     "exportRequest": {
-      "description": "web -> desktop (EXP-01).",
+      "description": "web -> desktop (EXP-01). mapping is the captured snapshot's cadPlan.mapping; the desktop composes the export with it, not with its own stored mapping, so the drawing, the design and the mapping all come from the same saved snapshot.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "requestId", "snapshot", "drawingTransferId", "payloadTransferId"],
+      "required": ["type", "requestId", "snapshot", "mapping", "drawingTransferId", "payloadTransferId"],
       "properties": {
         "type": { "const": "exportRequest" },
         "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
@@ -336,6 +336,7 @@
             "documentHash": { "$ref": "common.schema.json#/$defs/sha256" }
           }
         },
+        "mapping": { "$ref": "common.schema.json#/$defs/mapping" },
         "drawingTransferId": { "$ref": "common.schema.json#/$defs/transferId" },
         "payloadTransferId": { "$ref": "common.schema.json#/$defs/transferId" }
       }

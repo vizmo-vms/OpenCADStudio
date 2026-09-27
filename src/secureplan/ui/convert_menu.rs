@@ -124,9 +124,62 @@ impl OpenCADStudio {
             return iced::Task::none();
         }
         let bound = self.secureplan.sessions.by_tab(tab_id).expect("checked above");
-        let (session, base, mapping) = (bound.session, bound.base_identity.clone(), bound.plan_alignment.expect("checked above").mapping);
+        let (Some(session), base, generation, mapping) =
+            (bound.session, bound.base_identity.clone(), bound.generation, bound.plan_alignment.expect("checked above").mapping)
+        else {
+            return iced::Task::none();
+        };
+        // The selection is cut on this thread within a fixed budget; the
+        // candidates are assembled on a worker.
         let scene = &self.tabs[self.active_tab].scene;
-        let found = match convert::candidates(scene, &scene.selected, &mapping, kind) {
+        let pieces = convert::pieces(scene, &scene.selected, &mapping);
+        let origin = convert::Origin { session, base_identity: base, generation, revision: self.tabs[self.active_tab].edit_revision };
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            bound.busy = Some(crate::app::secureplan::session::Busy { operation: "convert", progress: None });
+        }
+        self.secureplan_report_states();
+        self.secureplan_run_job(move || {
+            let result = convert::assemble(&pieces, kind);
+            crate::app::secureplan::Msg::Converted(convert::Done { tab_id, kind, origin, mapping, result: crate::app::secureplan::Carry::new(result) })
+        })
+    }
+
+    /// The candidates are ready: send them if nothing changed meanwhile.
+    pub(crate) fn secureplan_converted(&mut self, done: convert::Done) -> iced::Task<crate::app::Message> {
+        let (tab_id, kind, mapping) = (done.tab_id, done.kind, done.mapping);
+        let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) else { return iced::Task::none() };
+        if bound.busy.is_some_and(|busy| busy.operation == "convert") {
+            bound.busy = None;
+        }
+        let Some(result) = done.result.take() else { return iced::Task::none() };
+        let current = self.secureplan_tab_index(tab_id).is_some_and(|index| {
+            let bound = self.secureplan.sessions.by_tab(tab_id).expect("found above");
+            bound.session == Some(done.origin.session)
+                && bound.base_identity == done.origin.base_identity
+                && bound.generation == done.origin.generation
+                && bound.mode == Mode::Edit
+                && bound.apply.is_none()
+                && !bound.unresolved
+                && bound.staged.is_none()
+                && self.tabs[index].edit_revision == done.origin.revision
+                && !self.secureplan_has_unapplied(index)
+                && !self.secureplan_modified(index)
+        });
+        self.secureplan_report_states();
+        if !current {
+            self.secureplan.dialog = Some(Dialog::notice(
+                "Not converted",
+                vec![
+                    "The drawing or the survey changed while the selection was being converted.".into(),
+                    "Nothing was sent to SecurePlan. Select again and convert.".into(),
+                ],
+            ));
+            super::super::testdriver_event("convert-refused", "stale");
+            return iced::Task::none();
+        }
+        let session = Some(done.origin.session);
+        let base = done.origin.base_identity;
+        let found = match result {
             Ok(found) => found,
             Err(refusal) => {
                 let mut lines = vec![refusal.message.clone()];
@@ -354,6 +407,36 @@ mod tests {
         let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
         let (request, _) = h.receive("convertRequest");
         assert_eq!(request["candidates"]["walls"][0], json!({ "start": [0.0, 18000.0], "end": [30000.0, 18000.0] }));
+    }
+
+    #[test]
+    fn candidates_built_while_the_drawing_changed_are_not_sent() {
+        for change in ["edit", "view mode", "plan update"] {
+            let mut h = applied(&format!("convert_stale_{}", change.replace(' ', "_")));
+            select_corner(&mut h);
+            h.hold_jobs();
+            let _ = h.app.dispatch_command("SECUREPLANCONVERT WALLS");
+            assert_eq!(h.held(), 1, "assembled on a worker");
+            let _ = h.state_where(|s| s["busy"]["operation"] == "convert");
+            assert!(h.app.secureplan_can_convert().is_err(), "one conversion at a time");
+            match change {
+                "edit" => h.edit((0.0, 0.0), (1000.0, 1000.0)),
+                "view mode" => h.send(json!({ "type": "sessionMode", "requestId": "m1", "mode": "view", "reason": "leaseLost" })),
+                _ => {
+                    let id = h.transfer("plan.dxf", "image/vnd.dxf", &testutil::synthetic_dxf());
+                    let mut plan = crate::app::secureplan::session::tests::sample("openSession-edit")["cadPlan"].clone();
+                    plan["cadUnits"] = json!("mm");
+                    let other = "0".repeat(64);
+                    h.send(json!({ "type": "planUpdate", "requestId": "p1", "reason": "applied", "cadPlan": plan, "placement": crate::app::secureplan::session::tests::sample("openSession-edit")["placement"], "baseIdentity": other, "drawingTransferId": id }));
+                }
+            }
+            h.release(0);
+            assert!(h.bound().converts.is_empty(), "{change}: nothing sent");
+            h.send_state_probe();
+            let seen = h.types_until("sessionState");
+            assert!(!seen.iter().any(|t| t == "convertRequest"), "{change}: {seen:?}");
+            assert!(h.bound().busy.is_none_or(|b| b.operation != "convert"), "{change}");
+        }
     }
 
     #[test]

@@ -11,19 +11,21 @@
 //! | Walls | lines, one layer per material and status | `…-WALL-<MATERIAL>-<STATUS>` |
 //! | Doors and openings | lines, one layer per status | `…-DOOR-<STATUS>` |
 //! | Cable routes | polylines, with a "label (cable type)" text | `…-ROUTE` |
-//! | Targets | a circle with a direction line and a "label (N px/m)" text | `…-TARGET` |
+//! | Targets | a circle with a direction line; the web's engineering label (its achieved PPM) and a "Required N PPM" text | `…-TARGET` |
 //! | General drawings | polylines, rectangles, ellipses, arrows, with their label | `…-DRAWING` |
 //! | Engineering labels of walls, doors and other elements | text | `…-LABEL` |
 //! | Notes (when chosen) | multiline text | `…-NOTE` |
 //! | Coverage (when chosen) | closed outlines | `…-COVERAGE` |
 //!
-//! Each element's label is drawn once. A device's, route's, target's or
-//! drawing's label belongs to that row's representation (EXP-02: "static
-//! blocks with visible labels", "polylines with type/label", "reference
-//! geometry and annotations"), drawn from the element's own fields on its own
-//! layer; the `labels[]` entry the web also sends for that element is not
-//! drawn again. The other `labels[]` entries (walls, doors, …) are the
-//! engineering labels.
+//! Each element's label is drawn once. A device's, route's or drawing's label
+//! belongs to that row's representation (EXP-02: "static blocks with visible
+//! labels", "polylines with type/label", "reference geometry and
+//! annotations"), drawn from the element's own fields on its own layer; the
+//! `labels[]` entry the web also sends for that element is not drawn again.
+//! A target's label is its `labels[]` entry, which carries the PPM the design
+//! achieves there, drawn on the target's layer; its required PPM, from the
+//! target itself, is a separate text below it. The other `labels[]` entries
+//! (doors and the rest) are the engineering labels.
 //!
 //! Layer and block names are collision-free: when any of them already exists
 //! (a re-imported earlier export), every new name takes the first free
@@ -391,6 +393,7 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
     }
     for target in &payload.targets {
         let at = cad(target.position);
+        let evaluated = payload.labels.iter().find(|label| label.element_id == target.id);
         let mut marker = Circle::new();
         marker.center = at;
         marker.radius = TARGET_RADIUS_MM * unit;
@@ -398,10 +401,18 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
         let r = target.rotation_deg.to_radians();
         let tip = [target.position[0] + r.cos() * 2.0 * TARGET_RADIUS_MM, target.position[1] + r.sin() * 2.0 * TARGET_RADIUS_MM];
         plan.add("TARGET", polyline(&[at, cad(tip)], false));
-        let label = if target.label.trim().is_empty() { "Target" } else { target.label.trim() };
+        // The web's label, with the achieved PPM, where the web puts it;
+        // without one, the target's own label beside it.
+        let (caption, place) = match evaluated {
+            Some(label) => (label.text.clone(), cad(label.position)),
+            None => (
+                if target.label.trim().is_empty() { "Target".to_string() } else { target.label.trim().to_string() },
+                Vector3::new(at.x + 1.5 * TARGET_RADIUS_MM * unit, at.y - height / 2.0, 0.0),
+            ),
+        };
+        plan.add("TARGET", text(&caption, place, height));
         let ppm = super::ui::format_number(target.required_ppm);
-        let beside = Vector3::new(at.x + 1.5 * TARGET_RADIUS_MM * unit, at.y - height / 2.0, 0.0);
-        plan.add("TARGET", text(&format!("{label} ({ppm} px/m)"), beside, height));
+        plan.add("TARGET", text(&format!("Required {ppm} PPM"), Vector3::new(place.x, place.y - 1.5 * height, 0.0), height));
     }
     for drawing in &payload.drawings {
         let points = &drawing.points;
@@ -649,6 +660,16 @@ pub fn result_name(path: &std::path::Path) -> String {
 
 // ── The export under way ────────────────────────────────────────────────────
 
+/// One export job: the session it answers and a serial unique in the
+/// process. Workers, the Save dialog and the dialog itself carry it; a result
+/// for any other key (an older export, or one of an earlier session of the
+/// same survey) is ignored, whatever its request id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobKey {
+    pub session: super::bridge::SessionId,
+    pub serial: u64,
+}
+
 /// Where an export is.
 #[derive(Debug, Clone)]
 pub enum Stage {
@@ -660,11 +681,14 @@ pub enum Stage {
     Writing,
     /// Written and checked; waiting for the Save dialog.
     Saving { bytes: Arc<Vec<u8>>, format: Format, version: DxfVersion },
+    /// Being written to the chosen file, on a worker.
+    Storing,
 }
 
 /// One `exportRequest` being answered.
 #[derive(Debug, Clone)]
 pub struct ExportJob {
+    pub key: JobKey,
     pub request_id: String,
     pub stage: Stage,
     /// The dialog, while another SecurePlan dialog is showing.
@@ -705,7 +729,7 @@ pub fn prepare(drawing: &super::session::Drawing, payload: &[u8], snapshot: &ser
 #[derive(Debug, Clone)]
 pub struct ComposeDone {
     pub tab_id: u64,
-    pub request_id: String,
+    pub key: JobKey,
     pub result: super::Carry<Result<Composed, String>>,
 }
 
@@ -713,10 +737,22 @@ pub struct ComposeDone {
 #[derive(Debug, Clone)]
 pub struct WriteDone {
     pub tab_id: u64,
-    pub request_id: String,
+    pub key: JobKey,
     pub format: Format,
     pub version: DxfVersion,
     pub result: super::Carry<Result<Vec<u8>, WriteError>>,
+}
+
+/// A finished file write, for the UI thread.
+#[derive(Debug, Clone)]
+pub struct SaveDone {
+    pub tab_id: u64,
+    pub key: JobKey,
+    /// The saved file's name (no directory), for `exportResult`.
+    pub name: String,
+    pub format: Format,
+    pub version: DxfVersion,
+    pub saved: bool,
 }
 
 #[cfg(test)]
@@ -814,7 +850,8 @@ pub(crate) mod tests {
         assert_eq!(block.entity_handles.len(), symbols::symbol(DeviceKind::Camera).len());
         // Targets, drawings, labels, notes and coverage.
         let target: Vec<_> = on_layer(&document, "SECUREPLAN-TARGET").collect();
-        assert!(matches!(target[2], EntityType::Text(t) if t.value == "Entry face (250 px/m)"));
+        assert!(matches!(target[2], EntityType::Text(t) if t.value == "Entry face"), "no evaluated label in this payload: its own");
+        assert!(matches!(target[3], EntityType::Text(t) if t.value == "Required 250 PPM"));
         let drawings: Vec<_> = on_layer(&document, "SECUREPLAN-DRAWING").collect();
         assert!(drawings.iter().any(|e| matches!(e, EntityType::LwPolyline(p) if p.is_closed && p.vertices.len() == 4)), "rectangle");
         assert!(drawings.iter().any(|e| matches!(e, EntityType::Ellipse(el) if (el.minor_axis_ratio - 0.5).abs() < 1e-12)), "ellipse");
@@ -860,6 +897,29 @@ pub(crate) mod tests {
         let (dx, dy) = (tip[0] - 6000.0, tip[1] - 3000.0);
         let length = dx.hypot(dy);
         assert!((dx / length - (facing[0] - 6000.0)).abs() < 1e-9 && (dy / length - (facing[1] - 3000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_target_shows_the_achieved_ppm_once_and_the_required_ppm_apart() {
+        let mut value = sample_payload();
+        // As the web sends it: the target's engineering label carries the
+        // PPM the design achieves there (0 here), not the required 250.
+        value["labels"].as_array_mut().unwrap().push(serde_json::json!({ "elementId": "target-1", "text": "Entry face · 0 PPM", "position": [7000, 3900] }));
+        let payload = parse_payload(value.to_string().as_bytes()).unwrap();
+        let mut document = testutil::synthetic_document();
+        compose(&mut document, &payload, &mapping());
+        let texts = |value: &str| document.entities().filter(|e| matches!(e, EntityType::Text(t) if t.value == value)).map(|e| e.common().layer.clone()).collect::<Vec<_>>();
+        assert_eq!(texts("Entry face · 0 PPM"), ["SECUREPLAN-TARGET"], "the achieved PPM, once, with the target");
+        assert_eq!(texts("Required 250 PPM"), ["SECUREPLAN-TARGET"], "the requirement, apart");
+        assert!(texts("Entry face").is_empty() && texts("Entry face (250 px/m)").is_empty(), "no second label");
+        let placed = document
+            .entities()
+            .find_map(|e| match e {
+                EntityType::Text(t) if t.value == "Entry face · 0 PPM" => Some(t.insertion_point),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(placed, Vector3::new(7000.0, 18000.0 - 3900.0, 0.0), "where the web places it");
     }
 
     #[test]

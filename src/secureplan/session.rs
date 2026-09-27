@@ -813,6 +813,10 @@ impl OpenCADStudio {
         // A changed plan replaces the document: keep the local work first,
         // under the plan it was made from, and replace nothing if that fails.
         let preserved = if unapplied && !keep_local { self.secureplan_keep_recovery(index) } else { Preserve::Nothing };
+        // An export answers the session that asked for it: it ends before the
+        // document is bound to the new one, whether or not the old session's
+        // close has arrived yet.
+        self.secureplan_drop_export(tab_id);
         {
             let bound = self.secureplan.sessions.by_tab_mut(tab_id).expect("bound above");
             bound.session = Some(session);
@@ -1501,6 +1505,10 @@ pub(crate) mod tests {
         pub survey_empty: bool,
         /// Earlier web connections, kept open.
         old_webs: Vec<Web>,
+        /// A session whose `Closed` event is held back (a re-pair that
+        /// overtakes the old session's close), and the event once it came.
+        pub hold_close: Option<SessionId>,
+        pub held_close: Option<BridgeEvent>,
         dir: std::path::PathBuf,
     }
 
@@ -1528,7 +1536,7 @@ pub(crate) mod tests {
             let BridgeEvent::Opened { session, .. } = &opened else { panic!("expected Opened") };
             let session = *session;
             let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
-            Self { app, events, web, session, next_transfer: 1, bridge, survey_empty: true, old_webs: Vec::new(), dir }
+            Self { app, events, web, session, next_transfer: 1, bridge, survey_empty: true, old_webs: Vec::new(), hold_close: None, held_close: None, dir }
         }
 
         pub(crate) fn dir(&self) -> &std::path::Path {
@@ -1538,8 +1546,54 @@ pub(crate) mod tests {
 
         /// Deliver the next bridge event to the app.
         pub(crate) fn pump(&mut self) {
-            let event = next_event(&self.events);
-            let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+            loop {
+                let event = next_event(&self.events);
+                if matches!(&event, BridgeEvent::Closed { session, .. } if Some(*session) == self.hold_close) {
+                    self.held_close = Some(event);
+                    continue;
+                }
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+                return;
+            }
+        }
+
+        /// Re-pair the open survey from a new page, confirmed in the desktop,
+        /// holding back the old session's `Closed` event so that the new
+        /// session's messages overtake it.
+        pub(crate) fn pair_again_overtaking(&mut self, pairing: u8) {
+            let old = self.session;
+            self.hold_close = Some(old);
+            let request = launch(ORIGIN, pairing);
+            self.bridge.add_pending(request.clone());
+            let web = connect_web(self.bridge.port(), &request).expect("pair again");
+            self.old_webs.push(std::mem::replace(&mut self.web, web));
+            loop {
+                let event = next_event(&self.events);
+                if matches!(&event, BridgeEvent::Closed { session, .. } if *session == old) {
+                    self.held_close = Some(event);
+                    continue;
+                }
+                let opened = match &event {
+                    BridgeEvent::Opened { session, needs_confirmation, .. } => Some((*session, *needs_confirmation)),
+                    _ => None,
+                };
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+                if let Some((session, needs_confirmation)) = opened {
+                    self.session = session;
+                    if needs_confirmation {
+                        let _ = self.app.update(Message::SecurePlan(Msg::Action(Action::Repair(session, true))));
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// Deliver the held-back `Closed` event, if it came.
+        pub(crate) fn deliver_held_close(&mut self) {
+            self.hold_close = None;
+            if let Some(event) = self.held_close.take() {
+                let _ = self.app.update(Message::SecurePlan(Msg::Bridge(event)));
+            }
         }
 
         pub(crate) fn send(&mut self, message: Value) {
@@ -1625,6 +1679,30 @@ pub(crate) mod tests {
                         let chunk = self.web.opener.open(FrameKind::Chunk, &sealed).unwrap();
                         let id = u32::from_le_bytes(chunk[..4].try_into().unwrap()) as u64;
                         transfers.get_mut(&id).expect("announced").1.extend_from_slice(&chunk[8..]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// The types of the control messages the web receives up to and
+        /// including the next one of type `kind`.
+        pub(crate) fn types_until(&mut self, kind: &str) -> Vec<String> {
+            let mut types = Vec::new();
+            loop {
+                match self.web.socket.read().expect("a frame") {
+                    Frame::Text(text) => {
+                        let sealed = channel::b64url_decode(text.as_str()).unwrap();
+                        let message: Value = serde_json::from_slice(&self.web.opener.open(FrameKind::Control, &sealed).unwrap()).unwrap();
+                        let found = message["type"].as_str().unwrap_or_default().to_string();
+                        types.push(found.clone());
+                        if found == kind {
+                            return types;
+                        }
+                    }
+                    Frame::Binary(sealed) => {
+                        // Every frame advances the counter: open it to stay in step.
+                        let _ = self.web.opener.open(FrameKind::Chunk, &sealed);
                     }
                     _ => {}
                 }
@@ -2612,8 +2690,7 @@ pub(crate) mod tests {
     }
 
     /// The synthetic plan with one damaged polyline the reader drops.
-    #[cfg(feature = "secureplan-test")]
-    fn damaged_dxf() -> Vec<u8> {
+    pub(crate) fn damaged_dxf() -> Vec<u8> {
         use acadrust::types::Vector2;
         let mut doc = testutil::synthetic_document();
         let mut damaged = acadrust::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);

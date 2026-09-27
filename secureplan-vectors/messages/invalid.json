@@ -1193,6 +1193,21 @@
       }
     },
     {
+      "name": "exportRequest-missing-mapping",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "exportRequest",
+        "requestId": "exp-1",
+        "snapshot": {
+          "version": 12,
+          "documentHash": "2b69620a5a625907df23f2bd30c3276da97753912d6460d22d778a7b0208f56a"
+        },
+        "drawingTransferId": 22,
+        "payloadTransferId": 23
+      }
+    },
+    {
       "name": "exportResult-path-name",
       "direction": "desktopToWeb",
       "layer": "schema",

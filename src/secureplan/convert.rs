@@ -197,18 +197,30 @@ struct Chain {
     points: Vec<[f64; 2]>,
 }
 
-/// What the selection is made of.
+/// What the selection is made of, cut into world points. Built on the UI
+/// thread within [`MAX_PIECE_POINTS`]; the candidates are assembled from it on
+/// a worker.
 #[derive(Debug, Default)]
-struct Pieces {
+pub struct Pieces {
     chains: Vec<Chain>,
     unsupported: Vec<[f64; 2]>,
     skipped: usize,
+    /// Points gathered so far; past [`MAX_PIECE_POINTS`] nothing more is cut.
+    points: usize,
+    over_budget: bool,
 }
+
+/// The most points a selection may be cut into: past it, conversion is
+/// refused before any further work (a wall or route has at most 10,000).
+pub const MAX_PIECE_POINTS: usize = 200_000;
+/// A route's pieces share their joints: at most twice its points.
+const MAX_ROUTE_PIECE_POINTS: usize = 2 * MAX_ROUTE_POINTS;
 
 /// Walk the selected top-level model-space entities (block references are
 /// followed into their content) and cut every line and curve into a chain of
-/// world points within [`CHORD_TOLERANCE_MM`].
-fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: &HashSet<Handle, S>, mapping: &Mapping) -> Pieces {
+/// world points within [`CHORD_TOLERANCE_MM`], stopping at
+/// [`MAX_PIECE_POINTS`].
+pub fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: &HashSet<Handle, S>, mapping: &Mapping) -> Pieces {
     let mut pieces = Pieces::default();
     let block = scene.current_layout_block_handle_pub();
     let to_world = |transform: &acadrust::types::Transform, point: Vector3| {
@@ -222,6 +234,9 @@ fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: &Has
         // Only the selection, and everything inside a selected block reference.
         |entity, context| context.is_instanced() || selected.contains(&entity.common().handle),
         |entity, context| {
+            if pieces.over_budget {
+                return;
+            }
             let transform = &context.transform;
             let chain: Option<Vec<[f64; 2]>> = match entity {
                 EntityType::Line(line) => Some(vec![to_world(transform, line.start), to_world(transform, line.end)]),
@@ -268,6 +283,8 @@ fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: &Has
                 }
             };
             if let Some(points) = chain.filter(|points| points.len() >= 2) {
+                pieces.points += points.len();
+                pieces.over_budget = pieces.points > MAX_PIECE_POINTS;
                 pieces.chains.push(Chain { points });
             }
         },
@@ -299,20 +316,35 @@ fn reject(rejected: &mut Vec<Rejected>, total: &mut usize, reason: Reason, at_mm
 }
 
 /// The candidates for `kind` from the selected entities of `scene` (its model
-/// space), mapped with `mapping`.
+/// space), mapped with `mapping`: [`pieces`] then [`assemble`].
 pub fn candidates<S: std::hash::BuildHasher>(
     scene: &crate::scene::Scene,
     selected: &HashSet<Handle, S>,
     mapping: &Mapping,
     kind: Kind,
 ) -> Result<Candidates, Refusal> {
-    let pieces = pieces(scene, selected, mapping);
+    assemble(&pieces(scene, selected, mapping), kind)
+}
+
+/// The candidates for `kind` from `pieces` (on a worker): near-linear work,
+/// with the budgets checked first.
+pub fn assemble(pieces: &Pieces, kind: Kind) -> Result<Candidates, Refusal> {
+    if pieces.over_budget {
+        return Err(Refusal::new(format!(
+            "The selection is too large to convert at once (more than {MAX_PIECE_POINTS} points of linework). Select fewer objects."
+        )));
+    }
+    if kind == Kind::Route && pieces.points > MAX_ROUTE_PIECE_POINTS {
+        return Err(Refusal::new(format!(
+            "The selection is too large for one cable route (SecurePlan takes at most {MAX_ROUTE_POINTS} points). Select a shorter path."
+        )));
+    }
     if pieces.chains.iter().flat_map(|c| &c.points).chain(&pieces.unsupported).any(|p| !in_range(*p)) {
         return Err(Refusal::new("Part of the selection lies outside the survey's coordinate range (±10 km)."));
     }
     let result = match kind {
-        Kind::Walls => walls(&pieces),
-        Kind::Route => route(&pieces),
+        Kind::Walls => walls(pieces),
+        Kind::Route => route(pieces),
     };
     result.map(|mut candidates| {
         candidates.skipped = pieces.skipped;
@@ -354,16 +386,46 @@ fn walls(pieces: &Pieces) -> Result<Candidates, Refusal> {
     Ok(Candidates { kind: Kind::Walls, walls, points: Vec::new(), rejected, rejected_total: total, skipped: 0 })
 }
 
-/// Points of `chains` joined when within [`MIN_POINT_SPACING_MM`].
-struct Nodes(Vec<[f64; 2]>);
+/// A uniform grid of cells `size` wide, holding indices.
+struct Grid {
+    size: f64,
+    cells: std::collections::HashMap<(i64, i64), Vec<usize>>,
+}
+
+impl Grid {
+    fn new(size: f64) -> Self {
+        Self { size, cells: Default::default() }
+    }
+
+    fn cell(&self, point: [f64; 2]) -> (i64, i64) {
+        ((point[0] / self.size).floor() as i64, (point[1] / self.size).floor() as i64)
+    }
+
+    /// The indices in the cells around `point` (its cell and the eight next to it).
+    fn near(&self, point: [f64; 2]) -> impl Iterator<Item = usize> + '_ {
+        let (x, y) = self.cell(point);
+        (-1..=1).flat_map(move |dx| (-1..=1).map(move |dy| (x + dx, y + dy))).flat_map(|key| self.cells.get(&key).into_iter().flatten().copied())
+    }
+}
+
+/// Points of `chains` joined when within [`MIN_POINT_SPACING_MM`]: a point
+/// becomes the lowest-numbered node within that distance, found through a
+/// grid of 1 mm cells.
+struct Nodes {
+    points: Vec<[f64; 2]>,
+    grid: Grid,
+}
 
 impl Nodes {
     fn of(&mut self, point: [f64; 2]) -> usize {
-        match self.0.iter().position(|node| distance(*node, point) < MIN_POINT_SPACING_MM) {
+        let found = self.grid.near(point).filter(|&node| distance(self.points[node], point) < MIN_POINT_SPACING_MM).min();
+        match found {
             Some(index) => index,
             None => {
-                self.0.push(point);
-                self.0.len() - 1
+                self.points.push(point);
+                let key = self.grid.cell(point);
+                self.grid.cells.entry(key).or_default().push(self.points.len() - 1);
+                self.points.len() - 1
             }
         }
     }
@@ -388,6 +450,9 @@ fn to_segment(point: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     distance(point, [a[0] + t * dx, a[1] + t * dy])
 }
 
+/// At most this many branch places are gathered (the notice names five).
+const MAX_BRANCHES: usize = 64;
+
 fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
     if !pieces.unsupported.is_empty() {
         return Err(Refusal::at(Reason::UnsupportedCurve, pieces.unsupported.iter().copied().take(5).collect()));
@@ -397,28 +462,60 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
         return Err(Refusal::new("The selection has no lines or curves to convert."));
     }
     // Each chain joins the nodes at its two ends.
-    let mut nodes = Nodes(Vec::new());
+    let mut nodes = Nodes { points: Vec::new(), grid: Grid::new(MIN_POINT_SPACING_MM) };
     let ends: Vec<(usize, usize)> = chains
         .iter()
         .map(|chain| (nodes.of(chain.points[0]), nodes.of(*chain.points.last().expect("two points"))))
         .collect();
-    let mut degree = vec![0usize; nodes.0.len()];
-    for &(a, b) in &ends {
-        degree[a] += 1;
-        degree[b] += 1;
+    let nodes = nodes.points;
+    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (chain, &(a, b)) in ends.iter().enumerate() {
+        incident[a].push(chain);
+        if b != a {
+            incident[b].push(chain);
+        }
     }
+    let degree: Vec<usize> = (0..nodes.len())
+        .map(|node| incident[node].iter().map(|&c| usize::from(ends[c].0 == node) + usize::from(ends[c].1 == node)).sum())
+        .collect();
     // Branches: three or more pieces meeting at a point, or a piece ending
-    // on another piece away from that piece's ends.
-    let mut branches: Vec<[f64; 2]> = degree.iter().enumerate().filter(|(_, d)| **d > 2).map(|(node, _)| nodes.0[node]).collect();
-    for (i, &(a, b)) in ends.iter().enumerate() {
+    // on another piece away from that piece's ends. Segments are found
+    // through a grid whose cells are at least 2 mm and about as long as an
+    // average segment: each segment is entered in the cells around points
+    // half a cell apart along it, so any point within 1 mm of it lies in a
+    // cell next to one of those.
+    let mut branches: Vec<[f64; 2]> = (0..nodes.len()).filter(|&node| degree[node] > 2).map(|node| nodes[node]).take(MAX_BRANCHES).collect();
+    let segments: Vec<(usize, [f64; 2], [f64; 2])> =
+        chains.iter().enumerate().flat_map(|(c, chain)| chain.points.windows(2).map(move |w| (c, w[0], w[1]))).collect();
+    let total: f64 = segments.iter().map(|(_, a, b)| distance(*a, *b)).sum();
+    let mut grid = Grid::new((total / segments.len().max(1) as f64).max(2.0 * MIN_POINT_SPACING_MM));
+    for (index, &(_, a, b)) in segments.iter().enumerate() {
+        let steps = (distance(a, b) / (grid.size / 2.0)).ceil().max(1.0) as usize;
+        let mut keys = std::collections::HashSet::new();
+        for step in 0..=steps {
+            let t = step as f64 / steps as f64;
+            let (x, y) = grid.cell([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    keys.insert((x + dx, y + dy));
+                }
+            }
+        }
+        for key in keys {
+            grid.cells.entry(key).or_default().push(index);
+        }
+    }
+    'ends: for (i, &(a, b)) in ends.iter().enumerate() {
         for node in [a, b] {
-            let at = nodes.0[node];
-            let touches = chains.iter().enumerate().any(|(j, other)| {
+            if branches.len() >= MAX_BRANCHES {
+                break 'ends;
+            }
+            let at = nodes[node];
+            let (x, y) = grid.cell(at);
+            let touches = grid.cells.get(&(x, y)).into_iter().flatten().any(|&index| {
+                let (j, sa, sb) = segments[index];
                 let (c, d) = ends[j];
-                j != i
-                    && node != c
-                    && node != d
-                    && other.points.windows(2).any(|segment| to_segment(at, segment[0], segment[1]) < MIN_POINT_SPACING_MM)
+                j != i && node != c && node != d && to_segment(at, sa, sb) < MIN_POINT_SPACING_MM
             });
             if touches && !branches.iter().any(|b| distance(*b, at) < MIN_POINT_SPACING_MM) {
                 branches.push(at);
@@ -430,12 +527,12 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
     }
     // Pieces that do not meet: one gap per missing link, where the nearest
     // ends of separate groups are.
-    let mut parent: Vec<usize> = (0..nodes.0.len()).collect();
+    let mut parent: Vec<usize> = (0..nodes.len()).collect();
     for &(a, b) in &ends {
         let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
         parent[ra] = rb;
     }
-    let groups: Vec<usize> = (0..nodes.0.len()).map(|node| root(&mut parent, node)).collect();
+    let groups: Vec<usize> = (0..nodes.len()).map(|node| root(&mut parent, node)).collect();
     let mut distinct: Vec<usize> = groups.clone();
     distinct.sort_unstable();
     distinct.dedup();
@@ -444,29 +541,35 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
         // none: any of its points), paired across groups nearest first
         // (Kruskal), one gap per missing link. Past MAX_GAP_GROUPS groups
         // only the first groups' ends are named, so the work stays small.
+        let named: std::collections::HashSet<usize> = distinct.iter().copied().take(MAX_GAP_GROUPS).collect();
+        let mut members: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for (node, group) in groups.iter().enumerate() {
+            if named.contains(group) {
+                members.entry(*group).or_default().push(node);
+            }
+        }
         let mut ends: Vec<(usize, usize)> = Vec::new();
-        for &group in distinct.iter().take(MAX_GAP_GROUPS) {
-            let members: Vec<usize> = (0..nodes.0.len()).filter(|&n| groups[n] == group).collect();
-            let free: Vec<usize> = members.iter().copied().filter(|&n| degree[n] == 1).collect();
-            let pick = if free.is_empty() { vec![members[0]] } else { free };
+        for (&group, nodes_of) in &members {
+            let free: Vec<usize> = nodes_of.iter().copied().filter(|&n| degree[n] == 1).collect();
+            let pick = if free.is_empty() { vec![nodes_of[0]] } else { free };
             ends.extend(pick.into_iter().map(|node| (group, node)));
         }
         let mut links: Vec<(f64, usize, usize)> = Vec::new();
         for (i, &(ga, a)) in ends.iter().enumerate() {
             for &(gb, b) in &ends[i + 1..] {
                 if ga != gb {
-                    links.push((distance(nodes.0[a], nodes.0[b]), a, b));
+                    links.push((distance(nodes[a], nodes[b]), a, b));
                 }
             }
         }
         links.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
-        let mut joined: Vec<usize> = (0..nodes.0.len()).collect();
+        let mut joined: Vec<usize> = (0..nodes.len()).collect();
         let mut gaps = Vec::new();
         for (_, a, b) in links {
             let (ra, rb) = (root(&mut joined, groups[a]), root(&mut joined, groups[b]));
             if ra != rb {
                 joined[ra] = rb;
-                gaps.push(midpoint(nodes.0[a], nodes.0[b]));
+                gaps.push(midpoint(nodes[a], nodes[b]));
             }
         }
         return Err(Refusal::at(Reason::Gap, gaps));
@@ -476,7 +579,7 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
     let mut used = vec![false; chains.len()];
     let mut at = start;
     let mut path: Vec<[f64; 2]> = Vec::new();
-    while let Some(next) = (0..chains.len()).find(|&i| !used[i] && (ends[i].0 == at || ends[i].1 == at)) {
+    while let Some(next) = incident[at].iter().copied().find(|&i| !used[i]) {
         used[next] = true;
         let forward = ends[next].0 == at;
         let mut points = chains[next].points.clone();
@@ -489,16 +592,19 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
         at = if forward { ends[next].1 } else { ends[next].0 };
     }
     // Consecutive points closer than 1 mm: the later one goes, except the
-    // path's end, which replaces the point before it.
+    // path's end, which stays and replaces every point before it that is
+    // too close (the start excepted).
     let (mut rejected, mut total) = (Vec::new(), 0);
     let mut points: Vec<[f64; 2]> = Vec::with_capacity(path.len());
     let last = path.len() - 1;
     for (index, point) in path.into_iter().enumerate() {
         match points.last() {
             Some(previous) if distance(*previous, point) < MIN_POINT_SPACING_MM => {
-                if index == last && points.len() > 1 {
-                    let dropped = points.pop().expect("more than one");
-                    reject(&mut rejected, &mut total, Reason::PointsTooClose, dropped);
+                if index == last {
+                    while points.len() > 1 && distance(*points.last().expect("more than one"), point) < MIN_POINT_SPACING_MM {
+                        let dropped = points.pop().expect("more than one");
+                        reject(&mut rejected, &mut total, Reason::PointsTooClose, dropped);
+                    }
                     points.push(point);
                 } else {
                     reject(&mut rejected, &mut total, Reason::PointsTooClose, point);
@@ -508,7 +614,8 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
         }
     }
     let length: f64 = points.windows(2).map(|pair| distance(pair[0], pair[1])).sum();
-    if points.len() < 2 || length < MIN_LENGTH_MM {
+    let spaced = points.windows(2).all(|pair| distance(pair[0], pair[1]) >= MIN_POINT_SPACING_MM);
+    if points.len() < 2 || length < MIN_LENGTH_MM || !spaced {
         return Err(Refusal::at(Reason::TooShort, points.first().copied().into_iter().collect()));
     }
     if points.len() > MAX_ROUTE_POINTS {
@@ -518,6 +625,26 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
         )));
     }
     Ok(Candidates { kind: Kind::Route, walls: Vec::new(), points, rejected, rejected_total: total, skipped: 0 })
+}
+
+/// What a conversion was started under: its candidates are sent only if the
+/// session, plan, document and drawing are still the same.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Origin {
+    pub session: super::bridge::SessionId,
+    pub base_identity: String,
+    pub generation: u64,
+    pub revision: u64,
+}
+
+/// Candidates assembled on a worker, for the UI thread.
+#[derive(Debug, Clone)]
+pub struct Done {
+    pub tab_id: u64,
+    pub kind: Kind,
+    pub origin: Origin,
+    pub mapping: Mapping,
+    pub result: super::Carry<Result<Candidates, Refusal>>,
 }
 
 /// The reasons of `rejected`, counted, for the user.
@@ -622,6 +749,17 @@ mod tests {
     }
 
     #[test]
+    fn a_spline_is_converted_within_a_millimetre_along_every_chord() {
+        let (spline, curve) = crate::app::secureplan::publish::tests::bulging_spline();
+        let (scene, selected) = scene_with(vec![EntityType::Spline(spline)]);
+        let found = candidates(&scene, &selected, &mapping(), Kind::Route).unwrap();
+        // Back to CAD coordinates: world (x, 20000 − y).
+        let cad: Vec<[f64; 2]> = found.points.iter().map(|p| [p[0], 20000.0 - p[1]]).collect();
+        let departure = crate::app::secureplan::publish::tests::polyline_departure(&cad, curve);
+        assert!(departure <= CHORD_TOLERANCE_MM * (1.0 + 1e-6), "the curve leaves a chord by {departure} mm");
+    }
+
+    #[test]
     fn a_route_joins_pieces_end_to_end_in_order() {
         // Drawn out of order and one reversed: the path still runs A → D.
         let (scene, selected) = scene_with(vec![
@@ -663,15 +801,34 @@ mod tests {
     }
 
     #[test]
-    fn many_separate_pieces_are_refused_quickly() {
-        // 4000 separate 200 mm lines: a gap refusal, without pairing every end.
-        let lines = (0..4000).map(|i| line(0.0, i as f64 * 1000.0, 200.0, i as f64 * 1000.0)).collect();
+    fn oversized_selections_are_refused_or_handled_quickly() {
+        // 100,000 separate 200 mm lines: over the route's budget, refused
+        // before any pairing of ends; as walls, over the wall limit.
+        let spot = |i: usize| (((i % 316) * 300) as f64, ((i / 316) * 300) as f64);
+        let lines: Vec<EntityType> = (0..100_000).map(spot).map(|(x, y)| line(x, y, x + 200.0, y)).collect();
+        let (scene, selected) = scene_with(lines);
+        let started = std::time::Instant::now();
+        let refused = candidates(&scene, &selected, &mapping(), Kind::Route).unwrap_err();
+        assert!(refused.message.contains("too large"), "{}", refused.message);
+        let refused = candidates(&scene, &selected, &mapping(), Kind::Walls).unwrap_err();
+        assert!(refused.message.contains("at most"), "{}", refused.message);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(4), "{elapsed:?}");
+        // Past the budget, cutting stops and the conversion is refused.
+        let (scene, selected) = scene_with((0..100_001).map(spot).map(|(x, y)| line(x, y, x + 200.0, y)).collect());
+        let pieces = pieces(&scene, &selected, &mapping());
+        assert!(pieces.over_budget && pieces.points <= MAX_PIECE_POINTS + 2);
+        assert!(assemble(&pieces, Kind::Walls).unwrap_err().message.contains("too large to convert at once"));
+        // Just under the route's budget (9,999 separate lines): the gaps are
+        // found without comparing every pair of ends.
+        let lines: Vec<EntityType> = (0..9_999).map(spot).map(|(x, y)| line(x, y, x + 200.0, y)).collect();
         let (scene, selected) = scene_with(lines);
         let started = std::time::Instant::now();
         let refused = candidates(&scene, &selected, &mapping(), Kind::Route).unwrap_err();
         assert!(refused.message.contains("do not meet"));
         assert_eq!(refused.at_mm.len(), MAX_GAP_GROUPS - 1);
-        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
@@ -697,6 +854,21 @@ mod tests {
         // Walls: nothing long enough is refused outright.
         let (scene, selected) = scene_with(vec![line(0.0, 0.0, 149.9, 0.0)]);
         assert!(candidates(&scene, &selected, &mapping(), Kind::Walls).unwrap_err().message.contains("150 mm"));
+    }
+
+    #[test]
+    fn a_reversing_tail_leaves_no_step_under_a_millimetre() {
+        // (0,0) → (200,0) → (201.1,0) → (200.5,0): keeping the end must not
+        // leave (200,0) and (200.5,0) side by side.
+        let polyline = LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(200.0, 0.0), Vector2::new(201.1, 0.0), Vector2::new(200.5, 0.0)]);
+        let (scene, selected) = scene_with(vec![EntityType::LwPolyline(polyline)]);
+        let found = candidates(&scene, &selected, &mapping(), Kind::Route).unwrap();
+        for pair in found.points.windows(2) {
+            assert!(distance(pair[0], pair[1]) >= MIN_POINT_SPACING_MM, "{:?}", found.points);
+        }
+        assert!(close(*found.points.last().unwrap(), [200.5, 20000.0]), "the end is kept");
+        assert!(close(found.points[0], [0.0, 20000.0]));
+        assert_eq!(found.rejected.iter().filter(|r| r.reason == Reason::PointsTooClose).count(), 2);
     }
 
     #[test]
