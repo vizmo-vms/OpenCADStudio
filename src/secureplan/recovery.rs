@@ -417,7 +417,7 @@ impl crate::app::OpenCADStudio {
             vec![
                 (restore.to_string(), super::ui::Action::RecoveryRestore(tab_id)),
                 ("Discard them".to_string(), super::ui::Action::RecoveryDiscard(tab_id)),
-                ("Decide later".to_string(), super::ui::Action::Dismiss),
+                ("Decide later".to_string(), super::ui::Action::RecoveryLater(tab_id)),
             ],
         ));
         true

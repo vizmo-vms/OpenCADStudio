@@ -119,6 +119,10 @@ impl Api {
     }
 }
 
+/// The application name 3DxWare shows; SecurePlan CAD names upstream only
+/// in About (DSK-08).
+const APP_NAME: &str = if cfg!(feature = "secureplan") { "SecurePlan CAD" } else { "Open CAD Studio" };
+const APP_NAME_C: &CStr = if cfg!(feature = "secureplan") { c"SecurePlan CAD" } else { c"Open CAD Studio" };
 const NO_DATA: c_long = 0x80040078_u32 as c_long;
 const INVALID: c_long = 0x80040016_u32 as c_long;
 
@@ -348,7 +352,7 @@ impl Commands {
     fn new(actions: &[Action]) -> Self {
         let mut strings = vec![
             CString::new("Default").unwrap(),
-            CString::new("Open CAD Studio").unwrap(),
+            CString::new(APP_NAME).unwrap(),
             CString::new("").unwrap(),
         ];
         let mut nodes = vec![Node {
@@ -493,7 +497,7 @@ impl Connection {
         let result = unsafe {
             (api.create)(
                 &mut handle,
-                c"Open CAD Studio".as_ptr(),
+                APP_NAME_C.as_ptr(),
                 accessors.as_ptr(),
                 accessors.len(),
                 &options,

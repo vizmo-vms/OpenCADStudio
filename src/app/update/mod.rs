@@ -8350,7 +8350,8 @@ impl OpenCADStudio {
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(error) = &self.plugin_registry_error {
                     return iced::clipboard::write(format!(
-                        "Open CAD Studio v{}\nOS: {}\nArchitecture: {}\nRegistry: {}\nError: {}",
+                        "{} v{}\nOS: {}\nArchitecture: {}\nRegistry: {}\nError: {}",
+                        if cfg!(feature = "secureplan") { "SecurePlan CAD" } else { "Open CAD Studio" },
                         env!("OCS_FULL_VERSION"),
                         std::env::consts::OS,
                         std::env::consts::ARCH,

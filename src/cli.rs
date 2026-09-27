@@ -28,7 +28,12 @@ use clap::Parser;
         "\nprofile: ", env!("OCS_BUILD_PROFILE"),
         "\nfeatures: ", env!("OCS_BUILD_FEATURES"),
     ),
-    about = crate::t!("Open CAD Studio — 2D/3D CAD editor").into_owned(),
+    // SecurePlan CAD names upstream only in About (DSK-08).
+    about = if cfg!(feature = "secureplan") {
+        "SecurePlan CAD — the desktop CAD companion of SecurePlan".to_string()
+    } else {
+        crate::t!("Open CAD Studio — 2D/3D CAD editor").into_owned()
+    },
     long_about = None,
 )]
 pub struct Cli {

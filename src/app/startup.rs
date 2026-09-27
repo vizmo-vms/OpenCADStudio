@@ -9,6 +9,8 @@ impl OpenCADStudio {
             self.pending_startup_modals
                 .push_back(ModalKind::AssocPrompt);
         }
+        // Nor does it ask for donations to upstream (DSK-08).
+        #[cfg(not(feature = "secureplan"))]
         if self.donation_prompt_version != env!("OCS_APP_VERSION") {
             self.pending_startup_modals
                 .push_back(ModalKind::DonationPrompt);
@@ -114,7 +116,9 @@ pub(crate) fn gpu_platform_hint() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{config::AppConfig, Message};
+    #[cfg(not(feature = "secureplan"))]
+    use crate::app::config::AppConfig;
+    use crate::app::Message;
     use iced::wgpu;
 
     #[test]
@@ -157,7 +161,9 @@ mod tests {
         assert_ne!(software.identity().unwrap(), restarted.gpu_warning_silenced);
     }
 
+    // SecurePlan CAD has no donation prompt (DSK-08, secureplan::home tests).
     #[test]
+    #[cfg(not(feature = "secureplan"))]
     fn donation_prompt_persists_once_per_version() {
         let mut app = OpenCADStudio::new_for_test();
         // Older settings have no donation version; headless construction never prompts.
@@ -191,12 +197,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "secureplan"))]
     fn startup_dialogs_wait_their_turn_and_preserve_unseen_prompts() {
         let mut app = OpenCADStudio::new_for_test();
         app.apply_config(AppConfig::default());
         app.queue_startup_prompts();
-        // SecurePlan CAD has no association prompt: the donation prompt is first.
-        #[cfg(not(feature = "secureplan"))]
         assert_eq!(app.active_modal, Some(ModalKind::AssocPrompt));
         let _ = app.update(Message::UpdateCheckResult(Some(
             crate::io::update_check::UpdateInfo {
@@ -204,11 +209,8 @@ mod tests {
                 body: String::new(),
             },
         )));
-        #[cfg(not(feature = "secureplan"))]
-        {
-            assert_eq!(app.active_modal, Some(ModalKind::AssocPrompt));
-            let _ = app.update(Message::AssocPromptNo);
-        }
+        assert_eq!(app.active_modal, Some(ModalKind::AssocPrompt));
+        let _ = app.update(Message::AssocPromptNo);
         assert_eq!(app.active_modal, Some(ModalKind::DonationPrompt));
 
         // A file-recovery dialog may interrupt startup before the first frame.

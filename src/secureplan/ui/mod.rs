@@ -41,6 +41,8 @@ pub enum Action {
     CloseKeep(u64),
     RecoveryRestore(u64),
     RecoveryDiscard(u64),
+    /// "Decide later": keep the recovery copy for another time.
+    RecoveryLater(u64),
     /// Answer a re-pair to an open document (BRG-05).
     Repair(SessionId, bool),
     AlignConfirm,
@@ -55,6 +57,8 @@ pub enum Action {
     Command(&'static str),
     /// Replace tab `.0`'s drawing: choose the file now (PUB-01).
     ImportReplace(u64),
+    /// Show connected survey tab `.0` (the home screen's list, DSK-08).
+    ShowSurvey(u64),
     /// The updater (DSK-07): **Update**, keep recovery copies and update,
     /// Apply tab `.0` first, **Install and restart**, and cancel a download.
     UpdateStart,

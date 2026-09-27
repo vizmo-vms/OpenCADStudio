@@ -135,3 +135,38 @@ fn secureplan_link_from_an_ineligible_website_opens_nothing() {
     assert!(output.stderr.is_empty(), "{output:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Release builds refuse `--export`, `--dwg-thumbnail` and `--script` before
+/// reading or writing any file (DSK-08); `secureplan-test` builds apply that
+/// rule when `SECUREPLAN_TEST_RELEASE_RULES` is set.
+#[cfg(feature = "secureplan-test")]
+#[test]
+fn secureplan_release_builds_refuse_the_headless_drawing_modes() {
+    let dir = sentinel_dir("release");
+    let input = dir.join("synthetic.dxf");
+    let doc = acadrust::CadDocument::new();
+    std::fs::write(&input, OpenCADStudio::io::save_to_bytes(&doc, "dxf", doc.version).unwrap()).unwrap();
+    let script = dir.join("script.scr");
+    std::fs::write(&script, "LINE 0,0 1,1\n").unwrap();
+    let (converted, thumbnail) = (dir.join("out.dxf"), dir.join("out.png"));
+    let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    for args in [
+        vec!["--export".to_string(), path(&input), path(&converted)],
+        vec!["--dwg-thumbnail".to_string(), path(&input), path(&thumbnail), "64".to_string()],
+        vec!["--new-instance".to_string(), "--script".to_string(), path(&script)],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_OpenCADStudio"))
+            .args(&args)
+            .env("SECUREPLAN_TEST_RELEASE_RULES", "1")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("XDG_CONFIG_HOME", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the SecurePlan CAD binary");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not available in SecurePlan CAD"), "{args:?}: {output:?}");
+        assert!(!converted.exists() && !thumbnail.exists(), "{args:?} wrote a file");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

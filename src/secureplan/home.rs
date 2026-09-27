@@ -224,6 +224,11 @@ mod tests {
         ui.into_messages().collect()
     }
 
+    /// A task that does nothing at all (no message, no effect).
+    fn inert(task: iced::Task<Message>) -> bool {
+        iced_runtime::task::into_stream(task).is_none()
+    }
+
     fn shows(element: Element<'_, Message>, wanted: &str) -> bool {
         iced_test::simulator(element).find(wanted).is_ok()
     }
@@ -261,7 +266,7 @@ mod tests {
             let _ = app.update(message.clone());
             assert!(!nothing_opened(&app), "the fixture does not open with {message:?}");
         }
-        assert!(OpenCADStudio::new_for_test().update(Message::OpenFile).units() > 0, "Open shows no file dialog");
+        assert!(!inert(OpenCADStudio::new_for_test().update(Message::OpenFile)), "Open shows no file dialog");
 
         let mut app = OpenCADStudio::new_for_test();
         app.secureplan.no_standalone = true;
@@ -270,11 +275,11 @@ mod tests {
             assert!(nothing_opened(&app), "{message:?} opened a drawing");
             assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("Edit in desktop")), "{message:?}");
         }
-        assert_eq!(app.update(Message::OpenFile).units(), 0, "the file dialog opened");
+        assert!(inert(app.update(Message::OpenFile)), "the file dialog opened");
         for message in [Message::SaveFile, Message::SaveAs, Message::DocTabSaveAll] {
             app.command_line.last_error = None;
             let task = app.update(message.clone());
-            assert_eq!(task.units(), 0, "{message:?} started a save");
+            assert!(inert(task), "{message:?} started a save");
             assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("does not save")), "{message:?}");
         }
         assert!(app.recent_files.iter().all(|recent| recent != &file), "a recent-file entry was added");
@@ -289,11 +294,9 @@ mod tests {
         for start_page in [crate::tr!("start", "new-drawing"), crate::tr!("start", "open-file")] {
             assert!(!shows(app.view_main(), &start_page), "the Start page shows {start_page}");
         }
-        // The only "+" left is the status bar's (disabled) new-layout button.
-        let mut ui = iced_test::simulator(app.view_main());
-        if ui.click("+").is_ok() {
-            assert!(!ui.into_messages().any(|m| matches!(m, Message::TabNew)), "the new-tab button shows");
-        }
+        // Neither the new-tab button nor the status bar (with its
+        // new-layout "+") shows on the home screen.
+        assert!(!shows(app.view_main(), "+"), "the new-tab button or the status bar shows");
         let home = || app.secureplan_home_view();
         for wanted in [APP_NAME, &format!("Version {VERSION}"), KEYBOARD_HINT] {
             assert!(shows(home(), wanted), "{wanted}");
@@ -323,8 +326,16 @@ mod tests {
         assert_eq!(h.app.tabs.len(), 2);
         assert_eq!(h.app.secureplan_window_title(), "Synthetic survey — SecurePlan CAD");
         assert_eq!(h.app.secureplan_connected_surveys(), vec![(index, "Synthetic survey".to_string(), h.bound().origin.clone())]);
+        assert!(shows(h.app.view_main(), "+"), "a survey has no status bar");
         let messages = clicked(h.app.secureplan_home_view(), "Synthetic survey");
         assert!(messages.iter().any(|m| matches!(m, Message::TabSwitch(i) if *i == index)), "the survey cannot be shown");
+        // By keyboard: the SECUREPLAN menu on the home screen lists it first.
+        let _ = h.app.update(Message::TabSwitch(0));
+        let _ = h.app.dispatch_command("SECUREPLAN");
+        let Some(super::super::ui::Dialog::Choice { form, .. }) = &h.app.secureplan.dialog else { panic!("no menu") };
+        assert_eq!((form.buttons[0].0.as_str(), form.focus), ("Show Synthetic survey", 0));
+        h.key(crate::app::secureplan::ui::trust_dialog::DialogKey::Activate);
+        assert_eq!(h.app.active_tab, index, "the keyboard cannot show the survey");
 
         let _ = h.app.update(Message::TabClose(index));
         assert_eq!(h.app.tabs.len(), 1);
@@ -358,13 +369,87 @@ mod tests {
         assert_eq!(h.app.secureplan_empty_session(), None, "a survey with a drawing offered Open drawing");
     }
 
+    /// The SecurePlan web app's `src/assets/vizmo-logo-mark.png`.
+    const LOGO_SHA256: &str = "be234e6a0150cfd3ea89dde886f46596d84ba9f0828e4feeb3c25ba131715778";
+
+    /// The PNG image of the `size` px entry in an ICO file.
+    fn ico_entry(ico: &[u8], size: u8) -> &[u8] {
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        let entry = (0..count).map(|i| &ico[6 + 16 * i..22 + 16 * i]).find(|e| e[0] == size).expect("no such icon size");
+        let length = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+        &ico[offset..offset + length]
+    }
+
     #[test]
     fn the_window_icon_and_about_are_vizmo_and_name_the_source() {
+        use sha2::Digest;
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(LOGO_PNG)), LOGO_SHA256, "not the Vizmo mark");
         let pixels = window_icon_rgba(32).expect("the logo decodes");
         assert_eq!(pixels.len(), 32 * 32 * 4);
         assert!(window_icon().is_some());
+        // The Windows icon's 256 px entry (0 in the directory) is the mark,
+        // pixel for pixel, centred on a transparent square.
+        let ico = include_bytes!("../../packaging/secureplan/AppIcon.ico");
+        let icon = ::image::load_from_memory_with_format(ico_entry(ico, 0), ::image::ImageFormat::Png).unwrap().into_rgba8();
+        let mark = ::image::load_from_memory_with_format(LOGO_PNG, ::image::ImageFormat::Png).unwrap().into_rgba8();
+        assert_eq!((icon.width(), mark.width()), (256, 224));
+        for (x, y, pixel) in icon.enumerate_pixels() {
+            let inside = (16..240).contains(&x) && (16..240).contains(&y);
+            if inside {
+                assert_eq!(pixel, mark.get_pixel(x - 16, y - 16), "({x}, {y})");
+            } else {
+                assert_eq!(pixel.0[3], 0, "({x}, {y}) is not transparent");
+            }
+        }
         let [product, licence] = about_lines();
         assert!(product.contains(APP_NAME) && product.contains(VERSION) && product.contains("Open CAD Studio"));
         assert!(licence.contains("GNU General Public License version 3") && licence.contains(SOURCE_URL));
+    }
+
+    /// Upstream's donation prompt and its link commands are gone, and a
+    /// recent-file command is refused before its path is looked at (DSK-08).
+    #[test]
+    fn no_donation_prompt_upstream_links_or_recent_files() {
+        // Startup, as a clean install and after an earlier version.
+        for previous in ["", "2026.30"] {
+            let mut app = OpenCADStudio::new_for_test();
+            app.donation_prompt_version = previous.to_string();
+            app.pending_startup_modals.clear();
+            app.active_modal = None;
+            app.queue_startup_prompts();
+            assert!(!app.pending_startup_modals.contains(&crate::app::ModalKind::DonationPrompt), "{previous:?}");
+            assert_ne!(app.active_modal, Some(crate::app::ModalKind::DonationPrompt), "{previous:?}");
+        }
+        let mut app = OpenCADStudio::new_for_test();
+        for verb in ["DONATE", "REPORT", "WEBVERSION", "CHANGELOG", "HELP", "help"] {
+            app.command_line.last_error = None;
+            assert!(inert(app.dispatch_command(verb)), "{verb} opened a page");
+            assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("not available in SecurePlan CAD")), "{verb}");
+        }
+        // Without the refusal a recent file opens.
+        let file = synthetic_file("recent");
+        assert!(!inert(OpenCADStudio::new_for_test().dispatch_command(&format!("OPEN_RECENT:{}", file.display()))));
+        let mut app = OpenCADStudio::new_for_test();
+        app.secureplan.no_standalone = true;
+        for path in [file.display().to_string(), r"\\attacker\share\drawing.dwg".to_string()] {
+            app.command_line.last_error = None;
+            assert!(inert(app.dispatch_command(&format!("OPEN_RECENT:{path}"))), "a recent file opened");
+            assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("Edit in desktop")));
+            assert!(nothing_opened(&app));
+        }
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    /// Outside About, SecurePlan CAD shows its own name, not upstream's.
+    #[test]
+    fn upstream_is_named_only_in_about() {
+        use clap::CommandFactory;
+        let app = OpenCADStudio::new_for_test();
+        let history: Vec<&str> = app.command_line.history.iter().map(|entry| entry.text.as_str()).collect();
+        assert!(history.iter().any(|line| line.ends_with("SecurePlan CAD ready.")), "{history:?}");
+        assert!(history.iter().all(|line| !line.contains("Open CAD Studio")), "{history:?}");
+        let about = crate::cli::Cli::command().get_about().map(|about| about.to_string()).unwrap_or_default();
+        assert!(about.starts_with(APP_NAME) && !about.contains("Open CAD Studio"), "{about}");
     }
 }

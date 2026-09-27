@@ -94,6 +94,23 @@ jobs:
             exit 1
           fi
 
+      # DSK-08: release builds read or write no drawing outside a session.
+      - name: Release build refuses the headless drawing modes
+        run: |
+          printf '0\nEOF\n' > in.dxf
+          printf 'LINE\n' > in.scr
+          for args in "--export in.dxf out.dxf" "--dwg-thumbnail in.dxf out.png 64" "--new-instance --script in.scr"; do
+            set +e
+            env -u DISPLAY -u WAYLAND_DISPLAY timeout 60 target/release/OpenCADStudio $args > refused.log 2>&1
+            code=$?
+            set -e
+            if [ "$code" != 2 ] || ! grep -q "not available in SecurePlan CAD" refused.log || [ -e out.dxf ] || [ -e out.png ]; then
+              echo "::error::the release binary ran $args (exit $code)"
+              cat refused.log
+              exit 1
+            fi
+          done
+
       - name: Clippy (warnings are denied inside src/secureplan)
         run: cargo clippy --locked --features secureplan --all-targets
 

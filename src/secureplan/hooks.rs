@@ -41,7 +41,16 @@
 //!   `src/scene/model/material_model.rs`, `src/scene/centerline.rs`,
 //!   `src/app/annotation_data.rs`: the external-resource guard;
 //! - `src/io/mod.rs`, `src/app/automation.rs`, `src/main.rs`: diagnostics
-//!   without file paths.
+//!   without file paths;
+//! - `src/main.rs`, `src/app/automation.rs`: release builds refuse
+//!   `--export`, `--dwg-thumbnail` and `--script` (DSK-08);
+//! - `src/app/startup.rs`: no donation prompt; `src/app/view/mod.rs`: no
+//!   status bar on the home screen (DSK-08);
+//! - `src/cli.rs`, `src/ui/command_line.rs`,
+//!   `src/ui/window/options/spacemouse.rs`, `src/input/spacemouse/navlib.rs`,
+//!   `src/io/pdf_export.rs`, `src/ui/window/plugin_manager.rs`,
+//!   `src/app/update/mod.rs`: "SecurePlan CAD" where upstream's name showed
+//!   outside About (DSK-08).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -838,14 +847,17 @@ impl OpenCADStudio {
                     Task::none()
                 }
             }
+            // Answering the recovery offer continues an import the page
+            // asked for.
             Action::RecoveryRestore(tab_id) => {
                 self.secureplan_restore_recovery(tab_id);
-                Task::none()
+                self.secureplan_continue_import(tab_id)
             }
             Action::RecoveryDiscard(tab_id) => {
                 self.secureplan_discard_recovery(tab_id);
-                Task::none()
+                self.secureplan_continue_import(tab_id)
             }
+            Action::RecoveryLater(tab_id) => self.secureplan_continue_import(tab_id),
             Action::Repair(session, accept) => {
                 if let Some(bridge) = self.secureplan_bridge() {
                     bridge.confirm(session, accept);
@@ -854,6 +866,10 @@ impl OpenCADStudio {
             }
             Action::Command(command) => self.dispatch_command(command),
             Action::ImportReplace(tab_id) => self.secureplan_pick_import(tab_id),
+            Action::ShowSurvey(tab_id) => match self.secureplan_tab_index(tab_id) {
+                Some(index) => self.update(Message::TabSwitch(index)),
+                None => Task::none(),
+            },
             Action::AlignConfirm => self.secureplan_confirm_align(),
             Action::ApplyConfirm => self.secureplan_confirm_apply(),
             Action::ApplyReset => {
@@ -890,10 +906,20 @@ impl OpenCADStudio {
             self.command_line.push_error(&refused.to_string());
             return Some(Task::none());
         }
+        // A recent-file open is refused before its path is looked at, so a
+        // network path is never touched (DSK-08).
+        if command.starts_with("OPEN_RECENT:") && self.secureplan_refuses_standalone(&Message::OpenRecent(Default::default())) {
+            return Some(Task::none());
+        }
         let argument = command.split_whitespace().nth(1);
         match command_verb(command).as_str() {
             // Registration as the .dwg/.dxf opener is not part of SecurePlan CAD (DSK-05).
             "FILEASSOC" => self.command_line.push_error("FILEASSOC is not available in SecurePlan CAD."),
+            // Upstream's donation, report, web-version, changelog and help
+            // pages: upstream appears only in About (DSK-08).
+            verb @ ("DONATE" | "REPORT" | "WEBVERSION" | "CHANGELOG" | "HELP") => {
+                self.command_line.push_error(&format!("{verb} is not available in SecurePlan CAD."));
+            }
             // "Allowed websites" (BRG-02): the list, also as a dialog for the
             // home screen's button.
             "SECUREPLANTRUST" => {
@@ -960,12 +986,20 @@ impl OpenCADStudio {
             // The SecurePlan tab's buttons as a keyboard menu with visible focus.
             "SECUREPLAN" => {
                 // The home screen offers only what needs no survey drawing.
+                // It lists the connected surveys first, as the home screen
+                // does, so the keyboard reaches them too (DSK-06).
                 let home = self.tabs[self.active_tab].is_start;
-                let mut buttons: Vec<(String, Action)> = super::ribbon::COMMANDS
-                    .iter()
-                    .filter(|(command, ..)| !(home && super::ribbon::needs_drawing(command)))
-                    .map(|(command, label, _)| (label.to_string(), Action::Command(command)))
+                let surveys = if home { self.secureplan_connected_surveys() } else { Vec::new() };
+                let mut buttons: Vec<(String, Action)> = surveys
+                    .into_iter()
+                    .map(|(index, label, _)| (format!("Show {label}"), Action::ShowSurvey(self.tabs[index].id)))
                     .collect();
+                buttons.extend(
+                    super::ribbon::COMMANDS
+                        .iter()
+                        .filter(|(command, ..)| !(home && super::ribbon::needs_drawing(command)))
+                        .map(|(command, label, _)| (label.to_string(), Action::Command(command))),
+                );
                 buttons.push(("Close".to_string(), Action::Dismiss));
                 self.secureplan.dialog = Some(Dialog::choice("SecurePlan", vec!["Choose a SecurePlan action.".to_string()], buttons));
             }

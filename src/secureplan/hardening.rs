@@ -77,6 +77,37 @@ pub fn headless_automation_refusal(mcp: bool, serve: bool) -> Option<&'static st
     )
 }
 
+/// Whether the headless modes that read or write drawings (`--export`,
+/// `--dwg-thumbnail`, `--script`) run: only in test and development builds,
+/// for measurement. Release builds refuse them before any file access
+/// (DSK-08). `secureplan-test` builds apply the release rule when
+/// `SECUREPLAN_TEST_RELEASE_RULES` is set, so the refusal can be tested.
+pub fn headless_files_allowed() -> bool {
+    #[cfg(test)]
+    if TEST_RELEASE_RULES.with(std::cell::Cell::get) {
+        return false;
+    }
+    #[cfg(feature = "secureplan-test")]
+    if std::env::var_os("SECUREPLAN_TEST_RELEASE_RULES").is_some() {
+        return false;
+    }
+    cfg!(any(debug_assertions, feature = "secureplan-test"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests apply the release rule on their own thread only.
+    pub(crate) static TEST_RELEASE_RULES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Refusal for the headless file modes, checked by `main` before anything
+/// reads a file.
+pub fn headless_file_refusal(export: bool, thumbnail: bool, script: bool) -> Option<&'static str> {
+    ((export || thumbnail || script) && !headless_files_allowed()).then_some(
+        "--export, --dwg-thumbnail and --script are not available in SecurePlan CAD: it opens drawings only for SecurePlan.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +238,28 @@ mod tests {
         assert!(headless_automation_refusal(true, false).is_some());
         assert!(headless_automation_refusal(false, true).is_some());
         assert!(headless_automation_refusal(false, false).is_none());
+    }
+
+    /// Release builds refuse the headless drawing modes, and `export_headless`
+    /// refuses on its own, before reading the input (DSK-08).
+    #[test]
+    fn release_rules_refuse_the_headless_drawing_modes() {
+        assert_eq!(headless_file_refusal(false, false, false), None);
+        assert_eq!(headless_file_refusal(true, true, true), None, "a development build refused");
+        TEST_RELEASE_RULES.with(|rule| rule.set(true));
+        for (export, thumbnail, script) in [(true, false, false), (false, true, false), (false, false, true)] {
+            assert!(headless_file_refusal(export, thumbnail, script).is_some_and(|r| r.contains("not available in SecurePlan CAD")));
+        }
+        assert_eq!(headless_file_refusal(false, false, false), None);
+        let dir = std::env::temp_dir().join(format!("secureplan_export_refused_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (input, output) = (dir.join("in.dxf"), dir.join("out.dxf"));
+        std::fs::write(&input, crate::app::secureplan::testutil::synthetic_dxf()).unwrap();
+        // 2 is the refusal; a failed read or write would be 1.
+        assert_eq!(crate::app::export_headless(&input, &output), 2);
+        assert!(!output.exists());
+        TEST_RELEASE_RULES.with(|rule| rule.set(false));
+        assert_eq!(crate::app::export_headless(&input, &output), 0, "the development export stopped working");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

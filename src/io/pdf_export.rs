@@ -530,7 +530,8 @@ pub async fn pick_pdf_path_async(stem: String) -> Option<std::path::PathBuf> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn build_pdf_pages(pages: &[PdfPageInput], plot_style: Option<&PlotStyleTable>) -> Result<Vec<u8>, String> {
-    let mut doc = PdfDocument::new("Open CAD Studio Export");
+    // SecurePlan CAD names upstream only in About (DSK-08).
+    let mut doc = PdfDocument::new(if cfg!(feature = "secureplan") { "SecurePlan CAD Export" } else { "Open CAD Studio Export" });
     // Borrowing all pages keeps their pixel Arcs alive until this cache is dropped.
     // Allocation addresses cannot be reused by another source during this export.
     let mut image_resources = std::collections::HashMap::new();
@@ -1281,7 +1282,8 @@ fn emit_plot_stamp(ops: &mut Vec<Op>) {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "user".into());
-    let label = format!("Open CAD Studio | {user} | {timestamp}");
+    let product = if cfg!(feature = "secureplan") { "SecurePlan CAD" } else { "Open CAD Studio" };
+    let label = format!("{product} | {user} | {timestamp}");
     ops.extend([
         Op::SaveGraphicsState,
         Op::StartTextSection,

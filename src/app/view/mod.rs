@@ -2144,8 +2144,12 @@ bg={bg_ms:.1}ms n={view_count}"
                     self.hovered_doc_tab,
                 ));
             }
-            col.push(center_stack)
-                .push({
+            let col = col.push(center_stack);
+            // Nor a status bar: it shows only in a survey session (DSK-08).
+            let col = if secureplan_home {
+                col
+            } else {
+                col.push({
                     let is_model = tab.scene.current_layout == "Model";
                     let scale_pill_enabled = is_model
                         || tab.scene.active_viewport.is_some()
@@ -2261,8 +2265,8 @@ bg={bg_ms:.1}ms n={view_count}"
                             }),
                     )
                 })
-                .width(Fill)
-                .height(Fill)
+            };
+            col.width(Fill).height(Fill)
         })
         .style(|theme: &Theme| container::Style {
             background: Some(Background::Color(theme.palette().background.base.color)),
