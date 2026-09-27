@@ -1136,8 +1136,14 @@ impl OpenCADStudio {
             survey_is_empty(bound),
             bound.realigned,
             bound.plan_version,
+            super::layout::references(&tab.scene),
         );
         dialog.origin = ApplyOrigin { session: bound.session, base_identity: bound.base_identity.clone(), generation: bound.generation };
+        // A paper layout the user is on starts chosen when it can be published.
+        let current = &tab.scene.current_layout;
+        if dialog.layouts.iter().any(|(name, found)| name == current && found.is_ok()) {
+            dialog.select_view(Some(current));
+        }
         Some(dialog)
     }
 
@@ -1262,18 +1268,11 @@ impl OpenCADStudio {
             "type": "applyRequest",
             "requestId": request_id,
             "baseIdentity": base_identity,
-            "view": { "kind": "model", "windowCad": built.plan.window_cad },
+            "view": built.plan.view.to_json(),
             "cadUnits": built.alignment.units.as_str(),
             "mapping": built.alignment.mapping_json(),
             "realigned": built.realigned,
-            "placement": {
-                "widthPt": p.width_pt,
-                "heightPt": p.height_pt,
-                "centerX": p.center_x,
-                "centerY": p.center_y,
-                "widthMm": p.width_mm,
-                "heightMm": p.height_mm,
-            },
+            "placement": super::publish::placement_json(&p),
             "roundingBoundMm": p.rounding_bound_mm,
             "chordToleranceMm": p.chord_tolerance_mm,
             "drawing": { "transferId": drawing_id, "formatVersion": outputs.drawing.format_version },
@@ -2139,7 +2138,7 @@ pub(crate) mod tests {
         let geometry = crate::app::secureplan::snap::tests::read(&snap, (wp, hp)).expect("a valid snap file");
         // The PDF and the snaps agree, and neither has the late edit.
         let plan = publish::ApplyPlan {
-            window_cad: [x0, y0, x1, y1],
+            view: publish::PublishedView::Model { window_cad: [x0, y0, x1, y1] },
             mapping: crate::app::secureplan::align::Alignment::from_cad_plan(&json!({ "cadUnits": "mm", "mapping": request["mapping"] })).unwrap().mapping,
             mm_per_pt: w / wp as f64,
             damaged_acknowledged: false,
@@ -2199,7 +2198,7 @@ pub(crate) mod tests {
         let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: Some(loaded.clone()), modified: true, pending_original: None, lost_entities: 0 };
         let window = [0.0, 0.0, 30000.0, 18000.0];
         let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
-        let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: publish::choose_mm_per_pt(window, &mapping).unwrap(), damaged_acknowledged: false };
+        let plan = publish::ApplyPlan { view: publish::PublishedView::Model { window_cad: window }, mapping, mm_per_pt: publish::choose_mm_per_pt(window, &mapping).unwrap(), damaged_acknowledged: false };
         let first = publish::build_outputs(&snapshot, &plan).unwrap();
         let second = publish::build_outputs(&snapshot, &plan).unwrap();
         assert_eq!(first.drawing.bytes, second.drawing.bytes, "the writer output repeats");
@@ -2244,7 +2243,7 @@ pub(crate) mod tests {
         let snapshot = publish::Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: None, modified: true, pending_original: None, lost_entities: 0 };
         let window = [0.0, 0.0, 30000.0, 18000.0];
         let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
-        let plan = publish::ApplyPlan { window_cad: window, mapping, mm_per_pt: 3.0, damaged_acknowledged: false };
+        let plan = publish::ApplyPlan { view: publish::PublishedView::Model { window_cad: window }, mapping, mm_per_pt: 3.0, damaged_acknowledged: false };
         publish::build_outputs(&snapshot, &plan).expect("outputs");
     }
 
@@ -2657,7 +2656,7 @@ pub(crate) mod tests {
         let _ = h.app.dispatch_command("SECUREPLANAPPLY");
         h.key(DialogKey::Activate);
         assert!(h.bound().apply.is_none() && matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "applied without the acknowledgement");
-        h.app.secureplan.dialog.as_mut().unwrap().form_mut().focus = 4;
+        h.app.secureplan.dialog.as_mut().unwrap().form_mut().focus = crate::app::secureplan::ui::apply_dialog::ACKNOWLEDGE;
         h.key(DialogKey::Right);
         h.key(DialogKey::Previous);
         h.key(DialogKey::Activate);

@@ -108,66 +108,87 @@ fn drawing_unit_pt() -> f32 {
 
 #[cfg(all(feature = "secureplan", not(target_arch = "wasm32")))]
 thread_local! {
-    static SECUREPLAN_PAGE: std::cell::Cell<Option<crate::app::secureplan::publish::PageTransform>> =
+    static SECUREPLAN_PAGE: std::cell::Cell<Option<crate::app::secureplan::publish::LayerTransform>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Write one SecurePlan page (CON-01): drawing coordinates are mapped by
-/// `transform` to a `W`×`H`-point page, with no plot stamp, clipped to the
-/// page, and finished deterministically by the SecurePlan publisher.
+/// Write one SecurePlan page (CON-01) from `layers`, drawn in order: each
+/// layer's drawing coordinates are mapped by its own transform to the same
+/// `W`×`H`-point page (a paper layout draws its sheet in paper coordinates and
+/// its reference viewport in model coordinates, clipped to the viewport), with
+/// no plot stamp, clipped to the page, and finished deterministically by the
+/// SecurePlan publisher.
 #[cfg(all(feature = "secureplan", not(target_arch = "wasm32")))]
-pub fn secureplan_page_pdf(
-    content: PlotContent,
-    transform: crate::app::secureplan::publish::PageTransform,
-) -> Result<Vec<u8>, String> {
+pub fn secureplan_page_pdf(layers: Vec<crate::app::secureplan::publish::PageLayer>) -> Result<Vec<u8>, String> {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             SECUREPLAN_PAGE.with(|page| page.set(None));
         }
     }
-    let (width_pt, height_pt) = (transform.placement.width_pt, transform.placement.height_pt);
-    let page = PdfPageInput {
-        content,
-        paper_w: width_pt as f64 / 2.834646,
-        paper_h: height_pt as f64 / 2.834646,
-        offset_x: 0.0,
-        offset_y: 0.0,
-        rotation_deg: 0,
-        scale: 1.0,
-        clip: None,
-        options: PdfPlotOptions { stamp: false, ..PdfPlotOptions::default() },
-        plot_style: None,
+    let placement = layers.first().ok_or("No page content.")?.transform.page.placement;
+    let (width_pt, height_pt) = (placement.width_pt, placement.height_pt);
+    let (w, h) = (width_pt as f32, height_pt as f32);
+    let corner = |x: f32, y: f32| LinePoint { p: Point { x: Pt(x), y: Pt(y) }, bezier: false };
+    let clip_to = |points: Vec<LinePoint>| Op::DrawPolygon {
+        polygon: Polygon { rings: vec![PolygonRing { points }], mode: PaintMode::Clip, winding_order: WindingOrder::NonZero },
     };
+    let single = layers.len() == 1;
     let mut doc = PdfDocument::new("SecurePlan plan");
     let mut image_resources = std::collections::HashMap::new();
-    {
-        let _reset = Reset;
-        SECUREPLAN_PAGE.with(|slot| slot.set(Some(transform)));
-        append_pdf_page(&mut doc, &mut image_resources, &page, None)?;
+    let mut ops = Vec::new();
+    let mut first_page = None;
+    for (index, layer) in layers.into_iter().enumerate() {
+        let page = PdfPageInput {
+            content: layer.content,
+            paper_w: width_pt as f64 / 2.834646,
+            paper_h: height_pt as f64 / 2.834646,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            rotation_deg: 0,
+            scale: 1.0,
+            clip: None,
+            options: PdfPlotOptions { stamp: false, ..PdfPlotOptions::default() },
+            plot_style: None,
+        };
+        {
+            let _reset = Reset;
+            SECUREPLAN_PAGE.with(|slot| slot.set(Some(layer.transform)));
+            append_pdf_page(&mut doc, &mut image_resources, &page, None)?;
+        }
+        let mut written = doc.pages.pop().ok_or("No page was written.")?;
+        let mut layer_ops = std::mem::take(&mut written.ops);
+        first_page.get_or_insert(written);
+        if single {
+            ops = layer_ops;
+            break;
+        }
+        // Every written page starts with its white background: the sheet
+        // keeps the first one; later layers draw over it without their own.
+        if !matches!(layer_ops.get(..2), Some([Op::SetFillColor { .. }, Op::DrawRectangle { .. }])) {
+            return Err("Unexpected page content.".into());
+        }
+        let background: Vec<Op> = layer_ops.drain(..2).collect();
+        if index == 0 {
+            ops.extend(background);
+        }
+        ops.push(Op::SaveGraphicsState);
+        for clip in &layer.clips {
+            ops.push(clip_to(clip.iter().map(|&[x, y]| corner(x as f32, y as f32)).collect()));
+        }
+        ops.extend(layer_ops);
+        ops.push(Op::RestoreGraphicsState);
     }
-    let pdf_page = doc.pages.last_mut().ok_or("No page was written.")?;
-    let bounds = printpdf::Rect::from_wh(Pt(width_pt as f32), Pt(height_pt as f32));
+    // Nothing outside the published page is visible.
+    ops.splice(0..0, [Op::SaveGraphicsState, clip_to(vec![corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)])]);
+    ops.push(Op::RestoreGraphicsState);
+    let mut pdf_page = first_page.ok_or("No page was written.")?;
+    pdf_page.ops = ops;
+    let bounds = printpdf::Rect::from_wh(Pt(w), Pt(h));
     pdf_page.media_box = bounds.clone();
     pdf_page.trim_box = bounds.clone();
     pdf_page.crop_box = bounds;
-    // Nothing outside the published window is visible on the page.
-    let (w, h) = (width_pt as f32, height_pt as f32);
-    let corner = |x: f32, y: f32| LinePoint { p: Point { x: Pt(x), y: Pt(y) }, bezier: false };
-    pdf_page.ops.splice(
-        0..0,
-        [
-            Op::SaveGraphicsState,
-            Op::DrawPolygon {
-                polygon: Polygon {
-                    rings: vec![PolygonRing { points: vec![corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)] }],
-                    mode: PaintMode::Clip,
-                    winding_order: WindingOrder::NonZero,
-                },
-            },
-        ],
-    );
-    pdf_page.ops.push(Op::RestoreGraphicsState);
+    doc.pages.push(pdf_page);
     let options = PdfSaveOptions { optimize: true, subset_fonts: true, secure: true, image_optimization: None };
     let mut warnings = Vec::new();
     let lopdf_doc = doc.to_lopdf_document(&options, &mut warnings);
@@ -1384,10 +1405,19 @@ fn emit_hatch(
     // boundary-relative encoding exists to avoid.
     let (world_ox, world_oy) = (hatch.world_origin[0], hatch.world_origin[1]);
 
+    // A SecurePlan page draws a boundary from its exact f64 vertices when
+    // the publisher recovered them (`boundary_wcs`, aligned with `boundary`).
+    #[cfg(feature = "secureplan")]
+    let exact = hatch
+        .boundary_wcs
+        .as_deref()
+        .filter(|exact| exact.len() == hatch.boundary.len() && SECUREPLAN_PAGE.with(std::cell::Cell::get).is_some());
+    #[cfg(not(feature = "secureplan"))]
+    let exact: Option<&Vec<[f64; 2]>> = None;
     // Split the boundary into rings on every NaN-NaN separator.
     let mut rings: Vec<PolygonRing> = Vec::new();
     let mut current: Vec<LinePoint> = Vec::new();
-    for &[bx, by] in hatch.boundary.iter() {
+    for (index, &[bx, by]) in hatch.boundary.iter().enumerate() {
         if bx.is_nan() || by.is_nan() {
             if current.len() >= 3 {
                 rings.push(PolygonRing { points: std::mem::take(&mut current) });
@@ -1396,8 +1426,12 @@ fn emit_hatch(
             }
             continue;
         }
+        let (x, y) = match exact.and_then(|exact| exact.get(index)) {
+            Some(&[x, y]) => (x, y),
+            None => (bx as f64 + world_ox, by as f64 + world_oy),
+        };
         current.push(LinePoint {
-            p: sheet_point(bx as f64 + world_ox + ox, by as f64 + world_oy + oy),
+            p: sheet_point(x + ox, y + oy),
             bezier: false,
         });
     }

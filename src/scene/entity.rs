@@ -1383,7 +1383,7 @@ impl Scene {
             all_visible,
             depth_map.as_ref(),
         )
-        .with_annotation_scale(self.annotation_scale)
+        .with_annotation_scale(self.fill_annotation_scale())
         .with_viewport(viewport);
         let mut hatch_block_memo = std::collections::HashMap::new();
         let mut models = Vec::new();
@@ -1560,7 +1560,7 @@ impl Scene {
             all_visible,
             depth_map.as_ref(),
         )
-        .with_annotation_scale(self.annotation_scale);
+        .with_annotation_scale(self.fill_annotation_scale());
         let mut models = Vec::new();
         let mut wipeout_sources = rustc_hash::FxHashMap::default();
         graph.walk_root(

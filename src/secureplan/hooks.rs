@@ -666,8 +666,10 @@ impl OpenCADStudio {
 
     /// Keep a form dialog's derived state in step with its fields.
     fn secureplan_refresh_dialog(&mut self) {
-        if let Some(Dialog::Align(dialog)) = self.secureplan.dialog.as_mut() {
-            dialog.refresh();
+        match self.secureplan.dialog.as_mut() {
+            Some(Dialog::Align(dialog)) => dialog.refresh(),
+            Some(Dialog::Apply(dialog)) => dialog.refresh(),
+            _ => {}
         }
     }
 
