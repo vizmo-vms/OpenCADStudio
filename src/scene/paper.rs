@@ -858,6 +858,17 @@ impl Scene {
         self.model_wires_for_viewport(vp_handle, screen_height_px)
     }
 
+    /// The annotation multiplier fills (hatches, wipeouts) are placed with:
+    /// the scene's own, except while SecurePlan builds the fills of model
+    /// space as a paper viewport shows them, when it is that viewport's.
+    pub(super) fn fill_annotation_scale(&self) -> f32 {
+        #[cfg(feature = "secureplan")]
+        if let Some(scale) = SECUREPLAN_FILL_ANNOTATION.with(std::cell::Cell::get) {
+            return scale;
+        }
+        self.annotation_scale
+    }
+
     /// SecurePlan (PUB-03 layouts): the context native paper rendering uses
     /// for model space seen through `viewport`: the model block, the
     /// viewport's frozen layers, its annotation scale and the annotation
@@ -880,14 +891,28 @@ impl Scene {
     }
 
     /// SecurePlan (PUB-03 layouts): the plot hatches and wipeouts of model
-    /// space as `viewport` shows them, in model coordinates (not projected).
+    /// space as `viewport` shows them (its frozen layers, annotation scale
+    /// and multiplier), in model coordinates (not projected).
     #[cfg(feature = "secureplan")]
-    pub(crate) fn secureplan_viewport_fills(&self, viewport: Handle) -> (Vec<HatchModel>, Vec<HatchModel>) {
-        let (model, frozen, scale, _) = self.secureplan_viewport_context(viewport);
-        let all_visible = self.annotation_all_visible();
+    pub(crate) fn secureplan_viewport_fills(&self, viewport: Handle, all_visible: bool) -> (Vec<HatchModel>, Vec<HatchModel>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SECUREPLAN_FILL_ANNOTATION.with(|scale| scale.set(None));
+            }
+        }
+        let (model, frozen, scale, multiplier) = self.secureplan_viewport_context(viewport);
+        let _reset = Reset;
+        SECUREPLAN_FILL_ANNOTATION.with(|slot| slot.set(Some(multiplier)));
         (
             self.plot_hatches_for_block(model, Some(&frozen), scale, all_visible, false),
             self.plot_wipeouts_for_block(model, Some(&frozen), scale, all_visible, false),
         )
     }
+}
+
+#[cfg(feature = "secureplan")]
+thread_local! {
+    /// The viewport annotation multiplier while SecurePlan builds its fills.
+    static SECUREPLAN_FILL_ANNOTATION: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
 }

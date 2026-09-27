@@ -1405,10 +1405,19 @@ fn emit_hatch(
     // boundary-relative encoding exists to avoid.
     let (world_ox, world_oy) = (hatch.world_origin[0], hatch.world_origin[1]);
 
+    // A SecurePlan page draws a boundary from its exact f64 vertices when
+    // the publisher recovered them (`boundary_wcs`, aligned with `boundary`).
+    #[cfg(feature = "secureplan")]
+    let exact = hatch
+        .boundary_wcs
+        .as_deref()
+        .filter(|exact| exact.len() == hatch.boundary.len() && SECUREPLAN_PAGE.with(std::cell::Cell::get).is_some());
+    #[cfg(not(feature = "secureplan"))]
+    let exact: Option<&Vec<[f64; 2]>> = None;
     // Split the boundary into rings on every NaN-NaN separator.
     let mut rings: Vec<PolygonRing> = Vec::new();
     let mut current: Vec<LinePoint> = Vec::new();
-    for &[bx, by] in hatch.boundary.iter() {
+    for (index, &[bx, by]) in hatch.boundary.iter().enumerate() {
         if bx.is_nan() || by.is_nan() {
             if current.len() >= 3 {
                 rings.push(PolygonRing { points: std::mem::take(&mut current) });
@@ -1417,8 +1426,12 @@ fn emit_hatch(
             }
             continue;
         }
+        let (x, y) = match exact.and_then(|exact| exact.get(index)) {
+            Some(&[x, y]) => (x, y),
+            None => (bx as f64 + world_ox, by as f64 + world_oy),
+        };
         current.push(LinePoint {
-            p: sheet_point(bx as f64 + world_ox + ox, by as f64 + world_oy + oy),
+            p: sheet_point(x + ox, y + oy),
             bezier: false,
         });
     }

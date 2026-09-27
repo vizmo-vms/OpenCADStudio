@@ -56,6 +56,8 @@ pub struct LayoutReference {
     /// layout's order; the reference goes at `reference_position` in it.
     pub others: Vec<SheetView>,
     pub reference_position: usize,
+    /// The layout shows annotative objects of every scale (its setting).
+    pub annotation_all_visible: bool,
 }
 
 /// Another viewport on a published sheet: a plan view (any twist), drawn
@@ -258,7 +260,13 @@ fn inside(rings: &[Vec<[f64; 2]>], [x, y]: [f64; 2]) -> bool {
 /// Whether the viewport shows any visible model geometry (its own frozen
 /// layers excluded), measured through the renderer's own viewport frame:
 /// a drawn line, or a fill (a solid hatch has no lines).
-fn shows_geometry(model: &crate::scene::Scene, viewport: Handle, frame: &crate::scene::viewport_ref::ViewportFrame, rect: [f64; 4]) -> bool {
+fn shows_geometry(
+    model: &crate::scene::Scene,
+    viewport: Handle,
+    frame: &crate::scene::viewport_ref::ViewportFrame,
+    rect: [f64; 4],
+    all_visible: bool,
+) -> bool {
     let to_paper = |x: f64, y: f64| {
         let paper = frame.model_to_paper(glam::DVec3::new(x, y, 0.0));
         [paper.x, paper.y]
@@ -282,7 +290,7 @@ fn shows_geometry(model: &crate::scene::Scene, viewport: Handle, frame: &crate::
     if lines {
         return true;
     }
-    let (hatches, wipeouts) = model.secureplan_viewport_fills(viewport);
+    let (hatches, wipeouts) = model.secureplan_viewport_fills(viewport, all_visible);
     let centre = [(rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0];
     hatches.iter().chain(&wipeouts).any(|fill| {
         let mut rings = vec![Vec::new()];
@@ -369,18 +377,20 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
     }
 
     // Each viewport's problem, if it has one, and its renderer frame.
+    let all_visible = paper.annotation_all_visible();
     let mut judged = Vec::new();
     for viewport in &viewports {
         let handle = viewport.common.handle;
         let rect = rect_of(viewport);
         let frame = model.viewport_frame(handle);
-        let problem = if !(viewport.width.abs() > 0.0 && viewport.height.abs() > 0.0 && viewport.view_height.abs() > 0.0)
+        // Depth clipping first: no enabled viewport may use it, whatever else.
+        let problem = if viewport.status.front_clipping || viewport.status.back_clipping {
+            Some(Problem::DepthClipped)
+        } else if !(viewport.width.abs() > 0.0 && viewport.height.abs() > 0.0 && viewport.view_height.abs() > 0.0)
             || !rect.iter().all(|v| v.is_finite())
             || !viewport.view_height.is_finite()
         {
             Some(Problem::NoView)
-        } else if viewport.status.front_clipping || viewport.status.back_clipping {
-            Some(Problem::DepthClipped)
         } else if !viewport.clip_boundary_handle.is_null() {
             Some(Problem::Clipped)
         } else if viewport.status.perspective {
@@ -392,7 +402,7 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
             Some(Problem::NotPlan)
         } else if viewports.iter().any(|other| other.common.handle != handle && overlap(rect, rect_of(other))) {
             Some(Problem::Overlapped)
-        } else if !frame.as_ref().is_some_and(|frame| shows_geometry(model, handle, frame, rect)) {
+        } else if !frame.as_ref().is_some_and(|frame| shows_geometry(model, handle, frame, rect, all_visible)) {
             Some(Problem::NoGeometry)
         } else {
             None
@@ -470,11 +480,11 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
             reference_position = others.len();
             continue;
         }
-        if *problem == Some(Problem::NoView) {
-            continue; // Nothing drawn.
-        }
         if other.status.front_clipping || other.status.back_clipping {
             return refuse(format!("viewport {} {}.", hex(handle), Problem::DepthClipped.text()));
+        }
+        if *problem == Some(Problem::NoView) {
+            continue; // Nothing drawn.
         }
         let Some(frame) = other_frame.filter(|_| !other.status.perspective && looks_down(other)) else {
             return refuse(format!(
@@ -482,7 +492,7 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
                 hex(handle)
             ));
         };
-        if !shows_geometry(model, handle, &frame, *other_rect) {
+        if !shows_geometry(model, handle, &frame, *other_rect, all_visible) {
             continue; // Nothing drawn.
         }
         let Some((to_paper, model_per_paper, _)) = saved_view(other, &frame) else {
@@ -509,6 +519,7 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
         basis,
         others,
         reference_position,
+        annotation_all_visible: all_visible,
     };
     let [width_mm, height_mm] = reference.sheet_mm();
     let side = |mm: f64| (mm * PT_PER_MM - 1e-9).ceil();
@@ -686,6 +697,12 @@ pub(crate) mod tests {
         assert!(refused.ends_with("shows a 3D view, which SecurePlan cannot draw on a published sheet. Turn it off to publish this layout."), "{refused}");
         iso.status.back_clipping = true;
         let refused = refusal(vec![plan_viewport((300.0, 300.0), 0.0), iso]);
+        assert!(refused.ends_with("uses front or back clipping, which SecurePlan cannot publish."), "{refused}");
+        // Even a viewport with no size may not use it.
+        let mut empty = plan_viewport((740.0, 480.0), 0.0);
+        (empty.width, empty.height) = (0.0, 0.0);
+        empty.status.front_clipping = true;
+        let refused = refusal(vec![plan_viewport((300.0, 300.0), 0.0), empty]);
         assert!(refused.ends_with("uses front or back clipping, which SecurePlan cannot publish."), "{refused}");
     }
 
@@ -925,9 +942,183 @@ pub(crate) mod tests {
         assert!(!near(&drawn, unscaled, 1e-3) && !near(&ends, unscaled, 1e-3), "the symbol is at the drawing's 1:1 size");
     }
 
+    /// A 1:100 viewport on a drawing whose own annotation scale is 1:1.
+    fn annotation_scene() -> Scene {
+        let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        scene.set_annotation_scale_named("1:100").unwrap();
+        scene.set_annotation_scale_named("1:1").unwrap();
+        scene
+    }
+
+    #[test]
+    fn annotative_fills_follow_the_viewport_annotation_scale() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, Insert, PolylineEdge, Wipeout};
+        use acadrust::types::Vector2;
+        use acadrust::xdata::ExtendedDataRecord;
+        let mut scene = annotation_scene();
+        // A symbol: a line, a 10 × 10 solid hatch and a 10 × 10 wipeout below it.
+        let mut path = BoundaryPath::new();
+        let square = |y: f64| [[0.0, y], [10.0, y], [10.0, y + 10.0], [0.0, y + 10.0]].map(|[x, y]| Vector2::new(x, y)).to_vec();
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(square(0.0), true)));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        let wipeout = Wipeout::polygonal(&square(-20.0), 0.0);
+        snap::tests::block(&mut scene.document, "SYMBOL", vec![line(0.0, 0.0, 10.0, 0.0), EntityType::Hatch(hatch), EntityType::Wipeout(wipeout)]);
+        let mut insert = Insert::new("SYMBOL", Vector3::new(15000.0, 3000.0, 0.0));
+        insert.common.extended_data.add_record(ExtendedDataRecord::new("AcAnnotativeData"));
+        scene.document.add_entity(EntityType::Insert(insert)).unwrap();
+        scene.rebuild_derived_caches();
+        let reference = found(&scene).unwrap();
+        let mapping = mm_mapping();
+        let (pdf, _, _) = publish_layout(&scene, &reference, &mapping);
+        let (model, _) = reference.transforms(&mapping).unwrap();
+        let drawn = publish::tests::content_points(&pdf);
+        // At 1:100 the symbol is 1000 units: the hatch reaches (16000, 4000),
+        // the wipeout's far corner (16000, 1000).
+        for (what, scaled, unscaled) in [("hatch", (16000.0, 4000.0), (15010.0, 3010.0)), ("wipeout", (16000.0, 1000.0), (15010.0, 2980.0))] {
+            assert!(near(&drawn, model.apply(scaled.0, scaled.1), 1e-3), "the {what} is not at the viewport's 1:100 size");
+            assert!(!near(&drawn, model.apply(unscaled.0, unscaled.1), 1e-3), "the {what} is at the drawing's 1:1 size");
+        }
+    }
+
+    #[test]
+    fn objects_of_other_annotation_scales_are_tessellated_and_snapped_as_drawn() {
+        use acadrust::entities::{Circle, Insert};
+        let mut scene = annotation_scene();
+        // A block of the 1:50 scale only, with a circle: the layout shows
+        // every scale's objects, so it is drawn through the 1:100 viewport.
+        let fifty = scene.set_annotation_scale_named("1:50").unwrap();
+        scene.set_annotation_scale_named("1:1").unwrap();
+        let mut circle = Circle::new();
+        circle.radius = 750.0;
+        snap::tests::block(&mut scene.document, "ROUND", vec![EntityType::Circle(circle)]);
+        let insert = scene.document.add_entity(EntityType::Insert(Insert::new("ROUND", Vector3::new(22000.0, 14000.0, 0.0)))).unwrap();
+        assert!(crate::scene::annotative::create_annotation_context(&mut scene.document, insert, fifty));
+        scene.rebuild_derived_caches();
+        let reference = found(&scene).unwrap();
+        assert!(reference.annotation_all_visible);
+        let mapping = mm_mapping();
+        let (pdf, _, geometry) = publish_layout(&scene, &reference, &mapping);
+        let (model, _) = reference.transforms(&mapping).unwrap();
+        let (cx, cy) = model.apply(22000.0, 14000.0);
+        let radius = 750.0 / model.placement.mm_per_pt;
+        let tolerance = model.placement.chord_tolerance_mm / model.placement.mm_per_pt;
+        let r_pt = model.placement.rounding_bound_mm / model.placement.mm_per_pt;
+        let (error, chords) = chord_error(&publish::tests::content_points(&pdf), (cx, cy), radius);
+        assert!(chords > 48 && error <= tolerance + 2.0 * r_pt, "{chords} chords, error {error} pt > {tolerance} pt");
+        let ends: Vec<[f64; 2]> = geometry.segments.iter().flat_map(|s| [[s[0] as f64, s[1] as f64], [s[2] as f64, s[3] as f64]]).collect();
+        assert!(chord_error(&ends, (cx, cy), radius).1 > 48, "the drawn circle gives no snaps");
+    }
+
+    #[test]
+    fn paper_space_is_tessellated_at_its_own_annotation_scale() {
+        use acadrust::entities::{Circle, Insert};
+        use acadrust::xdata::ExtendedDataRecord;
+        let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        // The drawing's scale is 10:1, but paper space draws at 1:1: an
+        // annotative paper symbol keeps its size.
+        scene.set_annotation_scale_named("10:1").unwrap();
+        let mut circle = Circle::new();
+        circle.radius = 20.0;
+        snap::tests::block(&mut scene.document, "STAMP", vec![EntityType::Circle(circle)]);
+        scene.set_current_layout(LAYOUT.into());
+        let mut insert = Insert::new("STAMP", Vector3::new(100.0, 500.0, 0.0));
+        insert.common.extended_data.add_record(ExtendedDataRecord::new("AcAnnotativeData"));
+        scene.add_entity(EntityType::Insert(insert));
+        scene.set_current_layout("Model".into());
+        scene.rebuild_derived_caches();
+        let reference = found(&scene).unwrap();
+        let mapping = mm_mapping();
+        let (pdf, _, _) = publish_layout(&scene, &reference, &mapping);
+        let (model, paper) = reference.transforms(&mapping).unwrap();
+        let (cx, cy) = paper.apply(100.0, 500.0);
+        let radius = paper.apply(120.0, 500.0).0 - cx;
+        let tolerance = model.placement.chord_tolerance_mm / model.placement.mm_per_pt;
+        let r_pt = model.placement.rounding_bound_mm / model.placement.mm_per_pt;
+        let (error, chords) = chord_error(&publish::tests::content_points(&pdf), (cx, cy), radius);
+        assert!(chords > 48 && error <= tolerance + 2.0 * r_pt, "{chords} chords, error {error} pt > {tolerance} pt");
+    }
+
+    /// Fill operators in a page's content.
+    fn fills(pdf: &[u8]) -> usize {
+        publish::tests::operations(pdf).iter().filter(|op| matches!(op.operator.as_str(), "f" | "f*" | "F" | "B" | "B*" | "b" | "b*")).count()
+    }
+
+    #[test]
+    fn the_viewport_render_mode_decides_whether_3d_faces_are_filled() {
+        use acadrust::entities::{Face3D, ViewportRenderMode};
+        let publish_with = |face: bool, mode: ViewportRenderMode| {
+            let mut viewport = plan_viewport((420.0, 300.0), 0.0);
+            viewport.render_mode = mode;
+            let (mut scene, _) = layout_scene(vec![viewport]);
+            if face {
+                let corner = |x: f64, y: f64| Vector3::new(x, y, 0.0);
+                let face = Face3D::new(corner(15000.0, 5000.0), corner(16000.0, 5000.0), corner(16000.0, 6000.0), corner(15000.0, 6000.0));
+                scene.document.add_entity(EntityType::Face3D(face)).unwrap();
+                scene.rebuild_derived_caches();
+            }
+            let reference = found(&scene).unwrap();
+            fills(&publish_layout(&scene, &reference, &mm_mapping()).0)
+        };
+        let plain = publish_with(false, ViewportRenderMode::Wireframe2D);
+        assert_eq!(publish_with(true, ViewportRenderMode::Wireframe2D), plain, "a wireframe viewport fills a 3D face");
+        assert!(publish_with(true, ViewportRenderMode::FlatShaded) > plain, "a shaded viewport does not fill a 3D face");
+    }
+
+    #[test]
+    fn psltscale_keeps_dashes_the_same_on_paper_in_every_viewport() {
+        use acadrust::tables::LineType;
+        let dashes = |psltscale: bool| {
+            let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+            scene.document.line_types.add(LineType::dashed()).unwrap();
+            // PSLTSCALE is the layout's own setting.
+            for object in scene.document.objects.values_mut() {
+                if let acadrust::objects::ObjectType::Layout(layout) = object {
+                    if layout.name == LAYOUT {
+                        layout.flags = if psltscale { layout.flags | 1 } else { layout.flags & !1 };
+                    }
+                }
+            }
+            scene.document.header.paper_space_linetype_scaling = !psltscale;
+            // A dashed wall seen by the 1:100 plan and the 1:10 detail.
+            let mut wall = line(4800.0, 5100.0, 5200.0, 5100.0);
+            wall.common_mut().linetype = "Dashed".into();
+            wall.common_mut().linetype_scale = 200.0;
+            scene.document.add_entity(wall).unwrap();
+            with_detail(&mut scene);
+            let reference = found(&scene).unwrap();
+            let pdf = publish_layout(&scene, &reference, &mm_mapping()).0;
+            let number = |o: &lopdf::Object| o.as_float().map(f64::from).or_else(|_| o.as_i64().map(|v| v as f64)).unwrap();
+            let mut arrays: Vec<Vec<f64>> = publish::tests::operations(&pdf)
+                .iter()
+                .filter(|op| op.operator == "d")
+                .map(|op| op.operands[0].as_array().unwrap().iter().map(number).collect::<Vec<f64>>())
+                .filter(|dash| !dash.is_empty())
+                .collect();
+            arrays.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            arrays.dedup();
+            arrays
+        };
+        // PSLTSCALE: 0.5 × 200 = 100 paper mm dashes in both viewports.
+        let on = dashes(true);
+        assert_eq!(on.len(), 1, "{on:?}");
+        assert!((on[0][0] - (100.0 * 72.0 / 25.4_f64).round()).abs() <= 1.0, "{on:?}");
+        // Without it, dashes scale with each viewport: 1 mm at 1:100, 10 mm at 1:10.
+        let off = dashes(false);
+        assert_eq!(off.len(), 2, "{off:?}");
+        assert!(off[1][0] > 5.0 * off[0][0], "{off:?}");
+    }
+
     /// A circular 1:10 detail viewport onto the column at (5000, 5000), beside
     /// the plan: clipped to a circle on the sheet, so not a second plan.
     fn with_detail(scene: &mut Scene) -> Handle {
+        detail_at(scene, (5000.0, 5000.0), 2000.0)
+    }
+
+    /// A circular detail viewport beside the plan showing `target` with
+    /// `view_height` model units across its 200 mm height.
+    fn detail_at(scene: &mut Scene, target: (f64, f64), view_height: f64) -> Handle {
         scene.set_current_layout(LAYOUT.into());
         let mut outline = acadrust::entities::Circle::new();
         outline.center = Vector3::new(720.0, 470.0, 0.0);
@@ -935,8 +1126,8 @@ pub(crate) mod tests {
         let outline = scene.add_entity(EntityType::Circle(outline));
         let mut detail = plan_viewport((720.0, 470.0), 0.0);
         detail.id = 3;
-        (detail.width, detail.height, detail.view_height) = (200.0, 200.0, 2000.0);
-        detail.view_target = Vector3::new(5000.0, 5000.0, 0.0);
+        (detail.width, detail.height, detail.view_height) = (200.0, 200.0, view_height);
+        detail.view_target = Vector3::new(target.0, target.1, 0.0);
         detail.clip_boundary_handle = outline;
         let detail = scene.add_entity(EntityType::Viewport(detail));
         scene.set_current_layout("Model".into());
@@ -944,9 +1135,45 @@ pub(crate) mod tests {
         detail
     }
 
+    /// A circular solid hatch of `radius` about `(x, y)` in model space.
+    fn round_fill(scene: &mut Scene, (x, y): (f64, f64), radius: f64) {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+            center: acadrust::types::Vector2::new(x, y),
+            radius,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::TAU,
+            counter_clockwise: true,
+        }));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        scene.add_entity(EntityType::Hatch(hatch));
+        scene.rebuild_derived_caches();
+    }
+
+    /// The largest chord error (page points) of the page points `ring` lying
+    /// on the circle of `radius` about `centre`, and how many chords.
+    fn chord_error(points: &[[f64; 2]], (cx, cy): (f64, f64), radius: f64) -> (f64, usize) {
+        let ring: Vec<[f64; 2]> = points.iter().copied().filter(|p| ((p[0] - cx).hypot(p[1] - cy) - radius).abs() < 0.01).collect();
+        let mut worst = 0.0_f64;
+        let mut chords = 0;
+        for pair in ring.windows(2) {
+            if (pair[0][0] - pair[1][0]).hypot(pair[0][1] - pair[1][1]) < radius {
+                let middle = [(pair[0][0] + pair[1][0]) / 2.0, (pair[0][1] + pair[1][1]) / 2.0];
+                worst = worst.max(radius - (middle[0] - cx).hypot(middle[1] - cy));
+                chords += 1;
+            }
+        }
+        (worst, chords)
+    }
+
     #[test]
     fn an_enlarged_detail_viewport_is_drawn_exactly_within_the_page_precision() {
         let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        // A round solid fill (radius 200) inside the column (radius 300).
+        round_fill(&mut scene, (5000.0, 5000.0), 200.0);
         let detail = with_detail(&mut scene);
         let reference = found(&scene).unwrap();
         assert_eq!(reference.others.len(), 1);
@@ -996,6 +1223,32 @@ pub(crate) mod tests {
             .fold(0.0, f64::max);
         // One f32 rounding per coordinate: within √2·r.
         assert!(worst <= r_pt * std::f64::consts::SQRT_2, "the detail is {worst} pt from where its f64 transform puts it (r = {r_pt} pt)");
+        // The round fill too: every boundary chord within the page precision
+        // (the fill renderer alone cuts at 7.5°), from exact vertices.
+        let fill_radius = place(5200.0, 5000.0).0 - cx;
+        let (fill_error, fill_chords) = chord_error(&drawn, (cx, cy), fill_radius);
+        assert!(fill_chords > 200 && fill_error <= tolerance + 2.0 * r_pt, "round fill: {fill_chords} chords, error {fill_error} pt > {tolerance} pt");
+        let fill_boundary: Vec<[f64; 2]> = publication
+            .scene
+            .document
+            .entities()
+            .find_map(|entity| match entity {
+                EntityType::Hatch(hatch) => Some(hatch.paths[0].edges.iter().flat_map(|edge| match edge {
+                    acadrust::entities::BoundaryEdge::Polyline(p) => p.vertices.iter().map(|v| [v.x, v.y]).collect(),
+                    _ => Vec::new(),
+                }).collect()),
+                _ => None,
+            })
+            .expect("the fill is re-tessellated");
+        assert!(fill_boundary.len() > 200);
+        let fill_worst = fill_boundary
+            .iter()
+            .map(|&[x, y]| {
+                let (x, y) = place(x, y);
+                drawn.iter().map(|p| (p[0] - x).hypot(p[1] - y)).fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0, f64::max);
+        assert!(fill_worst <= r_pt * std::f64::consts::SQRT_2, "the fill is {fill_worst} pt from its exact vertices");
         // Clipped to its circle on the sheet.
         let ops = publish::tests::operations(&pdf);
         let paths: Vec<usize> = ops
@@ -1007,6 +1260,64 @@ pub(crate) mod tests {
         assert!(paths.iter().any(|&edges| edges > 32), "no circular clip: {paths:?}");
         let snapped: Vec<[f64; 2]> = geometry.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
         assert!(!near(&snapped, (cx, cy), radius * 1.5), "the detail gives snaps");
+    }
+
+    #[test]
+    fn fill_vertices_far_from_the_fills_centre_stay_exact() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch, PolylineEdge};
+        use acadrust::types::Vector2;
+        let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
+        // A slab over the whole plan with a round hole (radius 100) at
+        // (5000, 5000): the hole is ~10 m from the fill's centre, where an
+        // f32 offset is ½ ulp ≈ 0.0005 units.
+        let mut outer = BoundaryPath::new();
+        let corners = [[0.0, 0.0], [30000.0, 0.0], [30000.0, 18000.0], [0.0, 18000.0]].map(|[x, y]| Vector2::new(x, y));
+        outer.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(corners.to_vec(), true)));
+        let mut hole = BoundaryPath::new();
+        hole.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+            center: Vector2::new(5000.0, 5000.0),
+            radius: 100.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::TAU,
+            counter_clockwise: true,
+        }));
+        let mut slab = Hatch::new();
+        slab.is_solid = true;
+        slab.paths = vec![outer, hole];
+        scene.add_entity(EntityType::Hatch(slab));
+        // A 1:1 detail onto the hole's edge.
+        detail_at(&mut scene, (5100.0, 5000.0), 200.0);
+        let reference = found(&scene).unwrap();
+        assert_eq!(reference.others[0].model_per_paper, 1.0);
+        let mapping = mm_mapping();
+        let (pdf, publication, _) = publish_layout(&scene, &reference, &mapping);
+        let (model, paper) = reference.transforms(&mapping).unwrap();
+        let r_pt = model.placement.rounding_bound_mm / model.placement.mm_per_pt;
+        let place = |x: f64, y: f64| {
+            let [a, b, c, d, e, f] = reference.others[0].to_paper;
+            paper.apply(a * x + b * y + e, c * x + d * y + f)
+        };
+        let hole: Vec<[f64; 2]> = publication
+            .scene
+            .document
+            .entities()
+            .find_map(|entity| match entity {
+                EntityType::Hatch(hatch) => Some(hatch.paths[1].edges.iter().flat_map(|edge| match edge {
+                    BoundaryEdge::Polyline(p) => p.vertices.iter().map(|v| [v.x, v.y]).collect(),
+                    _ => Vec::new(),
+                }).collect()),
+                _ => None,
+            })
+            .expect("the hole is re-tessellated");
+        let drawn = publish::tests::content_points(&pdf);
+        let worst = hole
+            .iter()
+            .map(|&[x, y]| {
+                let (x, y) = place(x, y);
+                drawn.iter().map(|p| (p[0] - x).hypot(p[1] - y)).fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0, f64::max);
+        assert!(worst <= r_pt * std::f64::consts::SQRT_2, "the hole is drawn {worst} pt from its exact vertices (r = {r_pt} pt)");
     }
 
     #[test]

@@ -351,6 +351,42 @@ mod tests {
     }
 
     #[test]
+    fn a_drawing_of_fills_only_applies_through_its_layout() {
+        use crate::app::secureplan::session::tests::Harness;
+        use crate::app::secureplan::{overlay, testutil};
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use acadrust::types::{Vector2, Vector3};
+        // Model space holds one solid hatch and nothing else; the layout's
+        // 1:10 viewport shows it.
+        let mut scene = crate::scene::Scene::new();
+        scene.document.header.insertion_units = 4;
+        let mut path = BoundaryPath::new();
+        let corners = [[59000.0, -1000.0], [63000.0, -1000.0], [63000.0, 3000.0], [59000.0, 3000.0]].map(|[x, y]| Vector2::new(x, y));
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge::new(corners.to_vec(), true)));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        scene.add_entity(acadrust::EntityType::Hatch(hatch));
+        let mut viewport = testutil::plan_viewport((420.0, 300.0), 0.0);
+        viewport.view_target = Vector3::new(61000.0, 1000.0, 0.0);
+        viewport.view_height = 1800.0;
+        testutil::add_layout(&mut scene, vec![viewport]);
+        let bytes = crate::io::save_to_bytes(&scene.document, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+
+        let mut h = Harness::new("driver_fills_only");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", serde_json::Value::Null, "none", "import");
+        let file = h.dir().join("fills-only.dxf");
+        std::fs::write(&file, bytes).unwrap();
+        let _ = h.app.secureplan_driver(parse(&format!("import {}", file.display())).unwrap());
+        let _ = h.app.secureplan_driver(parse("align units=mm").unwrap());
+        assert!(h.bound().alignment.is_some(), "a drawing of fills can be aligned");
+        h.app.secureplan.dialog = None;
+        let _ = h.app.secureplan_driver(parse("apply view=layout:Sheet A1").unwrap());
+        let (request, _) = h.receive("applyRequest");
+        assert_eq!(request["view"]["kind"], "layout");
+    }
+
+    #[test]
     fn import_align_and_apply_commands_parse() {
         assert_eq!(parse("import /tmp/synthetic plan.dxf"), Ok(Command::Import(PathBuf::from("/tmp/synthetic plan.dxf"))));
         assert_eq!(

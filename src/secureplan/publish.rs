@@ -224,6 +224,8 @@ pub struct LayoutPublication {
 /// One viewport's model content on the sheet.
 pub struct ViewLayer {
     pub viewport: acadrust::types::Handle,
+    /// Model units per paper unit.
+    pub model_per_paper: f64,
     pub transform: LayerTransform,
     /// Page-space polygons the content is clipped to (all of them).
     pub clips: Vec<Vec<[f64; 2]>>,
@@ -233,16 +235,27 @@ pub struct ViewLayer {
 /// draws it: the viewport's frozen layers and annotation scale.
 #[derive(Debug, Clone)]
 pub struct ViewContext {
+    /// The block drawn: model space, or a layout's paper space.
     pub model_block: acadrust::types::Handle,
     pub frozen: rustc_hash::FxHashSet<acadrust::types::Handle>,
     pub annotation_scale: Option<acadrust::types::Handle>,
     pub annotation_multiplier: f32,
+    /// Annotative objects of other scales are shown (the layout's setting).
+    pub all_visible: bool,
 }
 
 impl ViewContext {
-    pub fn of(scene: &crate::scene::Scene, viewport: acadrust::types::Handle) -> Self {
+    /// Model space through `viewport` on a layout whose "show all
+    /// annotative objects" setting is `all_visible`.
+    pub fn of(scene: &crate::scene::Scene, viewport: acadrust::types::Handle, all_visible: bool) -> Self {
         let (model_block, frozen, annotation_scale, annotation_multiplier) = scene.secureplan_viewport_context(viewport);
-        Self { model_block, frozen, annotation_scale, annotation_multiplier }
+        Self { model_block, frozen, annotation_scale, annotation_multiplier, all_visible }
+    }
+
+    /// A layout's paper space, as native paper rendering draws it: at 1:1.
+    pub fn paper(scene: &crate::scene::Scene, block: acadrust::types::Handle, all_visible: bool) -> Self {
+        let annotation_scale = scene.paper_annotation_scale_handle();
+        Self { model_block: block, frozen: Default::default(), annotation_scale, annotation_multiplier: 1.0, all_visible }
     }
 }
 
@@ -268,15 +281,19 @@ where
     use crate::scene::render_graph::{BlockRoot, BlockRootRole, RenderSceneGraph, SceneRoot};
     let document = &scene.document;
     let depths = scene.draw_depth_map();
-    let (frozen, annotation, multiplier) = match view {
-        Some(view) => (Some(&view.frozen), view.annotation_scale, view.annotation_multiplier),
+    // The annotation context the published view is drawn in, so the walk
+    // sees exactly what is drawn (including other scales' annotative
+    // objects when the space shows them all).
+    let (frozen, annotation, multiplier, all_visible) = match view {
+        Some(view) => (Some(&view.frozen), view.annotation_scale, view.annotation_multiplier, view.all_visible),
         None => (
             None,
             crate::scene::annotative::scale_handle_by_name(document, &document.header.current_annotation_scale),
             scene.annotation_scale,
+            scene.annotation_all_visible(),
         ),
     };
-    let graph = RenderSceneGraph::new(document, frozen, annotation, false, depths.as_ref()).with_annotation_scale(multiplier);
+    let graph = RenderSceneGraph::new(document, frozen, annotation, all_visible, depths.as_ref()).with_annotation_scale(multiplier);
     let root = SceneRoot::Block(BlockRoot { record: block, role: BlockRootRole::ModelSpace });
     graph.walk_root(
         root,
@@ -318,7 +335,87 @@ fn needs_flattening(entity: &acadrust::EntityType) -> bool {
     match entity {
         EntityType::Circle(_) | EntityType::Arc(_) | EntityType::Ellipse(_) | EntityType::Spline(_) | EntityType::Polyline2D(_) => true,
         EntityType::LwPolyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-12),
+        EntityType::Hatch(hatch) => hatch.paths.iter().flat_map(|path| &path.edges).any(curved_edge),
         _ => false,
+    }
+}
+
+/// Whether a hatch boundary edge is curved (an arc, ellipse, spline or
+/// bulged polyline): the fill renderer cuts those at a fixed angle.
+fn curved_edge(edge: &acadrust::entities::BoundaryEdge) -> bool {
+    use acadrust::entities::BoundaryEdge;
+    match edge {
+        BoundaryEdge::Line(_) => false,
+        BoundaryEdge::Polyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.z.abs() > 1e-12),
+        _ => true,
+    }
+}
+
+/// `hatch` with every curved boundary edge replaced by a straight polyline
+/// edge within `tolerance` (in its own plane), so the fill is drawn within
+/// the publication's precision from exact vertices.
+fn flatten_hatch(hatch: &acadrust::entities::Hatch, tolerance: f64) -> Result<acadrust::entities::Hatch, String> {
+    use acadrust::entities::{BoundaryEdge, PolylineEdge};
+    use acadrust::types::Vector2;
+    let mut flat = hatch.clone();
+    for edge in flat.paths.iter_mut().flat_map(|path| path.edges.iter_mut()) {
+        if !curved_edge(edge) {
+            continue;
+        }
+        let Some(curve) = crate::entities::hatch::edge_curve(edge) else { continue };
+        let points = curve.tessellate_within(tolerance);
+        // The kernel caps how finely it cuts a curve; check every chord.
+        let met = points.windows(2).all(|pair| {
+            let middle = [(pair[0][0] + pair[1][0]) / 2.0, (pair[0][1] + pair[1][1]) / 2.0];
+            let on = curve.point_at(curve.parameter_at(middle));
+            (on[0] - middle[0]).hypot(on[1] - middle[1]) <= tolerance * (1.0 + 1e-6)
+        });
+        if !met || points.len() < 2 {
+            return Err(TOO_LARGE.into());
+        }
+        *edge = BoundaryEdge::Polyline(PolylineEdge::new(points.into_iter().map(|[x, y]| Vector2::new(x, y)).collect(), false));
+    }
+    Ok(flat)
+}
+
+/// Give each fill the exact f64 positions of its boundary vertices
+/// (`boundary_wcs`, aligned with `boundary`), recovered from its boundary
+/// paths: the fill model keeps them only as f32 offsets. A vertex that is
+/// not a boundary-path vertex (cut by a block clip) keeps its f32 offset.
+fn exact_fill_boundaries(fills: &mut [crate::scene::model::hatch_model::HatchModel]) {
+    use acadrust::entities::BoundaryEdge;
+    for fill in fills {
+        let (Some(paths), Some(plane)) = (&fill.boundary_paths, &fill.fill_plane) else { continue };
+        let origin = fill.world_origin;
+        let mut exact: rustc_hash::FxHashMap<(u32, u32), [f64; 2]> = Default::default();
+        for path in paths.iter().filter(|path| path.flags.bits() & 8 == 0) {
+            for edge in &path.edges {
+                let points: Vec<[f64; 2]> = match edge {
+                    BoundaryEdge::Line(line) => vec![[line.start.x, line.start.y], [line.end.x, line.end.y]],
+                    BoundaryEdge::Polyline(polyline) => polyline.vertices.iter().map(|v| [v.x, v.y]).collect(),
+                    _ => Vec::new(),
+                };
+                for [x, y] in points {
+                    let at = [0, 1].map(|i| plane.origin[i] + x * plane.x_axis[i] + y * plane.y_axis[i]);
+                    exact.insert((((at[0] - origin[0]) as f32).to_bits(), ((at[1] - origin[1]) as f32).to_bits()), at);
+                }
+            }
+        }
+        if exact.is_empty() {
+            continue;
+        }
+        let boundary = fill
+            .boundary
+            .iter()
+            .map(|&[x, y]| {
+                if x.is_nan() || y.is_nan() {
+                    [f64::NAN, f64::NAN]
+                } else {
+                    exact.get(&(x.to_bits(), y.to_bits())).copied().unwrap_or([origin[0] + x as f64, origin[1] + y as f64])
+                }
+            })
+            .collect();
+        fill.boundary_wcs = Some(std::sync::Arc::new(boundary));
     }
 }
 
@@ -550,6 +647,11 @@ fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMa
     for (handle, tolerance) in handles {
         let handle = acadrust::types::Handle::new(handle);
         let Some(entity) = document.get_entity(handle) else { continue };
+        if let EntityType::Hatch(hatch) = entity {
+            let flat = flatten_hatch(hatch, tolerance)?;
+            document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::Hatch(flat)));
+            continue;
+        }
         let Some((polyline, keys)) = flatten(entity, tolerance)? else { continue };
         key_points.insert(handle.value(), keys);
         document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::LwPolyline(polyline)));
@@ -565,6 +667,10 @@ fn scene_of(document: acadrust::CadDocument, annotation_scale: f32, layout: Opti
         scene.current_layout = layout.to_string();
     }
     scene.rebuild_derived_caches();
+    if layout.is_some() {
+        // The layout's own settings (PSLTSCALE among them), as when it plots.
+        scene.load_current_layout_state();
+    }
     scene
 }
 
@@ -596,14 +702,16 @@ pub fn prepare_layout(source: &crate::scene::Scene, reference: &super::layout::L
     // each viewport's own annotation context.
     let chord = transform.placement.chord_tolerance_mm;
     let world_per_paper = paper.mapping.scale_mm_per_cad_unit;
-    let context = ViewContext::of(source, reference.viewport);
+    let all_visible = reference.annotation_all_visible;
+    let context = ViewContext::of(source, reference.viewport, all_visible);
     let mut tolerances = rustc_hash::FxHashMap::default();
     curve_tolerances(source, context.model_block, Some(&context), chord / transform.mapping.scale_mm_per_cad_unit, &mut tolerances);
     for other in &reference.others {
-        let view = ViewContext::of(source, other.viewport);
+        let view = ViewContext::of(source, other.viewport, all_visible);
         curve_tolerances(source, view.model_block, Some(&view), chord * other.model_per_paper / world_per_paper, &mut tolerances);
     }
-    curve_tolerances(source, reference.paper_block, None, chord / world_per_paper, &mut tolerances);
+    let paper_context = ViewContext::paper(source, reference.paper_block, all_visible);
+    curve_tolerances(source, reference.paper_block, Some(&paper_context), chord / world_per_paper, &mut tolerances);
     let (document, key_points) = flatten_curves(source, tolerances)?;
 
     // Each viewport's outline on the page: its rectangle and any boundary
@@ -621,10 +729,13 @@ pub fn prepare_layout(source: &crate::scene::Scene, reference: &super::layout::L
     let mut views = Vec::new();
     for other in &reference.others {
         let transform = LayerTransform { page: paper, to_page_space: Some(other.to_paper) };
-        views.push(ViewLayer { viewport: other.viewport, transform, clips: outline(other.rect, other.boundary)? });
+        views.push(ViewLayer { viewport: other.viewport, model_per_paper: other.model_per_paper, transform, clips: outline(other.rect, other.boundary)? });
     }
     let position = reference.reference_position.min(views.len());
-    views.insert(position, ViewLayer { viewport: reference.viewport, transform: transform.into(), clips: outline(reference.viewport_rect, None)? });
+    views.insert(
+        position,
+        ViewLayer { viewport: reference.viewport, model_per_paper: reference.model_per_paper, transform: transform.into(), clips: outline(reference.viewport_rect, None)? },
+    );
 
     let scene = scene_of(document, source.annotation_scale, Some(&reference.layout));
     let page = [0.0, 0.0, transform.placement.width_pt as f64, transform.placement.height_pt as f64];
@@ -701,16 +812,40 @@ fn with_depth(scene: &crate::scene::Scene, wires: Vec<crate::scene::WireModel>) 
 /// The model-space content of `scene` (what plots), as page content.
 fn model_content(scene: &crate::scene::Scene) -> (crate::io::pdf_export::PlotContent, usize) {
     let (wires, _) = scene.plot_wire_groups(None);
-    let content = plot_content(with_depth(scene, wires), scene.paper_plot_hatches().as_ref().clone(), scene.paper_plot_wipeouts().as_ref().clone());
+    let mut hatches = scene.paper_plot_hatches().as_ref().clone();
+    exact_fill_boundaries(&mut hatches);
+    let content = plot_content(with_depth(scene, wires), hatches, scene.paper_plot_wipeouts().as_ref().clone());
     (content, scene.paper_plot_images().len())
 }
 
-/// Model space as `viewport` shows it, as native paper rendering draws it
-/// (its frozen layers, annotation scale and layer overrides), in model
-/// coordinates.
-fn viewport_content(scene: &crate::scene::Scene, viewport: acadrust::types::Handle) -> crate::io::pdf_export::PlotContent {
-    let wires = scene.model_wires_for_viewport_arc(viewport, 0.0).as_ref().clone();
-    let (hatches, wipeouts) = scene.secureplan_viewport_fills(viewport);
+/// Model space as `view` shows it, as native paper rendering draws it
+/// (its frozen layers, annotation scale, layer overrides and saved render
+/// mode), in model coordinates. With PSLTSCALE, linetype dashes keep their
+/// paper length whatever the viewport's scale, as native projection does.
+fn viewport_content(scene: &crate::scene::Scene, view: &ViewLayer, all_visible: bool) -> crate::io::pdf_export::PlotContent {
+    let mut wires = scene.model_wires_for_viewport_arc(view.viewport, 0.0).as_ref().clone();
+    if let Some(acadrust::EntityType::Viewport(viewport)) = scene.document.get_entity(view.viewport) {
+        let flags = crate::scene::view::render::render_mode_flags(viewport.render_mode);
+        for wire in wires.iter_mut().filter(|wire| wire.fill_is_3d) {
+            if !flags.face3d_fill && !flags.mesh_fill {
+                wire.fill_tris.clear();
+                wire.fill_tris_low.clear();
+            }
+            if !flags.show_3d_edges {
+                wire.points.clear();
+                wire.points_low.clear();
+            }
+        }
+    }
+    if scene.document.header.paper_space_linetype_scaling {
+        let k = view.model_per_paper as f32;
+        for wire in &mut wires {
+            wire.pattern_length *= k;
+            wire.pattern = wire.pattern.map(|value| value * k);
+        }
+    }
+    let (mut hatches, wipeouts) = scene.secureplan_viewport_fills(view.viewport, all_visible);
+    exact_fill_boundaries(&mut hatches);
     plot_content(with_depth(scene, wires), hatches, wipeouts)
 }
 
@@ -749,7 +884,7 @@ pub fn page_pdf(publication: &Publication) -> Result<PublishedPdf, String> {
             let views = layout
                 .views
                 .iter()
-                .map(|view| PageLayer { content: viewport_content(scene, view.viewport), transform: view.transform, clips: view.clips.clone() });
+                .map(|view| PageLayer { content: viewport_content(scene, view, layout.reference.all_visible), transform: view.transform, clips: view.clips.clone() });
             // The layout's own order: viewports over paper space, unless its
             // plot settings draw paper space last.
             let layers = if paper_last { views.chain(std::iter::once(paper)).collect() } else { std::iter::once(paper).chain(views).collect() };
@@ -821,7 +956,8 @@ pub const MAX_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
 pub const WINDOW_MARGIN: f64 = 0.02;
 
 /// The extents of the model-space geometry the published view draws (what
-/// plots: off, frozen and non-plotting layers excluded), as `[x0, y0, x1, y1]`.
+/// plots: off, frozen and non-plotting layers excluded; lines and fills), as
+/// `[x0, y0, x1, y1]`.
 pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
     if scene.current_layout != "Model" {
         let (min, max) = scene.model_space_extents()?;
@@ -833,6 +969,15 @@ pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
         for (index, [x, y, _]) in wire.points.iter().enumerate() {
             let [lx, ly, _] = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
             let (x, y) = (*x as f64 + lx as f64, *y as f64 + ly as f64);
+            if x.is_finite() && y.is_finite() {
+                extents = [extents[0].min(x), extents[1].min(y), extents[2].max(x), extents[3].max(y)];
+            }
+        }
+    }
+    // A solid fill has no lines.
+    for fill in scene.paper_plot_hatches().iter().chain(scene.paper_plot_wipeouts().iter()) {
+        for [x, y] in fill.boundary.iter() {
+            let (x, y) = (fill.world_origin[0] + *x as f64, fill.world_origin[1] + *y as f64);
             if x.is_finite() && y.is_finite() {
                 extents = [extents[0].min(x), extents[1].min(y), extents[2].max(x), extents[3].max(y)];
             }
