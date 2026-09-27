@@ -96,8 +96,9 @@ pub enum Msg {
     ExportPicked(u64, super::export::JobKey, Option<Redacted<PathBuf>>),
     /// An export was written to its file, on a worker.
     ExportSaved(super::export::SaveDone),
-    /// The import file dialog closed (tab id, chosen file).
-    ImportPicked(u64, Option<Redacted<PathBuf>>),
+    /// The import file dialog closed (tab id, the drawing generation it was
+    /// opened for, chosen file).
+    ImportPicked(u64, u64, Option<Redacted<PathBuf>>),
     /// Mouse input in a dialog field.
     FormInput(usize, String),
     FormCycle(usize),
@@ -475,15 +476,24 @@ impl OpenCADStudio {
                 self.secureplan_export_saved(done);
                 Task::none()
             }
-            Msg::ImportPicked(tab_id, Some(path)) => {
+            Msg::ImportPicked(tab_id, generation, Some(path)) => {
                 // The tab the picker was opened for, if it may still import.
                 if let Err(reason) = self.secureplan_can_edit_tab(tab_id) {
                     self.command_line.push_error(&reason);
                     return Task::none();
                 }
+                // The drawing the user agreed to replace, or the empty survey,
+                // is still the one there: nothing replaced it meanwhile (a
+                // plan update, a reconnect or a restore) (PUB-01).
+                if self.secureplan.sessions.by_tab(tab_id).is_some_and(|bound| bound.generation != generation) {
+                    self.command_line.push_error(
+                        "SecurePlan: the survey's drawing changed while you chose a file, so nothing was imported. Choose Open drawing again.",
+                    );
+                    return Task::none();
+                }
                 self.secureplan_import_path(tab_id, path.expose())
             }
-            Msg::ImportPicked(_, None) => Task::none(),
+            Msg::ImportPicked(_, _, None) => Task::none(),
             #[cfg(feature = "secureplan-test")]
             Msg::Driver(command) => self.secureplan_driver(command),
             Msg::Bridge(event) => self.secureplan_bridge_event(event),
@@ -916,8 +926,9 @@ impl OpenCADStudio {
             // Registration as the .dwg/.dxf opener is not part of SecurePlan CAD (DSK-05).
             "FILEASSOC" => self.command_line.push_error("FILEASSOC is not available in SecurePlan CAD."),
             // Upstream's donation, report, web-version, changelog and help
-            // pages: upstream appears only in About (DSK-08).
-            verb @ ("DONATE" | "REPORT" | "WEBVERSION" | "CHANGELOG" | "HELP") => {
+            // pages: upstream appears only in About; and no plugin manager
+            // (DSK-08).
+            verb @ ("DONATE" | "REPORT" | "WEBVERSION" | "CHANGELOG" | "HELP" | "PLUGINS" | "PLUGINMANAGER") => {
                 self.command_line.push_error(&format!("{verb} is not available in SecurePlan CAD."));
             }
             // "Allowed websites" (BRG-02): the list, also as a dialog for the

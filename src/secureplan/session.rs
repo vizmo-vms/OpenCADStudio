@@ -575,6 +575,11 @@ impl OpenCADStudio {
         if self.secureplan_refuses_standalone(message) {
             return true;
         }
+        // No plugin manager (DSK-02, DSK-08), from any button or command.
+        if matches!(message, Message::PluginManagerOpen) {
+            self.command_line.push_error("The plugin manager is not available in SecurePlan CAD.");
+            return true;
+        }
         let active = matches!(
             message,
             Message::SaveFile
@@ -3106,7 +3111,8 @@ pub(crate) mod tests {
         // A pick for a survey that can no longer import is refused.
         h.app.secureplan.sessions.by_tab_mut(b).unwrap().mode = Mode::View;
         let file = h.dir().join("picked.dxf");
-        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(b, Some(file.into()))));
+        let generation = h.app.secureplan.sessions.by_tab(b).unwrap().generation;
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(b, generation, Some(file.into()))));
         assert!(!pending(&h, b));
     }
 
@@ -3155,6 +3161,28 @@ pub(crate) mod tests {
             assert_eq!(h.dialog_title().as_deref(), Some(expected), "answer {answer}");
             assert!(!h.bound().import_pending);
         }
+    }
+
+    /// A file chosen for an empty survey is not imported once a plan update
+    /// put a drawing there while the picker was open: the user never agreed
+    /// to replace it (PUB-01).
+    #[test]
+    fn a_pick_made_before_a_plan_update_replaces_nothing() {
+        let mut h = Harness::new("stale_pick");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let tab_id = h.tab_id();
+        let opened_for = h.bound().generation;
+        plan_update(&mut h, Some(("restored.dxf", "image/vnd.dxf", testutil::synthetic_dxf())), BASE);
+        assert!(h.bound().loaded.is_some() && h.bound().busy.is_none(), "the plan update did not finish");
+        let file = h.dir().join("picked.dxf");
+        std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(tab_id, opened_for, Some(file.clone().into()))));
+        assert!(h.bound().pending_original.is_none(), "the stale pick replaced the new drawing");
+        assert!(last_error(&h.app).contains("changed while you chose a file"), "{}", last_error(&h.app));
+        // A pick for the drawing there now goes ahead.
+        let current = h.bound().generation;
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(tab_id, current, Some(file.into()))));
+        assert!(h.bound().pending_original.is_some());
     }
 
     #[test]

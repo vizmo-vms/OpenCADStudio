@@ -1089,12 +1089,13 @@ impl OpenCADStudio {
             .map(crate::app::config::rgb_to_hex)
             .unwrap_or_default();
         self.sync_model_space_theme(false);
-        self.recent_files = cfg
-            .recent
-            .files
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect();
+        // SecurePlan CAD keeps no recent drawings and never reads the paths
+        // an earlier version stored (DSK-08).
+        self.recent_files = if cfg!(feature = "secureplan") {
+            Vec::new()
+        } else {
+            cfg.recent.files.iter().map(std::path::PathBuf::from).collect()
+        };
         self.recent_limit = cfg.recent.limit.clamp(
             crate::app::recent::RECENT_MIN,
             crate::app::recent::RECENT_MAX,

@@ -4436,10 +4436,16 @@ impl OpenCADStudio {
     /// [`Self::boot_web`].
     #[cfg(not(target_arch = "wasm32"))]
     fn boot() -> (Self, Task<Message>) {
+        Self::boot_from(Self::new())
+    }
+
+    /// The rest of [`Self::boot`], from the constructed app (tests start it
+    /// from their own settings).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn boot_from(mut s: Self) -> (Self, Task<Message>) {
         // File association is no longer re-registered on every launch. It is set
         // up once via the first-launch prompt below (when the user hasn't been
         // asked yet) and afterwards managed entirely by the FILEASSOC command.
-        let mut s = Self::new();
         // SecurePlan CAD started by a `secureplan-cad:` link shows no editor
         // until a session opens (or only the trust prompt for a new website).
         #[cfg(feature = "secureplan")]

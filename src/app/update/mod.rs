@@ -8122,16 +8122,7 @@ impl OpenCADStudio {
             }
 
             Message::AboutCopyInfo => {
-                let info = format!(
-                    "Open CAD Studio v{}\nRevision: {}\nCommit date: {}\nProfile: {}\nFeatures: {}\nOS: {}\nArch: {}",
-                    env!("OCS_FULL_VERSION"),
-                    env!("OCS_GIT_REV"),
-                    env!("OCS_COMMIT_DATE"),
-                    env!("OCS_BUILD_PROFILE"),
-                    env!("OCS_BUILD_FEATURES"),
-                    crate::ui::window::about::platform_name(),
-                    crate::ui::window::about::architecture_name(),
-                );
+                let info = crate::ui::window::about::copy_info();
                 #[cfg(target_arch = "wasm32")]
                 {
                     crate::sys::write_clipboard_text(&info);

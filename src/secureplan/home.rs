@@ -452,4 +452,62 @@ mod tests {
         let about = crate::cli::Cli::command().get_about().map(|about| about.to_string()).unwrap_or_default();
         assert!(about.starts_with(APP_NAME) && !about.contains("Open CAD Studio"), "{about}");
     }
+
+    /// Starting with the recent drawings an earlier version stored reads
+    /// none of them, not even a thumbnail, and keeps none (DSK-08).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn startup_reads_no_recent_drawing_an_earlier_version_stored() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("secureplan_boot_recent_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A FIFO: anything that opens it to read shows up as its reader.
+        let fifo = dir.join("recent.dwg");
+        let _ = std::fs::remove_file(&fifo);
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let config: crate::app::config::AppConfig = serde_json::from_value(serde_json::json!({
+            "recent": { "files": [fifo.display().to_string(), r"\\attacker\share\plan.dwg"], "limit": 20 }
+        }))
+        .unwrap();
+        let mut app = OpenCADStudio::new_for_test();
+        app.apply_config(config);
+        let (app, _startup) = OpenCADStudio::boot_from(app);
+        assert!(app.recent_files.is_empty() && app.recent_thumbs.is_empty(), "recent drawings were kept");
+        assert!(app.current_config().recent.files.is_empty(), "recent drawings would be saved again");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // With no reader, a non-blocking open for writing fails (ENXIO).
+        const O_NONBLOCK: i32 = 0o4000;
+        let reader = std::fs::OpenOptions::new().write(true).custom_flags(O_NONBLOCK).open(&fifo);
+        assert!(reader.is_err(), "startup opened a recent drawing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No plugin manager, from its commands or the Options button (DSK-08).
+    #[test]
+    fn the_plugin_manager_is_not_available() {
+        let mut app = OpenCADStudio::new_for_test();
+        for verb in ["PLUGINS", "PLUGINMANAGER"] {
+            app.command_line.last_error = None;
+            assert!(inert(app.dispatch_command(verb)), "{verb}");
+            assert!(app.command_line.last_error.as_deref().is_some_and(|e| e == format!("{verb} is not available in SecurePlan CAD.")), "{verb}");
+        }
+        app.command_line.last_error = None;
+        let _ = app.update(Message::PluginManagerOpen);
+        assert_ne!(app.active_modal, Some(crate::app::ModalKind::PluginManager));
+        assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("not available in SecurePlan CAD")));
+    }
+
+    /// `--version` and About's Copy info name SecurePlan CAD and its own
+    /// version first; the usage line keeps the binary's file name (DSK-08).
+    #[test]
+    fn the_version_names_secureplan_cad() {
+        use clap::CommandFactory;
+        let mut command = crate::cli::Cli::command();
+        assert_eq!(command.render_version(), format!("{APP_NAME} {VERSION}\n"));
+        let long = command.render_long_version();
+        assert!(long.starts_with(&format!("{APP_NAME} {VERSION}\nbuilt on Open CAD Studio ")), "{long}");
+        assert!(command.render_usage().to_string().contains("OpenCADStudio"));
+        let info = crate::ui::window::about::copy_info();
+        assert!(info.starts_with(&format!("{APP_NAME} v{VERSION}\nBuilt on Open CAD Studio v")), "{info}");
+    }
 }

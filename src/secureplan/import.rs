@@ -508,11 +508,16 @@ impl OpenCADStudio {
     }
 
     /// The drawing an import would replace, by name: the imported one not
-    /// applied yet, or the survey's plan. `None` when there is neither.
+    /// applied yet, a restored recovery copy, or the survey's plan. `None`
+    /// when there is none of them.
     pub(crate) fn secureplan_current_drawing(&self, tab_id: u64) -> Option<String> {
         let bound = self.secureplan.sessions.by_tab(tab_id)?;
         if let Some(original) = &bound.pending_original {
             return Some(original.name.expose().clone());
+        }
+        // A restored recovery copy counts as an imported drawing.
+        if bound.recovered_base.is_some() {
+            return Some(bound.loaded.as_ref().map_or_else(|| "the recovered drawing".to_string(), |d| d.name.expose().clone()));
         }
         if !bound.has_plan {
             return None;
@@ -527,9 +532,11 @@ impl OpenCADStudio {
             self.command_line.push_error(&message);
             return Task::none();
         }
+        // The picker's answer applies only to the drawing there now.
+        let generation = self.secureplan.sessions.by_tab(tab_id).map_or(0, |bound| bound.generation);
         #[cfg(test)]
         if let Some(path) = self.secureplan.test_pick.clone() {
-            return self.secureplan_update(super::Msg::ImportPicked(tab_id, Some(path.into())));
+            return self.secureplan_update(super::Msg::ImportPicked(tab_id, generation, Some(path.into())));
         }
         if !super::native_dialogs_allowed() {
             self.command_line.push_error("SecurePlan: file dialogs are disabled in this session.");
@@ -544,7 +551,7 @@ impl OpenCADStudio {
                     .await
                     .map(|handle| crate::sys::handle_path(&handle))
             },
-            move |path: Option<PathBuf>| Message::SecurePlan(super::Msg::ImportPicked(tab_id, path.map(Into::into))),
+            move |path: Option<PathBuf>| Message::SecurePlan(super::Msg::ImportPicked(tab_id, generation, path.map(Into::into))),
         )
     }
 
@@ -751,7 +758,8 @@ pub(crate) mod tests {
 
     /// Open drawing (PUB-01, DSK-08): the file dialog at once for a survey
     /// with no drawing; a confirmation naming the current drawing, with focus
-    /// on Cancel, when there is a plan or an imported drawing. Cancel, by
+    /// on Cancel, when there is a plan, an imported drawing or a restored
+    /// recovery copy. Cancel, by
     /// Enter or Escape, changes nothing.
     #[test]
     fn open_drawing_asks_before_replacing_a_plan_or_an_imported_drawing() {
@@ -814,5 +822,38 @@ pub(crate) mod tests {
         let loaded = h.bound().loaded.clone().map(|d| d.bytes);
         h.key(DialogKey::Cancel);
         assert!(pending(&h).is_none() && h.bound().loaded.clone().map(|d| d.bytes) == loaded, "Cancel changed the plan");
+
+        // A restored recovery copy, on a survey with no plan, counts as an
+        // imported drawing.
+        let mut h = Harness::new("open_drawing_recovered");
+        let kept = crate::app::secureplan::session::Drawing {
+            bytes: std::sync::Arc::new(testutil::synthetic_dxf()),
+            name: "kept.dxf".to_string().into(),
+            format: Format::Dxf,
+            format_version: "AC1032".into(),
+        };
+        let entry = crate::app::secureplan::recovery::Entry {
+            origin: crate::app::secureplan::bridge::tests::ORIGIN.into(),
+            survey: "7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f".into(),
+            base_identity: "none".into(),
+            plan_version: None,
+            saved: std::time::SystemTime::now(),
+            drawing: kept,
+            original: None,
+            lost_entities: 0,
+            alignment: None,
+        };
+        h.app.secureplan.recovery.save(&entry).unwrap();
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        assert_eq!(h.dialog_title().as_deref(), Some("Recovered edits"));
+        h.key(DialogKey::Activate);
+        pick(&mut h, "other.dxf");
+        let _ = h.app.dispatch_command("SECUREPLANIMPORT");
+        assert_eq!(h.dialog_title().as_deref(), Some(REPLACE), "a restored copy was replaced without asking");
+        let (text, focus, _) = lines(&h);
+        assert!(text.contains(&"Current drawing: kept.dxf".to_string()), "{text:?}");
+        assert_eq!(focus, 1, "focus is not on Cancel");
+        h.key(DialogKey::Cancel);
+        assert!(pending(&h).is_none() && h.bound().recovered_base.is_some(), "Cancel changed the restored copy");
     }
 }

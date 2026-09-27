@@ -22,6 +22,8 @@ pub mod export;
 pub mod handoff;
 pub mod hardening;
 pub mod home;
+#[cfg(test)]
+mod win_resources;
 pub mod import;
 pub mod layout;
 pub mod overlay;

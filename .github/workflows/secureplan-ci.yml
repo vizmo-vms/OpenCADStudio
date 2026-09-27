@@ -214,6 +214,23 @@ jobs:
       - name: Debug build (secureplan)
         run: cargo build --locked --features secureplan
 
+      # DSK-08: the executable's properties name SecurePlan CAD and its own
+      # version, never upstream's.
+      - name: Executable identity
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path src/secureplan/mod.rs -Pattern '^pub const VERSION: &str = "(.*)";$').Matches[0].Groups[1].Value
+          $info = (Get-Item target\debug\OpenCADStudio.exe).VersionInfo
+          $info | Format-List ProductName, FileDescription, ProductVersion, FileVersion
+          if ($info.ProductName -ne 'SecurePlan CAD' -or $info.FileDescription -ne 'SecurePlan CAD' -or $info.ProductVersion -ne $version -or $info.FileVersion -ne $version) {
+            Write-Error "the executable does not identify as SecurePlan CAD $version"
+            exit 1
+          }
+          $out = & target\debug\OpenCADStudio.exe -V | Out-String
+          if ($out.Trim() -ne "SecurePlan CAD $version") { Write-Error "-V printed: $out"; exit 1 }
+          $long = & target\debug\OpenCADStudio.exe --version | Out-String
+          if (-not $long.StartsWith("SecurePlan CAD $version")) { Write-Error "--version printed: $long"; exit 1 }
+
       - name: Build the per-user MSI (structure check)
         shell: pwsh
         run: packaging/windows/build-msi.ps1 -Exe target\debug\OpenCADStudio.exe -Version 0.1.0 -Out SecurePlanCAD-debug.msi
