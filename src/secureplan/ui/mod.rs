@@ -50,13 +50,11 @@ pub enum Action {
     /// Run a SecurePlan ribbon command (the keyboard menu of the tab).
     Command(&'static str),
     /// The updater (DSK-07): **Update**, keep recovery copies and update,
-    /// Apply tab `.0` first, **Install and restart**, drop the download, and
-    /// cancel a download.
+    /// Apply tab `.0` first, **Install and restart**, and cancel a download.
     UpdateStart,
     UpdateKeepAndStart,
     UpdateApplyFirst(u64),
     UpdateInstall,
-    UpdateDiscard,
     UpdateCancelDownload,
 }
 

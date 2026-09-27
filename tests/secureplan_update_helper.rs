@@ -1,26 +1,29 @@
-//! The SecurePlan CAD update helper on the real platforms (DSK-07). The test
-//! plays the exiting application: it starts the helper with a plan and holds
-//! the pipe, checks that nothing is installed while it "runs", then closes the
-//! pipe. The helper must then install and relaunch the new copy, which starts
-//! only after the old one has gone.
+//! The SecurePlan CAD update helper through the production launch path
+//! (DSK-07). A parent process (the SecurePlan CAD test build in its
+//! `secureplan-test` parent mode) plays the application: it finds its install
+//! with the production `target()` (or is told it), calls the production
+//! `prepare()` and `launch()`, then stays alive until the test lets it exit.
+//! The helper must change nothing while the parent runs, then install,
+//! record the outcome and relaunch.
 //!
-//! - macOS: a synthetic app and DMG (a tiny C program as the executable,
-//!   ad-hoc signed); the helper mounts the DMG, `ditto`s the app next to the
-//!   installed one, swaps it in by rename and relaunches it through Launch
-//!   Services. A damaged image leaves the installed app and reopens it.
-//! - Windows: SecurePlan CI builds a per-user MSI of this test build and
-//!   names it in `SECUREPLAN_TEST_MSI`; the helper installs it with msiexec
-//!   and relaunches the installed copy, which records itself (test builds
-//!   only) and exits. The test then checks the scheme registration and
-//!   uninstalls.
+//! - Linux (development only, no installer): the helper waits for the parent,
+//!   then its install fails; the outcome is recorded only after the exit.
+//! - macOS: a synthetic installed app and DMG (a tiny C program, ad-hoc
+//!   signed); the new app is swapped in after the parent exits and relaunched
+//!   through Launch Services; a damaged image leaves the app and reopens it.
+//! - Windows: SecurePlan CI builds two per-user MSIs of this test build
+//!   (0.1.0 and 0.1.1, whose executable differs by one byte). 0.1.0 is
+//!   installed first and the parent is that installed copy, so `target()` is
+//!   the production check and the upgrade has to wait for it to exit. The
+//!   installed copy is relaunched and records itself; the scheme is checked,
+//!   then everything is uninstalled.
 #![cfg(feature = "secureplan-test")]
-#![cfg(any(target_os = "macos", windows))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use OpenCADStudio::app::secureplan::update_helper::{take_outcome, Install, Plan, HELPER_ARG};
+use OpenCADStudio::app::secureplan::update_helper::{take_outcome, Outcome, Target, TestParent, TEST_PARENT_ENV};
 
 fn temp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("secureplan-helper-it-{tag}-{}", std::process::id()));
@@ -29,30 +32,69 @@ fn temp(tag: &str) -> PathBuf {
     dir
 }
 
-/// Start the helper as the application would, holding its stdin pipe.
-fn start_helper(plan: &Plan, dir: &Path, env: &[(&str, &Path)]) -> Child {
-    let plan_path = dir.join("update-plan.json");
-    std::fs::write(&plan_path, serde_json::to_vec(plan).unwrap()).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_OpenCADStudio"));
-    command.arg(HELPER_ARG).arg(&plan_path).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    command.spawn().expect("start the update helper")
-}
-
-fn wait_exit(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
+/// Poll until `check` holds.
+fn wait_until(limit: Duration, what: &str, mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return status;
-        }
-        assert!(Instant::now() < deadline, "the helper did not finish");
+    while !check() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
+/// A running parent ("the application") and the files that steer it.
+struct Parent {
+    child: Child,
+    spec: TestParent,
+}
+
+impl Parent {
+    /// Start `exe` as the parent for a download at `file` in `staging`.
+    fn start(exe: &Path, dir: &Path, version: &str, file: PathBuf, target: Option<Target>, env: &[(&str, &Path)]) -> Self {
+        let spec = TestParent {
+            version: version.into(),
+            staging: file.parent().unwrap().to_path_buf(),
+            file,
+            result: dir.join("update-result.json"),
+            target,
+            started: dir.join("parent-started"),
+            exit_when: dir.join("parent-may-exit"),
+        };
+        let spec_path = dir.join("parent.json");
+        std::fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+        let mut command = Command::new(exe);
+        command.env(TEST_PARENT_ENV, &spec_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let child = command.spawn().expect("start the parent");
+        let parent = Self { child, spec };
+        wait_until(Duration::from_secs(120), "the parent to launch the helper", || parent.spec.started.exists());
+        let started = std::fs::read_to_string(&parent.spec.started).unwrap();
+        assert!(!started.starts_with("refused"), "the production launch refused: {started}");
+        parent
+    }
+
+    fn outcome_written(&self) -> bool {
+        self.spec.result.exists()
+    }
+
+    /// Let the parent exit; returns once it has.
+    fn exit(&mut self) {
+        std::fs::write(&self.spec.exit_when, b"").unwrap();
+        let status = self.child.wait().unwrap();
+        assert!(status.success(), "the parent failed: {status:?}");
+    }
+
+    fn outcome(&self, limit: Duration) -> Outcome {
+        wait_until(limit, "the helper's outcome", || self.outcome_written());
+        // Written in one go, but give a partial write a moment.
+        std::thread::sleep(Duration::from_millis(300));
+        take_outcome(&self.spec.result).expect("a readable outcome")
+    }
+}
+
 /// Wait until `marker` holds a line satisfying `wanted`.
+#[cfg(any(target_os = "macos", windows))]
 fn wait_for_line(marker: &Path, limit: Duration, wanted: impl Fn(&str) -> bool) -> Option<String> {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
@@ -62,6 +104,31 @@ fn wait_for_line(marker: &Path, limit: Duration, wanted: impl Fn(&str) -> bool) 
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_helper_from_the_production_launch_acts_only_after_the_parent_exits() {
+    let dir = temp("linux");
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let msi = staging.join("SecurePlanCAD-windows-x64.msi");
+    std::fs::write(&msi, b"not really an installer").unwrap();
+    // A Windows plan: on Linux its installer cannot start, and the relaunch
+    // target does not exist, so nothing else is run.
+    let target = Target::Windows { exe: dir.join("missing").join("SecurePlanCAD.exe") };
+    let mut parent = Parent::start(Path::new(env!("CARGO_BIN_EXE_OpenCADStudio")), &dir, "0.2.0", msi.clone(), Some(target), &[]);
+    // The production prepare() wrote the plan and the helper copy.
+    assert!(staging.join("update-plan.json").is_file() && staging.join("SecurePlanCAD-update-helper.exe").is_file());
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!parent.outcome_written(), "the helper acted while the application ran");
+    assert!(msi.is_file(), "the download was touched while the application ran");
+    parent.exit();
+    let outcome = parent.outcome(Duration::from_secs(60));
+    assert!(!outcome.installed);
+    assert!(outcome.message.contains("Windows Installer could not start"), "{outcome:?}");
+    wait_until(Duration::from_secs(30), "the staging folder to go", || !staging.exists());
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(target_os = "macos")]
@@ -132,7 +199,7 @@ mod mac {
         dir: PathBuf,
         app: PathBuf,
         marker: PathBuf,
-        plan: Plan,
+        dmg: PathBuf,
     }
 
     fn setup(tag: &str, damaged: bool) -> Setup {
@@ -152,32 +219,28 @@ mod mac {
             build_app(&source, "0.2.0", &marker, "new");
             make_dmg(&source, &dmg);
         }
-        let plan = Plan {
-            version: "0.2.0".into(),
-            parent_pid: std::process::id(),
-            install: Install::Dmg { dmg, app: app.clone() },
-            result: Some(dir.join("update-result.json")),
-            staging,
-        };
-        Setup { dir, app, marker, plan }
+        Setup { dir, app, marker, dmg }
+    }
+
+    fn start(setup: &Setup) -> Parent {
+        let target = Target::Mac { app: setup.app.clone() };
+        Parent::start(Path::new(env!("CARGO_BIN_EXE_OpenCADStudio")), &setup.dir, "0.2.0", setup.dmg.clone(), Some(target), &[])
     }
 
     #[test]
-    fn the_new_app_is_swapped_in_after_exit_and_relaunched() {
+    fn the_new_app_is_swapped_in_after_the_parent_exits_and_relaunched() {
         let setup = setup("mac-ok", false);
-        let mut helper = start_helper(&setup.plan, &setup.dir, &[]);
-        // The application is still "running": nothing changes.
+        let mut parent = start(&setup);
+        // The application is still running: nothing changes.
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(version_of(&setup.app), "0.1.0");
-        assert!(!setup.marker.exists(), "something was launched before the application exited");
-        drop(helper.stdin.take());
-        assert!(wait_exit(&mut helper, Duration::from_secs(180)).success());
-        let outcome = take_outcome(setup.plan.result.as_ref().unwrap()).expect("an outcome");
+        assert!(!setup.marker.exists() && !parent.outcome_written(), "the helper acted before the application exited");
+        parent.exit();
+        let outcome = parent.outcome(Duration::from_secs(180));
         assert!(outcome.installed, "{outcome:?}");
         assert_eq!(version_of(&setup.app), "0.2.0");
         let leftovers: Vec<_> = std::fs::read_dir(setup.app.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(leftovers.len(), 1, "hidden copies were left: {leftovers:?}");
-        assert!(!setup.plan.staging.exists(), "the staging folder was left");
         assert!(wait_for_line(&setup.marker, Duration::from_secs(60), |line| line == "new").is_some(), "the new app was not relaunched");
         let launches = std::fs::read_to_string(&setup.marker).unwrap();
         assert!(!launches.contains("old"), "the old app ran: {launches}");
@@ -187,10 +250,9 @@ mod mac {
     #[test]
     fn a_damaged_image_leaves_the_app_and_reopens_it() {
         let setup = setup("mac-damaged", true);
-        let mut helper = start_helper(&setup.plan, &setup.dir, &[]);
-        drop(helper.stdin.take());
-        assert!(!wait_exit(&mut helper, Duration::from_secs(120)).success());
-        let outcome = take_outcome(setup.plan.result.as_ref().unwrap()).expect("an outcome");
+        let mut parent = start(&setup);
+        parent.exit();
+        let outcome = parent.outcome(Duration::from_secs(120));
         assert!(!outcome.installed && outcome.message.contains("disk image"), "{outcome:?}");
         assert_eq!(version_of(&setup.app), "0.1.0", "the installed app changed");
         assert!(wait_for_line(&setup.marker, Duration::from_secs(60), |line| line == "old").is_some(), "the app was not reopened");
@@ -207,50 +269,69 @@ mod win {
         output.status.success().then(|| String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    fn sha256(path: &Path) -> String {
+        let output = Command::new("certutil").arg("-hashfile").arg(path).arg("SHA256").output().unwrap();
+        assert!(output.status.success(), "certutil failed for {}", path.display());
+        String::from_utf8_lossy(&output.stdout).lines().nth(1).unwrap_or_default().replace(' ', "").to_lowercase()
+    }
+
+    fn msiexec(args: &[&std::ffi::OsStr]) -> std::process::ExitStatus {
+        Command::new("msiexec").args(args).status().unwrap()
+    }
+
     #[test]
-    fn the_msi_installs_per_user_after_exit_and_the_installed_copy_relaunches() {
-        let Some(msi) = std::env::var_os("SECUREPLAN_TEST_MSI").map(PathBuf::from) else {
-            eprintln!("skipped: SECUREPLAN_TEST_MSI names no MSI (SecurePlan CI sets it)");
+    fn an_installed_copy_updates_itself_after_it_exits_and_relaunches() {
+        let (Some(old_msi), Some(new_msi), Some(new_exe)) = (
+            std::env::var_os("SECUREPLAN_TEST_MSI_OLD").map(PathBuf::from),
+            std::env::var_os("SECUREPLAN_TEST_MSI_NEW").map(PathBuf::from),
+            std::env::var_os("SECUREPLAN_TEST_EXE_NEW").map(PathBuf::from),
+        ) else {
+            eprintln!("skipped: SecurePlan CI provides SECUREPLAN_TEST_MSI_OLD, SECUREPLAN_TEST_MSI_NEW and SECUREPLAN_TEST_EXE_NEW");
             return;
         };
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"));
+        let exe = local.join("Programs").join("SecurePlan CAD").join("SecurePlanCAD.exe");
+        assert!(!exe.exists(), "SecurePlan CAD is already installed on this runner");
+
+        // The existing installation (0.1.0).
+        let installed = msiexec(&["/i".as_ref(), old_msi.as_os_str(), "/qn".as_ref(), "/norestart".as_ref()]);
+        assert!(installed.success() && exe.is_file(), "the old MSI did not install: {installed:?}");
+        let old_hash = sha256(&exe);
+        let new_hash = sha256(&new_exe);
+        assert_ne!(old_hash, new_hash, "the two builds must differ");
+
         let dir = temp("windows");
         let staging = dir.join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let staged = staging.join("SecurePlanCAD-windows-x64.msi");
-        std::fs::copy(&msi, &staged).unwrap();
-        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"));
-        let exe = local.join("Programs").join("SecurePlan CAD").join("SecurePlanCAD.exe");
-        assert!(!exe.exists(), "SecurePlan CAD is already installed on this runner");
-        // Stands in for the exiting application's process.
-        let mut app = Command::new("cmd").args(["/C", "ping -n 3 127.0.0.1 >NUL"]).spawn().unwrap();
+        std::fs::copy(&new_msi, &staged).unwrap();
         let marker = dir.join("launches.txt");
-        let plan = Plan {
-            version: "0.1.0".into(),
-            parent_pid: app.id(),
-            install: Install::Msi { msi: staged, exe: exe.clone() },
-            result: Some(dir.join("update-result.json")),
-            staging,
-        };
-        let mut helper = start_helper(&plan, &dir, &[("SECUREPLAN_TEST_RELAUNCH_MARKER", marker.as_path())]);
-        std::thread::sleep(Duration::from_secs(2));
-        assert!(!exe.exists(), "installed before the application exited");
-        let _ = app.wait();
-        drop(helper.stdin.take());
-        let status = wait_exit(&mut helper, Duration::from_secs(600));
-        let outcome = take_outcome(plan.result.as_ref().unwrap()).expect("an outcome");
-        assert!(status.success() && outcome.installed, "{outcome:?}");
-        assert!(exe.is_file(), "the MSI did not install the executable");
+
+        // The installed copy is the application: the production target()
+        // must accept it, and the upgrade has to wait for it.
+        let mut parent = Parent::start(&exe, &dir, "0.1.1", staged, None, &[("SECUREPLAN_TEST_RELAUNCH_MARKER", marker.as_path())]);
+        assert!(staging.join("SecurePlanCAD-update-helper.exe").is_file(), "the helper does not run from a copy");
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(sha256(&exe), old_hash, "installed while the application ran");
+        assert!(!parent.outcome_written() && !marker.exists(), "the helper acted before the application exited");
+        let parent_pid = parent.child.id();
+        parent.exit();
+
+        let outcome = parent.outcome(Duration::from_secs(600));
+        assert!(outcome.installed, "{outcome:?}");
+        assert_eq!(sha256(&exe), new_hash, "the installed executable is not the new one");
         let line = wait_for_line(&marker, Duration::from_secs(120), |_| true).expect("the installed copy was not relaunched");
         let (pid, launched) = line.split_once(' ').unwrap();
-        assert_ne!(pid.parse::<u32>().unwrap(), helper.id());
+        assert_ne!(pid.parse::<u32>().unwrap(), parent_pid);
         assert_eq!(launched.to_lowercase(), exe.display().to_string().to_lowercase(), "the relaunch was not the installed copy");
         // The scheme is registered for the current user (DSK-04).
         let command = reg_query(&[r"HKCU\Software\Classes\secureplan-cad\shell\open\command", "/ve"]).expect("scheme command registered");
         assert!(command.to_lowercase().contains(&exe.display().to_string().to_lowercase()), "{command}");
         assert!(reg_query(&[r"HKCU\Software\Classes\secureplan-cad", "/v", "URL Protocol"]).is_some(), "URL Protocol value missing");
+
         // Uninstalling removes it all again (once the relaunched copy has gone).
         std::thread::sleep(Duration::from_secs(3));
-        let removed = Command::new("msiexec").arg("/x").arg(&msi).args(["/qn", "/norestart"]).status().unwrap();
+        let removed = msiexec(&["/x".as_ref(), new_msi.as_os_str(), "/qn".as_ref(), "/norestart".as_ref()]);
         assert!(removed.success(), "uninstall failed: {removed:?}");
         assert!(!exe.exists());
         assert!(reg_query(&[r"HKCU\Software\Classes\secureplan-cad"]).is_none(), "the scheme stayed registered after uninstall");

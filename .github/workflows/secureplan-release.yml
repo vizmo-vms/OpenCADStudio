@@ -11,11 +11,18 @@ name: SecurePlan CAD release
 #   publishes: draft release -> upload every asset -> download and verify
 #   them against SHA256SUMS -> publish and mark latest -> check that
 #   releases/latest/download/<name> serves them.
-# - Running it by hand (workflow_dispatch) is always a DRY RUN: it builds every
-#   asset, writes and verifies SHA256SUMS, and uploads them as workflow
-#   artifacts only. It never creates, edits or publishes a release: the
-#   publish job runs only for a tag push, and it is the only job whose token
-#   may write.
+# - A pull request into secureplan that touches the release workflow,
+#   packaging or the updater, and a manual run (workflow_dispatch, which needs
+#   the workflow on the default branch), are always a DRY RUN: they build every
+#   asset, write and verify SHA256SUMS, and upload them as workflow artifacts
+#   only. They never create, edit or publish a release: the publish job runs
+#   only for a tag push, and it is the only job whose token may write.
+# - Publication is serialized across all tags (one concurrency group), and a
+#   version that is not newer than the latest published release is refused
+#   (packaging/secureplan/release_order.py), so releases/latest never moves
+#   backwards.
+#
+# Actions are pinned to commits and Rust to an exact toolchain.
 #
 # Never enables the test-only cargo feature (SecurePlan CI fails any other
 # workflow that names it).
@@ -23,17 +30,30 @@ name: SecurePlan CAD release
 on:
   push:
     tags: ["secureplan-cad-v*"]
+  pull_request:
+    branches: [secureplan]
+    paths:
+      - .github/workflows/secureplan-release.yml
+      - packaging/**
+      - src/secureplan/update.rs
+      - src/secureplan/update_helper.rs
+      - src/secureplan/ui/update_dialog.rs
+      - src/io/update_check.rs
+      - tests/secureplan_update_helper.rs
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Builds of one ref run one at a time (a newer pull request push replaces an
+# older dry run); publication has its own global group (the publish job).
 concurrency:
   group: secureplan-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.1"
 
 jobs:
   prepare:
@@ -46,9 +66,12 @@ jobs:
       protocol: ${{ steps.version.outputs.protocol }}
       publish: ${{ steps.version.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+
+      - name: Release order and publication rules
+        run: python3 -m unittest discover -s packaging/secureplan -p 'test_*.py' -v
 
       - name: Check the version, tag and release notes
         id: version
@@ -111,12 +134,13 @@ jobs:
             target: x86_64-apple-darwin
             lipo: x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Release build (secureplan)
@@ -133,7 +157,7 @@ jobs:
       - name: Assemble, sign and package
         run: packaging/secureplan/make-release-dmg.sh "target/${{ matrix.target }}/release" "${{ matrix.lipo }}" "SecurePlanCAD-macos-${{ matrix.arch }}.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-macos-${{ matrix.arch }}
           path: SecurePlanCAD-macos-${{ matrix.arch }}.dmg
@@ -147,11 +171,13 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Release build (secureplan)
         run: cargo build --locked --release --features secureplan --bin OpenCADStudio
@@ -168,7 +194,7 @@ jobs:
         shell: pwsh
         run: packaging/windows/check-msi.ps1 -Msi SecurePlanCAD-windows-x64.msi -Version "${{ needs.prepare.outputs.version }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-windows-x64
           path: SecurePlanCAD-windows-x64.msi
@@ -181,7 +207,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -192,7 +218,7 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: git archive --format=tar.gz --prefix="OpenCADStudio-$TAG/" -o SecurePlanCAD-source.tar.gz "$GITHUB_SHA"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-source
           path: SecurePlanCAD-source.tar.gz
@@ -205,7 +231,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: secureplan-cad-*
           path: dist
@@ -230,7 +256,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-release
           path: dist/*
@@ -243,6 +269,11 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag' && needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    # One publication at a time across every tag, never cancelled: a slower
+    # older release cannot overtake a newer one (and is refused below).
+    concurrency:
+      group: secureplan-release-publish
+      cancel-in-progress: false
     permissions:
       contents: write
     env:
@@ -252,9 +283,9 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       PROTOCOL: ${{ needs.prepare.outputs.protocol }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: secureplan-cad-release
           path: dist
@@ -276,6 +307,12 @@ jobs:
             echo "- SecurePlan CAD $VERSION, bridge protocol $PROTOCOL, fork commit \`$GITHUB_SHA\`."
             echo "- Check a download with \`sha256sum -c SHA256SUMS --ignore-missing\`."
           } > release-notes.md
+
+      - name: The version is newer than the latest release
+        run: |
+          set -euo pipefail
+          latest="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          python3 packaging/secureplan/release_order.py "$TAG" "$latest"
 
       - name: Create the draft release
         run: |
@@ -302,8 +339,12 @@ jobs:
           cmp draft/SHA256SUMS dist/SHA256SUMS
           (cd draft && sha256sum -c SHA256SUMS)
 
-      - name: Publish and mark latest
-        run: gh release edit "$TAG" --draft=false --prerelease=false --latest
+      - name: Publish and mark latest (if still the newest)
+        run: |
+          set -euo pipefail
+          latest="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          python3 packaging/secureplan/release_order.py "$TAG" "$latest"
+          gh release edit "$TAG" --draft=false --prerelease=false --latest
 
       - name: releases/latest serves this release
         run: |

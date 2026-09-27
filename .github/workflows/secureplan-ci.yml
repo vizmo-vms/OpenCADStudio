@@ -21,21 +21,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.1"
 
 jobs:
   linux:
     name: Linux checks and debug build
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install dependencies
         run: |
@@ -60,6 +62,11 @@ jobs:
           cargo test --locked --features secureplan,secureplan-test --
           --skip arc_grips_drive_center_start_and_end_but_not_midpoint
           --skip symmetric_constraint_mirrors_one_circles_center_across_the_axis_line
+
+      # Release order (releases/latest never moves backwards) and the release
+      # workflow's publication rules.
+      - name: Release workflow checks
+        run: python3 -m unittest discover -s packaging/secureplan -p 'test_*.py' -v
 
       - name: No other workflow enables secureplan-test
         run: |
@@ -93,7 +100,7 @@ jobs:
       - name: Debug build (secureplan)
         run: cargo build --locked --features secureplan
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-debug-linux-x64
           path: |
@@ -106,13 +113,15 @@ jobs:
     name: Upstream tests (default features)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install dependencies
         run: |
@@ -141,15 +150,16 @@ jobs:
           - arch: x64
             target: x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
@@ -161,7 +171,7 @@ jobs:
           packaging/dev/make-dev-app.sh "target/${{ matrix.target }}/debug" "SecurePlan CAD Dev.app"
           ditto -c -k --keepParent "SecurePlan CAD Dev.app" secureplan-cad-dev.app.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-debug-macos-${{ matrix.arch }}
           path: secureplan-cad-dev.app.zip
@@ -174,13 +184,15 @@ jobs:
     # packaging/windows/*.wxs targets.
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Debug build (secureplan)
         run: cargo build --locked --features secureplan
@@ -195,7 +207,7 @@ jobs:
         shell: pwsh
         run: packaging/windows/check-msi.ps1 -Msi SecurePlanCAD-debug.msi -Version 0.1.0
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: secureplan-cad-debug-windows-x64
           path: |
@@ -212,44 +224,58 @@ jobs:
     name: macOS update helper
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: update-helper
 
       - name: Update helper tests
         run: cargo test --locked --features secureplan,secureplan-test --test secureplan_update_helper
 
-  # DSK-07: the update helper waits for the application to exit, installs a
-  # per-user MSI of this test build with msiexec (registering the scheme under
-  # HKCU), relaunches the installed copy, and the uninstall removes it again.
+  # DSK-07: an installed 0.1.0 of this test build, running, starts the update
+  # through the production launch path; the helper waits for it to exit,
+  # upgrades it to 0.1.1 with msiexec (registering the scheme under HKCU),
+  # relaunches the installed copy, and the uninstall removes it again.
   windows-update-helper:
     name: Windows update helper
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: update-helper
 
-      - name: Test build and its per-user MSI
+      # Two per-user MSIs of this test build: 0.1.0, and 0.1.1 whose
+      # executable differs by one appended byte, so the upgrade is visible.
+      - name: Test build and its per-user MSIs
         shell: pwsh
         run: |
           cargo build --locked --features secureplan,secureplan-test
           if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-          packaging/windows/build-msi.ps1 -Exe target\debug\OpenCADStudio.exe -Version 0.1.0 -Out update-test.msi
+          Copy-Item target\debug\OpenCADStudio.exe update-new.exe
+          $stream = [IO.File]::Open((Resolve-Path update-new.exe).Path, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+          $stream.WriteByte(0x53)
+          $stream.Close()
+          packaging/windows/build-msi.ps1 -Exe target\debug\OpenCADStudio.exe -Version 0.1.0 -Out update-old.msi
+          packaging/windows/build-msi.ps1 -Exe update-new.exe -Version 0.1.1 -Out update-new.msi
 
       - name: Update helper tests
         env:
-          SECUREPLAN_TEST_MSI: ${{ github.workspace }}\update-test.msi
-        run: cargo test --locked --features secureplan,secureplan-test --test secureplan_update_helper
+          SECUREPLAN_TEST_MSI_OLD: ${{ github.workspace }}\update-old.msi
+          SECUREPLAN_TEST_MSI_NEW: ${{ github.workspace }}\update-new.msi
+          SECUREPLAN_TEST_EXE_NEW: ${{ github.workspace }}\update-new.exe
+        run: cargo test --locked --features secureplan,secureplan-test --test secureplan_update_helper -- --nocapture

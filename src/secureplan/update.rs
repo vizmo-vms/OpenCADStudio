@@ -390,12 +390,16 @@ pub fn checksum_for(sums: &[u8], name: &str) -> Option<String> {
 fn make_staging_dir(root: &Path) -> Result<PathBuf, String> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
     let dir = root.join(format!("{STAGING_PREFIX}{}-{nanos}", std::process::id()));
-    let mut builder = std::fs::DirBuilder::new();
+    // Owner-only on Unix; the per-user temporary folder already is on Windows.
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder.create(&dir).map_err(|_| "SecurePlan CAD could not create a folder for the download.".to_string())?;
     Ok(dir)
 }
@@ -506,6 +510,9 @@ pub struct Updater {
     /// Unit tests record the helper launches instead of starting them.
     #[cfg(test)]
     pub launched: Mutex<Vec<update_helper::Plan>>,
+    /// Unit tests can hold the updater's worker jobs to interleave them.
+    #[cfg(test)]
+    pub held_jobs: Option<super::hooks::HeldJobs>,
 }
 
 impl Default for Updater {
@@ -528,6 +535,8 @@ impl Default for Updater {
             test_target: None,
             #[cfg(test)]
             launched: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            held_jobs: None,
         }
     }
 }
@@ -623,7 +632,9 @@ impl OpenCADStudio {
                 let announce = self.secureplan.update.announced.as_deref() != Some(release.version.as_str());
                 self.secureplan.update.available = Some(release.clone());
                 if manual {
-                    self.secureplan.dialog = Some(Dialog::Update(Box::new(super::ui::update_dialog::UpdateDialog::new(release))));
+                    let quiet = format!("SecurePlan CAD {} is available. Choose Check for updates again to see what's new.", release.version);
+                    let dialog = Dialog::Update(Box::new(super::ui::update_dialog::UpdateDialog::new(release)));
+                    self.secureplan_update_show(dialog, &quiet);
                 } else if announce {
                     // Never interrupts work: a line on the command line and a
                     // marker in the window title; the notes open on request.
@@ -642,7 +653,8 @@ impl OpenCADStudio {
                     Checked::Failed(message) => format!("The update check failed: {message}"),
                     Checked::Available(_) => unreachable!("handled above"),
                 };
-                self.secureplan.dialog = Some(Dialog::notice("Check for updates", vec![line, installed_line()]));
+                let quiet = format!("SecurePlan: {line}");
+                self.secureplan_update_show(Dialog::notice("Check for updates", vec![line, installed_line()]), &quiet);
             }
             // Automatic checks stay silent unless there is an update.
             _ => {}
@@ -761,24 +773,32 @@ impl OpenCADStudio {
         match result {
             Ok(staged) if cancelled => staged.discard(),
             Ok(staged) => {
-                self.secureplan.dialog = Some(ready_dialog(&staged.release));
+                let quiet = format!(
+                    "SecurePlan CAD {} is downloaded and checked. Choose SecurePlan › Check for updates to install it.",
+                    staged.release.version
+                );
+                let dialog = ready_dialog(&staged.release);
                 self.secureplan.update.staged = Some(staged);
+                self.secureplan_update_show(dialog, &quiet);
             }
             Err(_) if cancelled => self.command_line.push_info("SecurePlan: the update download was cancelled."),
             Err(reason) => {
-                self.secureplan.dialog = Some(Dialog::notice(
-                    "Update not installed",
-                    vec![reason, "Nothing was installed; SecurePlan CAD is unchanged.".into()],
-                ));
+                let quiet = format!("SecurePlan: the update was not installed. {reason}");
+                let dialog = Dialog::notice("Update not installed", vec![reason, "Nothing was installed; SecurePlan CAD is unchanged.".into()]);
+                self.secureplan_update_show(dialog, &quiet);
             }
         }
         Task::none()
     }
 
-    /// **Later** on a downloaded update: drop it.
-    pub(crate) fn secureplan_update_discard(&mut self) {
-        if let Some(staged) = self.secureplan.update.staged.take() {
-            staged.discard();
+    /// Show an updater result that arrived from a worker, unless the user is
+    /// in another dialog: then it is only announced (the window title shows
+    /// the state too), so a key meant for that dialog never acts on it.
+    fn secureplan_update_show(&mut self, dialog: Dialog, quiet: &str) {
+        if self.secureplan_dialog_open() || self.active_modal.is_some() {
+            self.command_line.push_info(quiet);
+        } else {
+            self.secureplan.dialog = Some(dialog);
         }
     }
 
@@ -817,16 +837,27 @@ impl OpenCADStudio {
     /// Called as the application exits: start the helper for a pending
     /// update. It waits for this process to end before installing.
     pub(crate) fn secureplan_update_on_exit(&self) {
-        let Some(launch) = self.secureplan.update.pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        let Some(launch) = self.secureplan.update.pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            // A download nobody chose to install goes with this session.
+            if let Some(staged) = &self.secureplan.update.staged {
+                staged.discard();
+            }
+            return;
+        };
         #[cfg(test)]
         self.secureplan.update.launched.lock().unwrap_or_else(|e| e.into_inner()).push(launch.plan.clone());
         #[cfg(not(test))]
         update_helper::launch(launch);
     }
 
-    /// Shown in the window title while an update is available.
+    /// Shown in the window title: the update's state, without a dialog.
     pub(crate) fn secureplan_update_title_suffix(&self) -> &'static str {
-        if self.secureplan.update.available.is_some() {
+        let update = &self.secureplan.update;
+        if update.install_pending() {
+            " (update installs on close)"
+        } else if update.staged.is_some() {
+            " (update ready to install)"
+        } else if update.available.is_some() {
             " (update available)"
         } else {
             ""
@@ -842,6 +873,10 @@ impl OpenCADStudio {
         let guarded = move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or(failed);
         #[cfg(test)]
         {
+            if let Some(held) = self.secureplan.update.held_jobs.as_mut() {
+                held.0.push(Box::new(guarded));
+                return Task::none();
+            }
             let message = guarded();
             self.secureplan_update(message)
         }
@@ -859,15 +894,21 @@ impl OpenCADStudio {
     }
 }
 
+/// **Install and restart** or **Later**. Focus, Enter and Escape all rest
+/// on **Later**, which keeps the download; installing takes a deliberate
+/// choice of the other button.
 fn ready_dialog(release: &Release) -> Dialog {
-    Dialog::choice(
-        "Update ready to install",
-        vec![
+    let buttons = vec![("Install and restart".to_string(), Action::UpdateInstall), ("Later".to_string(), Action::Dismiss)];
+    let mut form = super::ui::Form::new(Vec::new(), buttons, Action::Dismiss);
+    form.focus = 1;
+    Dialog::Choice {
+        title: "Update ready to install".into(),
+        form,
+        lines: vec![
             format!("SecurePlan CAD {} was downloaded, and its size and SHA-256 checksum match the release.", release.version),
-            "SecurePlan CAD will keep a recovery copy of any unapplied SecurePlan work, close, install the update and open again.".into(),
+            "Install and restart keeps a recovery copy of any unapplied SecurePlan work, closes SecurePlan CAD, installs the update and opens it again. Later keeps the download until SecurePlan CAD closes.".into(),
         ],
-        vec![("Install and restart".into(), Action::UpdateInstall), ("Later".into(), Action::UpdateDiscard)],
-    )
+    }
 }
 
 #[cfg(test)]
@@ -1414,6 +1455,71 @@ pub(crate) mod tests {
                 assert!(!text.contains(secret), "a request carried {secret}: {text}");
             }
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A download that finishes while the user is in another dialog must not
+    /// replace it or take its keys: Enter meant for that form never installs.
+    /// When the ready dialog does show, Enter and Escape mean Later.
+    #[test]
+    fn a_finished_download_never_takes_over_a_foreground_dialog() {
+        use crate::app::secureplan::session::tests::Harness;
+        use crate::app::secureplan::ui::DialogKey;
+        let mut h = Harness::new("update_foreground");
+        h.open_dxf();
+        let mock = Mock::start();
+        mock.release("0.2.0", ASSET, b"installer", 2 * HOUR);
+        let root = test_root("app-foreground");
+        use_mock(&mut h.app, &mock, &root);
+        let _ = h.app.dispatch_command("SECUREPLANUPDATE");
+        h.app.secureplan.update.held_jobs = Some(Default::default());
+        h.key(DialogKey::Activate); // Update: the download waits on its worker
+        assert!(h.app.secureplan.dialog.is_none());
+
+        // The user opens the alignment form, then the download finishes.
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "no alignment form");
+        let job = h.app.secureplan.update.held_jobs.as_mut().unwrap().0.remove(0);
+        let _ = h.app.secureplan_update(job());
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "the ready dialog replaced the form");
+        assert!(h.app.secureplan.update.staged.is_some());
+        assert!(history(&h.app).contains("0.2.0 is downloaded and checked"));
+        assert!(h.app.secureplan_window_title().ends_with("(update ready to install)"));
+        h.key(DialogKey::Activate); // Enter, meant for the form
+        assert!(!h.app.secureplan.update.install_pending() && launched(&h.app).is_empty(), "Enter installed the update");
+
+        // Asked for, the ready dialog rests on Later: Enter and Escape keep the download.
+        h.app.secureplan.dialog = None;
+        for key in [DialogKey::Activate, DialogKey::Cancel, DialogKey::Space] {
+            let _ = h.app.dispatch_command("SECUREPLANUPDATE");
+            assert_eq!(dialog(&h.app).as_deref(), Some("Update ready to install"));
+            h.key(key);
+            assert!(h.app.secureplan.dialog.is_none(), "{key:?}");
+            assert!(h.app.secureplan.update.staged.is_some() && !h.app.secureplan.update.install_pending(), "{key:?} installed or dropped it");
+        }
+        // Installing takes choosing the other button.
+        let _ = h.app.dispatch_command("SECUREPLANUPDATE");
+        h.key(DialogKey::Previous);
+        h.key(DialogKey::Activate);
+        assert_eq!(launched(&h.app).len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_download_nobody_installs_goes_with_the_session() {
+        let mock = Mock::start();
+        mock.release("0.2.0", ASSET, b"installer", 2 * HOUR);
+        let root = test_root("app-unused");
+        let mut app = OpenCADStudio::new_for_test();
+        use_mock(&mut app, &mock, &root);
+        let _ = app.dispatch_command("SECUREPLANUPDATE");
+        action(&mut app, Action::UpdateStart);
+        let staged = app.secureplan.update.staged.clone().expect("downloaded");
+        action(&mut app, Action::Dismiss); // Later
+        assert!(staged.file.is_file(), "Later dropped the download");
+        let _ = app.exit_app();
+        assert!(!staged.dir.exists(), "the unused download stayed");
+        assert!(launched(&app).is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 

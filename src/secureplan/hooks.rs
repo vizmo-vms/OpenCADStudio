@@ -206,25 +206,30 @@ impl Default for State {
             }
             // What the update helper did before this start (DSK-07).
             super::update::sweep_stale(&state.update.staging_root);
-            let outcome = super::update_helper::result_path().and_then(|path| super::update_helper::take_outcome(&path));
-            match outcome {
-                Some(outcome) if outcome.installed => {
-                    let line = format!("SecurePlan: {}", outcome.message);
-                    state.notice = Some(match state.notice.take() {
-                        Some(notice) => format!("{notice} {line}"),
-                        None => line,
-                    });
-                }
-                Some(outcome) => {
-                    state.dialog = Some(Dialog::notice(
-                        "Update not installed",
-                        vec![format!("SecurePlan CAD {} was not installed.", outcome.version), outcome.message],
-                    ));
-                }
-                None => {}
+            if let Some(outcome) = super::update_helper::result_path().and_then(|path| super::update_helper::take_outcome(&path)) {
+                state.show_update_outcome(outcome);
             }
         }
         state
+    }
+}
+
+impl State {
+    /// At the first start after an update: a notice when it installed, the
+    /// reason in a dialog when it did not (DSK-07).
+    pub(crate) fn show_update_outcome(&mut self, outcome: super::update_helper::Outcome) {
+        if outcome.installed {
+            let line = format!("SecurePlan: {}", outcome.message);
+            self.notice = Some(match self.notice.take() {
+                Some(notice) => format!("{notice} {line}"),
+                None => line,
+            });
+        } else {
+            self.dialog = Some(Dialog::notice(
+                "Update not installed",
+                vec![format!("SecurePlan CAD {} was not installed.", outcome.version), outcome.message],
+            ));
+        }
     }
 }
 
@@ -849,10 +854,6 @@ impl OpenCADStudio {
             Action::UpdateKeepAndStart => self.secureplan_update_keep_and_start(),
             Action::UpdateApplyFirst(tab_id) => self.secureplan_update_apply_first(tab_id),
             Action::UpdateInstall => self.secureplan_update_install(),
-            Action::UpdateDiscard => {
-                self.secureplan_update_discard();
-                Task::none()
-            }
             Action::UpdateCancelDownload => {
                 self.secureplan_update_cancel_download();
                 Task::none()
@@ -1056,6 +1057,21 @@ mod tests {
         assert!(crate::io::file_association::register_as_handler().is_err());
         assert!(crate::io::file_association::unregister_handler().is_err());
         assert!(pollster::block_on(crate::io::file_association::set_default_app()).is_err());
+    }
+
+    #[test]
+    fn the_first_start_after_an_update_reports_its_outcome() {
+        use crate::app::secureplan::update_helper::Outcome;
+        let mut app = app_with_drawing();
+        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: true, message: "SecurePlan CAD was updated to 0.2.0.".into() });
+        assert!(app.secureplan.dialog.is_none(), "a successful update opens no dialog");
+        let _ = app.update(Message::SecurePlan(Msg::Tick));
+        let history: Vec<String> = app.command_line.history.iter().map(|entry| entry.text.clone()).collect();
+        assert!(history.iter().any(|line| line.contains("updated to 0.2.0")), "{history:?}");
+        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: false, message: "Windows Installer stopped with error 1603; SecurePlan CAD is unchanged.".into() });
+        let Some(Dialog::Choice { title, lines, .. }) = &app.secureplan.dialog else { panic!("no dialog for a failed update") };
+        assert_eq!(title, "Update not installed");
+        assert!(lines.iter().any(|line| line.contains("1603")), "{lines:?}");
     }
 
     #[test]

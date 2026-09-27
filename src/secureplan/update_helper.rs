@@ -42,7 +42,8 @@ pub const WINDOWS_EXE: &str = "SecurePlanCAD.exe";
 const EXIT_WAIT: Duration = Duration::from_secs(120);
 
 /// Where this copy is installed, when it can update itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Target {
     /// The per-user MSI's executable.
     Windows { exe: PathBuf },
@@ -236,10 +237,15 @@ fn write_outcome(path: &Path, outcome: &Outcome) {
 /// For `main`, before anything else: run the helper when started as one, or
 /// (test builds) record a relaunch. `Some(exit code)` means exit now.
 pub fn main_hook() -> Option<i32> {
+    let helper = std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(HELPER_ARG));
+    #[cfg(feature = "secureplan-test")]
+    if let (false, Some(spec)) = (helper, std::env::var_os(TEST_PARENT_ENV)) {
+        return Some(run_test_parent(Path::new(&spec)));
+    }
     #[cfg(feature = "secureplan-test")]
     if let Some(marker) = std::env::var_os("SECUREPLAN_TEST_RELAUNCH_MARKER") {
         // Helper tests: the relaunched copy records itself and leaves.
-        if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new(HELPER_ARG)) {
+        if !helper {
             use std::io::Write;
             let exe = std::env::current_exe().map(|exe| exe.display().to_string()).unwrap_or_default();
             if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(marker) {
@@ -248,12 +254,72 @@ pub fn main_hook() -> Option<i32> {
             return Some(0);
         }
     }
-    let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() != Some(std::ffi::OsStr::new(HELPER_ARG)) {
+    if !helper {
         return None;
     }
-    let Some(plan_path) = args.next() else { return Some(2) };
+    let Some(plan_path) = std::env::args_os().nth(2) else { return Some(2) };
     Some(run(Path::new(&plan_path)))
+}
+
+/// Helper tests: the environment variable naming a [`TestParent`] file.
+#[cfg(feature = "secureplan-test")]
+pub const TEST_PARENT_ENV: &str = "SECUREPLAN_TEST_UPDATE_PARENT";
+
+/// Helper tests (`secureplan-test` builds only): this process plays the
+/// application that installs a verified download. It goes through the
+/// production [`target`] (unless `target` is given), [`prepare`] and
+/// [`launch`], says it has started, and exits only once `exit_when` exists,
+/// so a test controls exactly when "the application" ends.
+#[cfg(feature = "secureplan-test")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestParent {
+    pub version: String,
+    /// The verified download inside `staging`.
+    pub file: PathBuf,
+    pub staging: PathBuf,
+    pub result: PathBuf,
+    /// Where this copy is installed; `None` asks the production [`target`].
+    pub target: Option<Target>,
+    /// Written with this process id once the helper has started (or with
+    /// `refused: <reason>`).
+    pub started: PathBuf,
+    pub exit_when: PathBuf,
+}
+
+#[cfg(feature = "secureplan-test")]
+fn run_test_parent(spec_path: &Path) -> i32 {
+    // Neither the helper nor the relaunched copy may play the parent again.
+    std::env::remove_var(TEST_PARENT_ENV);
+    let Some(spec) = std::fs::read(spec_path).ok().and_then(|bytes| serde_json::from_slice::<TestParent>(&bytes).ok()) else {
+        return 2;
+    };
+    let prepared = spec.target.clone().map_or_else(target, Ok).and_then(|target| {
+        let size = std::fs::metadata(&spec.file).map(|meta| meta.len()).unwrap_or_default();
+        let name = spec.file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let release = super::update::Release {
+            version: spec.version.clone(),
+            tag: super::release_tag(&spec.version).unwrap_or_default(),
+            notes: String::new(),
+            published: 0,
+            asset: super::update::Asset { name, size },
+        };
+        let staged = Staged { release, dir: spec.staging.clone(), file: spec.file.clone() };
+        prepare(&staged, &target, Some(spec.result.clone()))
+    });
+    match prepared {
+        Ok(prepared) => launch(prepared),
+        Err(reason) => {
+            let _ = std::fs::write(&spec.started, format!("refused: {reason}"));
+            return 3;
+        }
+    }
+    let _ = std::fs::write(&spec.started, std::process::id().to_string());
+    let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
+    while !spec.exit_when.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    0
 }
 
 /// The helper: wait for the application to exit, install, record the
