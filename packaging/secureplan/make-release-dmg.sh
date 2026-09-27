@@ -8,7 +8,6 @@
 #
 # <release build dir> holds `OpenCADStudio` and `ocs_launcher` from
 # `cargo build --release --features secureplan --target <target>`.
-# Needs rsvg-convert (librsvg) for the icon.
 set -euo pipefail
 
 build_dir="${1:?usage: make-release-dmg.sh <build dir> <arm64|x86_64> <output .dmg>}"
@@ -36,15 +35,8 @@ for binary in "$app/Contents/MacOS/OpenCADStudio" "$app/Contents/MacOS/OpenCADSt
   fi
 done
 
-iconset="$work/AppIcon.iconset"
-mkdir -p "$iconset"
-for size in 16 32 64 128 256 512 1024; do
-  rsvg-convert -w "$size" -h "$size" "$root/assets/logo.svg" -o "$iconset/icon_${size}x${size}.png"
-done
-for base in 16 32 128 256 512; do
-  cp "$iconset/icon_$((base * 2))x$((base * 2)).png" "$iconset/icon_${base}x${base}@2x.png"
-done
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+# The Vizmo icon (DSK-08), made by packaging/secureplan/make-icons.py.
+cp "$root/packaging/secureplan/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 
 plist="$app/Contents/Info.plist"
 sed "s/__VERSION__/$version/g" "$root/packaging/Info.plist" > "$plist"

@@ -24,6 +24,10 @@ use crate::app::secureplan::Msg;
 use crate::app::Message;
 pub use trust_dialog::DialogKey;
 
+/// Vizmo's Signal Teal, the accent of the home screen and the SecurePlan
+/// dialogs (DSK-08). Focus is never shown by colour alone.
+pub const ACCENT: iced::Color = iced::Color::from_rgb8(0x00, 0x94, 0xA1);
+
 /// What a dialog button does.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -49,6 +53,8 @@ pub enum Action {
     ExportCancel,
     /// Run a SecurePlan ribbon command (the keyboard menu of the tab).
     Command(&'static str),
+    /// Replace tab `.0`'s drawing: choose the file now (PUB-01).
+    ImportReplace(u64),
     /// The updater (DSK-07): **Update**, keep recovery copies and update,
     /// Apply tab `.0` first, **Install and restart**, and cancel a download.
     UpdateStart,
@@ -273,7 +279,7 @@ fn focus_style(focused: bool) -> impl Fn(&Theme) -> container::Style {
         let palette = theme.palette();
         container::Style {
             border: Border {
-                color: if focused { palette.primary.base.color } else { palette.background.strong.color },
+                color: if focused { ACCENT } else { palette.background.strong.color },
                 width: if focused { 3.0 } else { 1.0 },
                 radius: 4.0.into(),
             },
@@ -298,7 +304,7 @@ pub fn dialog_button(label: &str, focused: bool, message: Message) -> Element<'s
                 background: Some(Background::Color(pair.color)),
                 text_color: pair.text,
                 border: Border {
-                    color: if focused { palette.primary.base.color } else { palette.background.strong.color },
+                    color: if focused { ACCENT } else { palette.background.strong.color },
                     width: if focused { 3.0 } else { 1.0 },
                     radius: 4.0.into(),
                 },

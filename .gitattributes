@@ -9,3 +9,6 @@
 secureplan-vectors/** -text
 # Windows registry files are read by regedit with CRLF line endings.
 packaging/dev/*.reg text eol=crlf
+
+*.ico binary
+*.icns binary

@@ -25,6 +25,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$build_dir/ocs_launcher" "$app/Contents/MacOS/OpenCADStudio"
 cp "$build_dir/OpenCADStudio" "$app/Contents/MacOS/OpenCADStudio-App"
 chmod +x "$app/Contents/MacOS/OpenCADStudio" "$app/Contents/MacOS/OpenCADStudio-App"
+cp "$root/packaging/secureplan/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 # A development identity, so it never replaces an installed release.
 sed -e "s/__VERSION__/$version/g" \
     -e "s/<string>in.vizmo.secureplan.cad<\/string>/<string>in.vizmo.secureplan.cad.dev<\/string>/" \

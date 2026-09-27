@@ -298,6 +298,22 @@ pub fn read_checked(path: &std::path::Path) -> Result<Vec<u8>, ImportError> {
     Ok(bytes)
 }
 
+/// Asks before a new drawing replaces `current` (PUB-01). Focus starts on
+/// Cancel, and Escape cancels too.
+fn replace_dialog(tab_id: u64, current: &str) -> super::ui::Dialog {
+    use super::ui::{Action, Dialog};
+    let mut dialog = Dialog::choice(
+        "Replace the survey's drawing?",
+        vec![
+            format!("Current drawing: {current}"),
+            "Opening another drawing replaces it here. SecurePlan keeps the current drawing until you Apply.".into(),
+        ],
+        vec![("Replace drawing".to_string(), Action::ImportReplace(tab_id)), ("Cancel".to_string(), Action::Dismiss)],
+    );
+    dialog.form_mut().focus = 1;
+    dialog
+}
+
 /// A load waiting for the tab's running parser to finish. Only the latest
 /// waits; an older one is dropped unstarted.
 #[derive(Debug, Clone)]
@@ -474,9 +490,39 @@ impl OpenCADStudio {
         }
     }
 
-    /// Start an import into the bound tab `tab_id`: the picker's answer goes
-    /// to that tab, whichever tab is active by then.
+    /// **Open drawing** in the bound tab `tab_id` (PUB-01). With no plan and
+    /// no imported drawing the file dialog opens at once; otherwise the user
+    /// first confirms replacing the current drawing, with focus on Cancel.
     pub(crate) fn secureplan_start_import(&mut self, tab_id: u64) -> Task<Message> {
+        if let Err(message) = self.secureplan_can_edit_tab(tab_id) {
+            self.command_line.push_error(&message);
+            return Task::none();
+        }
+        match self.secureplan_current_drawing(tab_id) {
+            Some(current) => {
+                self.secureplan.dialog = Some(replace_dialog(tab_id, &current));
+                Task::none()
+            }
+            None => self.secureplan_pick_import(tab_id),
+        }
+    }
+
+    /// The drawing an import would replace, by name: the imported one not
+    /// applied yet, or the survey's plan. `None` when there is neither.
+    pub(crate) fn secureplan_current_drawing(&self, tab_id: u64) -> Option<String> {
+        let bound = self.secureplan.sessions.by_tab(tab_id)?;
+        if let Some(original) = &bound.pending_original {
+            return Some(original.name.expose().clone());
+        }
+        if !bound.has_plan {
+            return None;
+        }
+        Some(bound.loaded.as_ref().map_or_else(|| "the survey's current drawing".to_string(), |d| d.name.expose().clone()))
+    }
+
+    /// Choose the file for an import into the bound tab `tab_id`: the
+    /// picker's answer goes to that tab, whichever tab is active by then.
+    pub(crate) fn secureplan_pick_import(&mut self, tab_id: u64) -> Task<Message> {
         if let Err(message) = self.secureplan_can_edit_tab(tab_id) {
             self.command_line.push_error(&message);
             return Task::none();
@@ -492,7 +538,7 @@ impl OpenCADStudio {
         Task::perform(
             async {
                 crate::sys::file_dialog()
-                    .set_title("Import drawing for SecurePlan")
+                    .set_title("Open drawing for SecurePlan")
                     .add_filter("DWG or DXF drawing", &["dwg", "dxf", "DWG", "DXF"])
                     .pick_file()
                     .await
@@ -701,5 +747,72 @@ pub(crate) mod tests {
         assert!(load_drawing("deep.dxf", bytes).unwrap_err().message.contains("32 deep"));
         let bytes = crate::io::save_to_bytes(&nested_drawing(MAX_BLOCK_DEPTH), "dxf", acadrust::DxfVersion::AC1032).unwrap();
         assert!(load_drawing("ok.dxf", bytes).is_ok());
+    }
+
+    /// Open drawing (PUB-01, DSK-08): the file dialog at once for a survey
+    /// with no drawing; a confirmation naming the current drawing, with focus
+    /// on Cancel, when there is a plan or an imported drawing. Cancel, by
+    /// Enter or Escape, changes nothing.
+    #[test]
+    fn open_drawing_asks_before_replacing_a_plan_or_an_imported_drawing() {
+        use crate::app::secureplan::session::tests::{sample, Harness};
+        use crate::app::secureplan::ui::trust_dialog::DialogKey;
+        use crate::app::secureplan::ui::Dialog;
+        use crate::app::secureplan::overlay;
+        use serde_json::Value;
+        const REPLACE: &str = "Replace the survey's drawing?";
+
+        let pending = |h: &Harness| h.bound().pending_original.as_ref().map(|o| o.name.expose().clone());
+        let pick = |h: &mut Harness, name: &str| {
+            let file = h.dir().join(name);
+            std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+            h.app.secureplan.test_pick = Some(file);
+        };
+        let lines = |h: &Harness| match &h.app.secureplan.dialog {
+            Some(Dialog::Choice { lines, form, .. }) => (lines.clone(), form.focus, form.buttons.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>()),
+            _ => panic!("no dialog"),
+        };
+
+        // No plan and nothing imported: the file dialog, no question.
+        let mut h = Harness::new("open_drawing_new");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        pick(&mut h, "first.dxf");
+        let _ = h.app.dispatch_command("SECUREPLANIMPORT");
+        assert_eq!(h.dialog_title().as_deref(), Some("Drawing imported"), "a new survey was asked to confirm");
+        assert_eq!(pending(&h).as_deref(), Some("first.dxf"));
+        h.app.secureplan.dialog = None;
+
+        // An imported drawing: asked, naming it, focus on Cancel.
+        pick(&mut h, "second.dxf");
+        let entities = h.entity_count();
+        for cancel in [DialogKey::Activate, DialogKey::Cancel] {
+            let _ = h.app.dispatch_command("SECUREPLANIMPORT");
+            assert_eq!(h.dialog_title().as_deref(), Some(REPLACE));
+            let (text, focus, buttons) = lines(&h);
+            assert!(text.contains(&"Current drawing: first.dxf".to_string()), "{text:?}");
+            assert_eq!(buttons, ["Replace drawing", "Cancel"]);
+            assert_eq!(focus, 1, "focus is not on Cancel");
+            h.key(cancel);
+            assert!(h.app.secureplan.dialog.is_none(), "{cancel:?} left the dialog open");
+            assert_eq!(pending(&h).as_deref(), Some("first.dxf"), "{cancel:?} replaced the drawing");
+            assert_eq!(h.entity_count(), entities);
+            assert!(h.app.secureplan.load_jobs.is_empty() && h.bound().busy.is_none());
+        }
+        // Replace drawing opens the file dialog, and the new file replaces it.
+        let _ = h.app.dispatch_command("SECUREPLANIMPORT");
+        h.key(DialogKey::Previous);
+        h.key(DialogKey::Activate);
+        assert_eq!(pending(&h).as_deref(), Some("second.dxf"));
+
+        // A survey with a plan, opened for import from the web: the import
+        // intent is edit, then Open drawing, so it asks first.
+        let mut h = Harness::new("open_drawing_plan");
+        h.open(Some(("plan.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", sample("openSession-edit")["cadPlan"].clone(), &"a".repeat(64), "import");
+        pick(&mut h, "other.dxf");
+        assert_eq!(h.dialog_title().as_deref(), Some(REPLACE), "the import intent did not ask");
+        assert!(lines(&h).0.contains(&"Current drawing: plan.dxf".to_string()), "{:?}", lines(&h).0);
+        let loaded = h.bound().loaded.clone().map(|d| d.bytes);
+        h.key(DialogKey::Cancel);
+        assert!(pending(&h).is_none() && h.bound().loaded.clone().map(|d| d.bytes) == loaded, "Cancel changed the plan");
     }
 }

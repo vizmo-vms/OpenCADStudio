@@ -1,8 +1,8 @@
-//! The origin-trust prompt (BRG-02, DSK-06).
+//! The prompt that asks whether to allow a website (BRG-02, DSK-06).
 //!
 //! Shows the exact origin that asked to connect. Keyboard: Tab, Shift+Tab and
 //! the arrow keys move focus between the two buttons, Enter or Space
-//! activates the focused one, Escape declines. Focus starts on "Don't trust",
+//! activates the focused one, Escape declines. Focus starts on "Don't allow",
 //! and the focused button has a thick outline and a "›" marker, so focus is
 //! visible without relying on colour.
 
@@ -61,17 +61,17 @@ pub fn view<'a>(base: Element<'a, Message>, prompt: &'a Prompt) -> Element<'a, M
         text("A website asked SecurePlan CAD to connect:").size(14),
         container(text(prompt.request.origin.as_str()).font(Font::MONOSPACE).size(16)).padding([6, 10]),
         text(
-            "Trust it only if this is your organisation's SecurePlan address. A trusted \
+            "Allow it only if this is your organisation's SecurePlan address. An allowed \
              website can open drawings in SecurePlan CAD when you choose Edit or View in \
-             desktop there. You can revoke it later with Revoke trust on the SecurePlan ribbon tab.",
+             desktop there. You can remove it later under Allowed websites.",
         )
         .size(13)
         .width(Length::Fixed(420.0)),
         row![
-            prompt_button("Don't trust", prompt.focus == PromptButton::Decline, decline.clone()),
+            prompt_button("Don't allow", prompt.focus == PromptButton::Decline, decline.clone()),
             prompt_button(
-                "Trust and connect",
-                prompt.focus == PromptButton::Trust,
+                "Allow",
+                prompt.focus == PromptButton::Allow,
                 Message::SecurePlan(Msg::TrustAnswer(true)),
             ),
         ]
@@ -82,7 +82,7 @@ pub fn view<'a>(base: Element<'a, Message>, prompt: &'a Prompt) -> Element<'a, M
     .padding(8);
     crate::ui::modal::modal(
         base,
-        "Trust this website?",
+        "Allow this website?",
         content,
         decline,
         Vector::ZERO,

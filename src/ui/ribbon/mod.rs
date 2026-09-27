@@ -446,15 +446,22 @@ impl Ribbon {
         show_block_palette: bool,
     ) -> Element<'_, Message> {
         // ── Quick-access file commands + undo/redo, one merged flow ────────
-        let lead = iced::widget::Row::with_children(vec![
+        // SecurePlan CAD neither creates, opens nor saves drawings itself
+        // (DSK-08): its quick-access row is Undo and Redo only.
+        #[cfg(not(feature = "secureplan"))]
+        let files: Vec<Element<'_, Message>> = vec![
             quick_access_btn(crate::ui::icons::DOC_NEW, "New", "NEW").into(),
             quick_access_btn(crate::ui::icons::FOLDER_OPEN, "Open", "OPEN").into(),
             quick_access_btn(crate::ui::icons::SAVE, "Save", "SAVE").into(),
             quick_access_btn(crate::ui::icons::FILE_EXPORT, "Save As", "SAVEAS").into(),
             quick_access_btn(crate::ui::icons::PRINT, "Print", "PRINT").into(),
+        ];
+        #[cfg(feature = "secureplan")]
+        let files: Vec<Element<'_, Message>> = Vec::new();
+        let lead = iced::widget::Row::with_children(files.into_iter().chain([
             render_history_control("Undo", UNDO_HISTORY_ID, undo_count, &self.open_dropdown).into(),
             render_history_control("Redo", REDO_HISTORY_ID, redo_count, &self.open_dropdown).into(),
-        ])
+        ]))
         .spacing(TOP_HIST_GAP)
         .align_y(iced::Center)
         .wrap()

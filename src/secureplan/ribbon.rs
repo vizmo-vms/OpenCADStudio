@@ -16,17 +16,23 @@ pub struct SecurePlanModule;
 
 /// The SecurePlan commands, in ribbon order: (command, label, glyph).
 pub const COMMANDS: [(&str, &str, &str); 10] = [
-    ("SECUREPLANIMPORT", "Import drawing", "⤓"),
+    ("SECUREPLANIMPORT", "Open drawing", "⤓"),
     ("SECUREPLANALIGN", "Align", "⌖"),
     ("SECUREPLANAPPLY", "Apply", "✓"),
     ("SECUREPLANCONVERT", "Convert selection", "⇄"),
     ("SECUREPLANOVERLAY", "Design overlay", "◫"),
-    ("SECUREPLANTRUST", "Trusted websites", "☰"),
-    ("SECUREPLANREVOKE", "Revoke trust", "✕"),
+    ("SECUREPLANTRUST", "Allowed websites", "☰"),
+    ("SECUREPLANREVOKE", "Remove website", "✕"),
     ("SECUREPLANDEVORIGINS", "Developer origins", "⚙"),
     ("SECUREPLANUPDATE", "Check for updates", "↻"),
     ("SECUREPLANAUTOUPDATE", "Automatic update checks", "⏲"),
 ];
+
+/// The first five commands work on a survey's drawing; the others (websites
+/// and updates) also work from the home screen (DSK-08).
+pub fn needs_drawing(command: &str) -> bool {
+    COMMANDS[..5].iter().any(|(id, ..)| *id == command)
+}
 
 fn tool(index: usize) -> ToolDef {
     let (id, label, glyph) = COMMANDS[index];
@@ -43,7 +49,7 @@ fn groups() -> &'static [RibbonGroup] {
             },
             RibbonGroup { title: "SecurePlan design", tools: vec![RibbonItem::LabeledTool(tool(3)), RibbonItem::LabeledTool(tool(4))] },
             RibbonGroup {
-                title: "Trust",
+                title: "Websites",
                 tools: vec![RibbonItem::LabeledTool(tool(5)), RibbonItem::LabeledTool(tool(6)), RibbonItem::LabeledTool(tool(7))],
             },
             // The About/Help place for SecurePlan CAD's own updates (DSK-07).
@@ -83,7 +89,7 @@ mod tests {
         }
         let expected: Vec<String> = COMMANDS.iter().map(|(command, ..)| command.to_string()).collect();
         assert_eq!(commands, expected);
-        // The trust commands are on the tab (user decision, F4a).
+        // The allowed-website commands are on the tab (user decision, F4a).
         for trust in ["SECUREPLANTRUST", "SECUREPLANREVOKE", "SECUREPLANDEVORIGINS"] {
             assert!(commands.iter().any(|c| c == trust), "{trust}");
         }

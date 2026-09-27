@@ -141,6 +141,13 @@ pub fn view_window(
         .style(button::primary)
         .padding([6, 16]);
 
+    // SecurePlan CAD names its upstream, licence and source only here (DSK-08).
+    #[cfg(feature = "secureplan")]
+    let hero = {
+        let [product, licence] = crate::app::secureplan::home::about_lines();
+        column![hero, text(product).size(12), text(licence).size(12)].spacing(6)
+    };
+
     container(
         column![
             hero,

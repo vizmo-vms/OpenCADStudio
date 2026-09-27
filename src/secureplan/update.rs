@@ -1111,7 +1111,7 @@ pub(crate) mod tests {
         assert!(matches!(check(&mock.endpoints(), ASSET, unix_now()), Checked::Failed(_)));
         // The API request itself never follows a redirect.
         mock.route("/latest", Reply::redirect("/elsewhere"));
-        mock.route("/elsewhere", Reply::ok(release_json("0.2.0", ASSET, 10, 2 * HOUR).to_string()));
+        mock.route("/elsewhere", Reply::ok(release_json("9.0.0", ASSET, 10, 2 * HOUR).to_string()));
         assert!(matches!(check(&mock.endpoints(), ASSET, unix_now()), Checked::Failed(_)));
         assert!(!mock.requests().iter().any(|r| r.target == "/elsewhere"));
     }
@@ -1120,11 +1120,11 @@ pub(crate) mod tests {
     fn requests_carry_no_survey_data_or_identifiers() {
         let mock = Mock::start();
         let bytes = b"installer bytes".to_vec();
-        mock.release("0.2.0", ASSET, &bytes, 2 * HOUR);
+        mock.release("9.0.0", ASSET, &bytes, 2 * HOUR);
         let Checked::Available(release) = check(&mock.endpoints(), ASSET, unix_now()) else { panic!("available") };
         let root = test_root("requests");
         download(&mock.endpoints(), &release, &root, &AtomicBool::new(false)).unwrap().discard();
-        let tag = "secureplan-cad-v0.2.0";
+        let tag = "secureplan-cad-v9.0.0";
         let expected = ["/latest".to_string(), format!("/download/{tag}/{SUMS_NAME}"), format!("/download/{tag}/{ASSET}"), format!("/assets/{ASSET}?signature=x")];
         let requests = mock.requests();
         assert_eq!(requests.iter().map(|r| r.target.clone()).collect::<Vec<_>>(), expected);
@@ -1157,7 +1157,7 @@ pub(crate) mod tests {
     fn a_verified_download_follows_the_asset_redirect() {
         let mock = Mock::start();
         let bytes = vec![7u8; 200_000];
-        mock.release("0.2.0", ASSET, &bytes, 2 * HOUR);
+        mock.release("9.0.0", ASSET, &bytes, 2 * HOUR);
         let root = test_root("verified");
         let staged = download(&mock.endpoints(), &release_for(&mock), &root, &AtomicBool::new(false)).expect("verified");
         assert_eq!(std::fs::read(&staged.file).unwrap(), bytes);
@@ -1180,13 +1180,13 @@ pub(crate) mod tests {
             ("checksum", |mock, _| mock.route(&format!("/assets/{ASSET}?signature=x"), Reply::ok(b"the fake installer".to_vec()))),
             ("longer", |mock, bytes| mock.route(&format!("/assets/{ASSET}?signature=x"), Reply::ok([bytes, b"!"].concat()))),
             ("shorter", |mock, bytes| mock.route(&format!("/assets/{ASSET}?signature=x"), Reply::ok(bytes[1..].to_vec()))),
-            ("unlisted", |mock, _| mock.route(&format!("/download/secureplan-cad-v0.2.0/{SUMS_NAME}"), Reply::ok(format!("{}  other.msi\n", "a".repeat(64))))),
-            ("sums missing", |mock, _| mock.route(&format!("/download/secureplan-cad-v0.2.0/{SUMS_NAME}"), Reply::status(404))),
+            ("unlisted", |mock, _| mock.route(&format!("/download/secureplan-cad-v9.0.0/{SUMS_NAME}"), Reply::ok(format!("{}  other.msi\n", "a".repeat(64))))),
+            ("sums missing", |mock, _| mock.route(&format!("/download/secureplan-cad-v9.0.0/{SUMS_NAME}"), Reply::status(404))),
             ("asset missing", |mock, _| mock.route(&format!("/assets/{ASSET}?signature=x"), Reply::status(404))),
         ];
         for (name, break_it) in cases {
             let mock = Mock::start();
-            mock.release("0.2.0", ASSET, &bytes, 2 * HOUR);
+            mock.release("9.0.0", ASSET, &bytes, 2 * HOUR);
             let release = release_for(&mock);
             break_it(&mock, &bytes);
             let error = download(&mock.endpoints(), &release, &root, &AtomicBool::new(false)).expect_err(name);
@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
     fn a_redirect_to_another_host_scheme_or_port_is_refused() {
         let mock = Mock::start();
         let bytes = b"installer".to_vec();
-        mock.release("0.2.0", ASSET, &bytes, 2 * HOUR);
+        mock.release("9.0.0", ASSET, &bytes, 2 * HOUR);
         let release = release_for(&mock);
         let port = mock.base.rsplit(':').next().unwrap().parse::<u16>().unwrap();
         let root = test_root("redirects");
@@ -1238,14 +1238,14 @@ pub(crate) mod tests {
             "https://user@objects.githubusercontent.com/x",
             "https://evil.example/x",
             "https://raw.githubusercontent.com/x",
-            "https://github.com/vizmo-vms/OpenCADStudio/releases/download/secureplan-cad-v0.2.0/SHA256SUMS",
+            "https://github.com/vizmo-vms/OpenCADStudio/releases/download/secureplan-cad-v9.0.0/SHA256SUMS",
             "https://api.github.com/repos/vizmo-vms/OpenCADStudio/releases/latest",
         ] {
             assert!(!github_redirect_allowed(&parse(refused)), "{refused}");
         }
         // The first request goes only to the fork's release paths.
         let github = Endpoints::github();
-        assert!(github.allowed(&parse(&format!("{DOWNLOAD_BASE}/secureplan-cad-v0.2.0/{ASSET}"))));
+        assert!(github.allowed(&parse(&format!("{DOWNLOAD_BASE}/secureplan-cad-v9.0.0/{ASSET}"))));
         assert!(github.allowed(&parse(&github.latest)));
         assert!(!github.allowed(&parse("https://github.com/other/repo/releases/download/x/y")));
         // A GitHub download's redirect hops use the asset-host rule.
@@ -1266,7 +1266,7 @@ pub(crate) mod tests {
     #[test]
     fn a_cancelled_download_keeps_nothing() {
         let mock = Mock::start();
-        mock.release("0.2.0", ASSET, b"bytes", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"bytes", 2 * HOUR);
         let root = test_root("cancel");
         let error = download(&mock.endpoints(), &release_for(&mock), &root, &AtomicBool::new(true)).unwrap_err();
         assert_eq!(error, CANCELLED);
@@ -1313,7 +1313,7 @@ pub(crate) mod tests {
     fn an_unpaired_copy_updates_through_the_whole_flow() {
         let mock = Mock::start();
         let bytes = vec![3u8; 50_000];
-        mock.release("0.2.0", ASSET, &bytes, 2 * HOUR);
+        mock.release("9.0.0", ASSET, &bytes, 2 * HOUR);
         let root = test_root("app-flow");
         let mut app = OpenCADStudio::new_for_test();
         use_mock(&mut app, &mock, &root);
@@ -1321,7 +1321,7 @@ pub(crate) mod tests {
 
         let _ = app.dispatch_command("SECUREPLANUPDATE");
         let Some(Dialog::Update(update)) = &app.secureplan.dialog else { panic!("the notes open on a manual check") };
-        assert_eq!(update.release.version, "0.2.0");
+        assert_eq!(update.release.version, "9.0.0");
         assert!(update.notes.iter().any(|line| line.contains("Faster Apply")));
         assert!(app.secureplan_window_title().ends_with("(update available)"));
 
@@ -1337,7 +1337,7 @@ pub(crate) mod tests {
         let plans = launched(&app);
         assert_eq!(plans.len(), 1, "the helper starts as the application exits");
         let plan = &plans[0];
-        assert_eq!(plan.version, "0.2.0");
+        assert_eq!(plan.version, "9.0.0");
         assert_eq!(plan.parent_pid, std::process::id());
         assert_eq!(plan.install, update_helper::Install::Dmg { dmg: staged.file.clone(), app: root.join("Applications/SecurePlan CAD.app") });
         let written: update_helper::Plan = serde_json::from_slice(&std::fs::read(staged.dir.join("update-plan.json")).unwrap()).unwrap();
@@ -1348,7 +1348,7 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_download_leaves_nothing_to_install() {
         let mock = Mock::start();
-        mock.release("0.2.0", ASSET, b"the real installer", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"the real installer", 2 * HOUR);
         mock.route(&format!("/assets/{ASSET}?signature=x"), Reply::ok(b"the fake installer".to_vec()));
         let root = test_root("app-refused");
         let mut app = OpenCADStudio::new_for_test();
@@ -1369,7 +1369,7 @@ pub(crate) mod tests {
     #[test]
     fn a_copy_that_cannot_replace_itself_refuses_before_downloading() {
         let mock = Mock::start();
-        mock.release("0.2.0", ASSET, b"bytes", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"bytes", 2 * HOUR);
         let root = test_root("app-target");
         let mut app = OpenCADStudio::new_for_test();
         use_mock(&mut app, &mock, &root);
@@ -1395,11 +1395,11 @@ pub(crate) mod tests {
             assert_eq!(app.command_line.history.len(), before, "{status} was not silent");
             assert!(app.secureplan.dialog.is_none());
         }
-        mock.release("0.2.0", ASSET, b"bytes", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"bytes", 2 * HOUR);
         let _ = app.update(Message::SecurePlan(Msg::UpdateDue));
         let _ = app.update(Message::SecurePlan(Msg::UpdateDue));
         assert!(app.secureplan.dialog.is_none(), "an automatic check interrupted work");
-        assert_eq!(history(&app).matches("SecurePlan CAD 0.2.0 is available").count(), 1);
+        assert_eq!(history(&app).matches("SecurePlan CAD 9.0.0 is available").count(), 1);
         assert!(app.secureplan_window_title().ends_with("(update available)"));
         // The off switch stops the schedule; a manual check still works.
         let _ = app.dispatch_command("SECUREPLANAUTOUPDATE OFF");
@@ -1416,7 +1416,7 @@ pub(crate) mod tests {
         h.open_dxf();
         h.edit((0.0, 0.0), (10.0, 0.0));
         let mock = Mock::start();
-        mock.release("0.2.0", ASSET, b"installer", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"installer", 2 * HOUR);
         let root = test_root("app-unapplied");
         use_mock(&mut h.app, &mock, &root);
 
@@ -1468,7 +1468,7 @@ pub(crate) mod tests {
         let mut h = Harness::new("update_foreground");
         h.open_dxf();
         let mock = Mock::start();
-        mock.release("0.2.0", ASSET, b"installer", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"installer", 2 * HOUR);
         let root = test_root("app-foreground");
         use_mock(&mut h.app, &mock, &root);
         let _ = h.app.dispatch_command("SECUREPLANUPDATE");
@@ -1483,7 +1483,7 @@ pub(crate) mod tests {
         let _ = h.app.secureplan_update(job());
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "the ready dialog replaced the form");
         assert!(h.app.secureplan.update.staged.is_some());
-        assert!(history(&h.app).contains("0.2.0 is downloaded and checked"));
+        assert!(history(&h.app).contains("9.0.0 is downloaded and checked"));
         assert!(h.app.secureplan_window_title().ends_with("(update ready to install)"));
         h.key(DialogKey::Activate); // Enter, meant for the form
         assert!(!h.app.secureplan.update.install_pending() && launched(&h.app).is_empty(), "Enter installed the update");
@@ -1508,7 +1508,7 @@ pub(crate) mod tests {
     #[test]
     fn a_download_nobody_installs_goes_with_the_session() {
         let mock = Mock::start();
-        mock.release("0.2.0", ASSET, b"installer", 2 * HOUR);
+        mock.release("9.0.0", ASSET, b"installer", 2 * HOUR);
         let root = test_root("app-unused");
         let mut app = OpenCADStudio::new_for_test();
         use_mock(&mut app, &mock, &root);

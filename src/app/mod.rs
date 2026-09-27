@@ -426,6 +426,7 @@ pub(super) struct OpenCADStudio {
     start_section: StartSection,
     /// Widest natural single-row width of the Start-page action buttons,
     /// measured by `WrapFlow` so side lists collapse before those buttons wrap.
+    #[cfg_attr(feature = "secureplan", allow(dead_code))]
     start_action_w: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Read-only editor buffer backing the command-line history dropdown, so
     /// the log can be drag-selected across lines and copied (issue #232).
@@ -4402,10 +4403,16 @@ impl OpenCADStudio {
     /// Open the primary application window (maximized) and record its id.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open_main_window(&mut self) -> Task<Message> {
+        #[cfg(not(feature = "secureplan"))]
         use helpers::build_window_icon;
+        // SecurePlan CAD's window carries the Vizmo logo mark (DSK-08).
+        #[cfg(feature = "secureplan")]
+        let icon = secureplan::home::window_icon();
+        #[cfg(not(feature = "secureplan"))]
+        let icon = build_window_icon().and_then(|rgba| window::icon::from_rgba(rgba, 32, 32).ok());
         let (id, open_task) = window::open(window::Settings {
             maximized: true,
-            icon: build_window_icon().and_then(|rgba| window::icon::from_rgba(rgba, 32, 32).ok()),
+            icon,
             exit_on_close_request: false,
             // A Wayland compositor has no StartupWMClass to go on: it resolves a
             // window's dock icon by matching the window's app_id against the

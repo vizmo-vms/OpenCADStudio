@@ -149,11 +149,6 @@ jobs:
       - name: The build embeds its fork commit
         run: grep -aqF "$GITHUB_SHA" "target/${{ matrix.target }}/release/OpenCADStudio"
 
-      - name: Install librsvg (icon)
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: brew install librsvg
-
       - name: Assemble, sign and package
         run: packaging/secureplan/make-release-dmg.sh "target/${{ matrix.target }}/release" "${{ matrix.lipo }}" "SecurePlanCAD-macos-${{ matrix.arch }}.dmg"
 

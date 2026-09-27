@@ -564,8 +564,12 @@ impl OpenCADStudio {
 
     /// Hook for `update`: file-writing messages (Save, Save As, plotting,
     /// printing and exports) are refused while a bound document is active, or
-    /// open at all for the ones that cover every tab.
+    /// open at all for the ones that cover every tab. Nothing opens, creates
+    /// or saves a drawing outside a session (DSK-08).
     pub(crate) fn secureplan_blocks_message(&mut self, message: &Message) -> bool {
+        if self.secureplan_refuses_standalone(message) {
+            return true;
+        }
         let active = matches!(
             message,
             Message::SaveFile
@@ -1055,7 +1059,7 @@ impl OpenCADStudio {
         let bound = self.secureplan_active_bound()?;
         let tab = self.tabs.get(self.active_tab)?;
         let dot = if tab.dirty || bound.unapplied() { "● " } else { "" };
-        Some(format!("{dot}{} — SecurePlan — {} {}", bound.label.expose(), super::APP_NAME, super::VERSION))
+        Some(format!("{dot}{} — {}", bound.label.expose(), super::APP_NAME))
     }
 }
 
@@ -2028,13 +2032,13 @@ pub(crate) mod tests {
         assert_eq!(
             labels,
             [
-                "Import drawing",
+                "Open drawing",
                 "Align",
                 "Apply",
                 "Convert selection",
                 "Design overlay",
-                "Trusted websites",
-                "Revoke trust",
+                "Allowed websites",
+                "Remove website",
                 "Developer origins",
                 "Check for updates",
                 "Automatic update checks",

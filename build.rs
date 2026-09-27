@@ -119,12 +119,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OCS_PATREON_TOKEN");
 
     // Release builds generate the icon before compiling.
+    // SecurePlan CAD carries the committed Vizmo icon instead (DSK-08).
     #[cfg(windows)]
     {
-        println!("cargo:rerun-if-changed=packaging/windows/AppIcon.ico");
-        if Path::new("packaging/windows/AppIcon.ico").exists() {
+        let icon = if std::env::var_os("CARGO_FEATURE_SECUREPLAN").is_some() {
+            "packaging/secureplan/AppIcon.ico"
+        } else {
+            "packaging/windows/AppIcon.ico"
+        };
+        println!("cargo:rerun-if-changed={icon}");
+        if Path::new(icon).exists() {
             let mut res = winresource::WindowsResource::new();
-            res.set_icon("packaging/windows/AppIcon.ico");
+            res.set_icon(icon);
             res.set("ProductVersion", &full_version);
             res.set("FileVersion", &app_version);
             if let Err(e) = res.compile() {
