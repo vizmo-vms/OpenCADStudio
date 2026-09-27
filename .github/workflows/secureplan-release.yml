@@ -290,13 +290,6 @@ jobs:
           name: secureplan-cad-release
           path: dist
 
-      - name: Verify the assets again
-        working-directory: dist
-        run: |
-          set -euo pipefail
-          test "$(ls | wc -l)" -eq 5
-          sha256sum -c SHA256SUMS
-
       - name: Write the release notes
         run: |
           {
@@ -308,51 +301,9 @@ jobs:
             echo "- Check a download with \`sha256sum -c SHA256SUMS --ignore-missing\`."
           } > release-notes.md
 
-      - name: The version is newer than the latest release
-        run: |
-          set -euo pipefail
-          latest="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)"
-          python3 packaging/secureplan/release_order.py "$TAG" "$latest"
-
-      - name: Create the draft release
-        run: |
-          set -euo pipefail
-          existing="$(gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
-          if [ -n "$existing" ]; then
-            echo "::error::a release (possibly a draft) for $TAG already exists; delete it or release a new version"
-            exit 1
-          fi
-          gh release create "$TAG" --draft --verify-tag --title "SecurePlan CAD $VERSION" --notes-file release-notes.md
-
-      - name: Upload every asset to the draft
-        run: gh release upload "$TAG" dist/SecurePlanCAD-macos-arm64.dmg dist/SecurePlanCAD-macos-x64.dmg dist/SecurePlanCAD-windows-x64.msi dist/SecurePlanCAD-source.tar.gz dist/SHA256SUMS
-
-      - name: Download the draft's assets and verify them
-        run: |
-          set -euo pipefail
-          mkdir draft
-          gh release download "$TAG" --dir draft
-          if [ "$(ls draft | sort)" != "$(ls dist | sort)" ]; then
-            echo "::error::the draft's assets differ: $(ls draft | tr '\n' ' ')"
-            exit 1
-          fi
-          cmp draft/SHA256SUMS dist/SHA256SUMS
-          (cd draft && sha256sum -c SHA256SUMS)
-
-      - name: Publish and mark latest (if still the newest)
-        run: |
-          set -euo pipefail
-          latest="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)"
-          python3 packaging/secureplan/release_order.py "$TAG" "$latest"
-          gh release edit "$TAG" --draft=false --prerelease=false --latest
-
-      - name: releases/latest serves this release
-        run: |
-          set -euo pipefail
-          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$TAG"
-          mkdir latest
-          for name in SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-source.tar.gz SHA256SUMS; do
-            curl -fsSL --retry 5 --retry-delay 10 -o "latest/$name" "https://github.com/$GH_REPO/releases/latest/download/$name"
-          done
-          (cd latest && sha256sum -c SHA256SUMS)
-          echo "Published $TAG and marked it latest." >> "$GITHUB_STEP_SUMMARY"
+      # Verify, check the order against releases/latest (404 means none; any
+      # other lookup failure stops), draft, upload, verify the draft, check
+      # the order again, publish and mark latest, check releases/latest.
+      # Tested with a stub gh: packaging/secureplan/test_publish_release.py.
+      - name: Publish
+        run: packaging/secureplan/publish-release.sh "$TAG" "$VERSION" dist release-notes.md

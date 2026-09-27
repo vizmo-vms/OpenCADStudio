@@ -15,7 +15,7 @@ WORKFLOW = pathlib.Path(__file__).resolve().parents[2] / ".github/workflows/secu
 class VersionOrder(unittest.TestCase):
     def test_only_a_strictly_newer_release_may_be_published(self):
         allowed = [
-            ("secureplan-cad-v0.1.0", ""),
+            ("secureplan-cad-v0.1.0", release_order.NONE),
             ("secureplan-cad-v0.1.1", "secureplan-cad-v0.1.0"),
             ("secureplan-cad-v0.10.0", "secureplan-cad-v0.9.0"),
             ("secureplan-cad-v1.0.0", "secureplan-cad-v0.99.99"),
@@ -29,19 +29,22 @@ class VersionOrder(unittest.TestCase):
             ("secureplan-cad-v0.9.0", "secureplan-cad-v0.10.0"),
             ("secureplan-cad-v0.1.9", "secureplan-cad-v0.1.10"),
             ("secureplan-cad-v0.2.0", "v2026.38"),  # latest outside the scheme
-            ("v0.2.0", ""),
-            ("secureplan-cad-v256.0.0", ""),
-            ("secureplan-cad-v0.02.0", ""),
-            ("secureplan-cad-v0.2", ""),
+            ("secureplan-cad-v0.2.0", ""),  # an empty lookup is not "no release"
+            ("v0.2.0", release_order.NONE),
+            ("secureplan-cad-v256.0.0", release_order.NONE),
+            ("secureplan-cad-v0.02.0", release_order.NONE),
+            ("secureplan-cad-v0.2", release_order.NONE),
         ]
         for candidate, latest in refused:
             self.assertFalse(release_order.may_publish(candidate, latest)[0], (candidate, latest))
 
     def test_the_command_line_exit_codes(self):
         self.assertEqual(release_order.main(["x", "secureplan-cad-v0.2.0", "secureplan-cad-v0.1.0"]), 0)
-        self.assertEqual(release_order.main(["x", "secureplan-cad-v0.2.0", ""]), 0)
-        self.assertEqual(release_order.main(["x", "secureplan-cad-v0.2.0"]), 0)
+        self.assertEqual(release_order.main(["x", "secureplan-cad-v0.2.0", "--none"]), 0)
         self.assertEqual(release_order.main(["x", "secureplan-cad-v0.1.0", "secureplan-cad-v0.2.0"]), 1)
+        # A lookup that produced nothing, or no lookup at all, is refused.
+        self.assertEqual(release_order.main(["x", "secureplan-cad-v0.2.0", ""]), 2)
+        self.assertEqual(release_order.main(["x", "secureplan-cad-v0.2.0"]), 2)
         self.assertEqual(release_order.main(["x"]), 2)
 
 
@@ -70,16 +73,13 @@ class PublicationOrder(unittest.TestCase):
         self.assertNotIn("${{", match.group(1), "one group for every tag")
         self.assertEqual(match.group(2), "false")
 
-    def test_the_order_is_checked_before_the_draft_and_again_before_promotion(self):
-        checks = [m.start() for m in re.finditer(r"release_order\.py", self.publish)]
-        create = self.publish.index("gh release create")
-        promote = self.publish.index("gh release edit")
-        self.assertIn("--latest", self.publish[promote:].splitlines()[0])
-        self.assertTrue(checks and checks[0] < create, "checked before the draft is created")
-        self.assertTrue(any(create < c < promote for c in checks), "checked again just before it is marked latest")
-        # The second check is in the same step as the promotion.
-        step = self.publish[:promote].rsplit("      - name:", 1)[1]
-        self.assertIn("release_order.py", step)
+    def test_the_publish_job_runs_the_tested_script_and_nothing_else_publishes(self):
+        self.assertIn("packaging/secureplan/publish-release.sh", self.publish)
+        self.assertNotIn("|| true", self.text, "a failure must never be ignored")
+        other = self.text.replace(self.publish, "")
+        for command in ("gh release", "gh api"):
+            self.assertNotIn(command, other, f"{command} outside the publish job")
+            self.assertNotIn(command, self.publish, f"{command} outside the tested script")
 
     def test_only_a_tag_push_can_publish(self):
         condition = re.search(r"\n    if: (.*)", self.publish).group(1)

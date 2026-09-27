@@ -1343,7 +1343,7 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
                 return Err(ApplyError::new(
                     ErrorCode::WriterError,
                     format!(
-                        "SecurePlan CAD cannot write {label}, this drawing's version, so the edited drawing cannot be applied. Undo the edits to apply the drawing unchanged, or import it saved as {} R14 or later.",
+                        "SecurePlan CAD cannot write {label}, this drawing's version, so a changed drawing cannot be applied, even after undoing the changes. To apply it unchanged, close the drawing, choose Discard edits, and open the survey from SecurePlan again (or import the drawing again if SecurePlan does not have it yet). To keep changes, save the drawing as {} R14 or later in your CAD application and import that.",
                         format.ext().to_ascii_uppercase()
                     ),
                 ));
@@ -1639,7 +1639,7 @@ pub(crate) mod tests {
             let error = build_outputs(&snapshot(format, "AC1012", true), &plan).unwrap_err();
             assert_eq!(error.code, ErrorCode::WriterError, "{format:?}");
             let label = format!("{} R13 (AC1012)", format.ext().to_ascii_uppercase());
-            assert!(error.message.contains(&label) && error.message.contains("R14 or later"), "{}", error.message);
+            assert!(error.message.contains(&label) && error.message.contains("R14 or later") && error.message.contains("Discard edits"), "{}", error.message);
             let unedited = snapshot(format, "AC1012", false);
             let outputs = build_outputs(&unedited, &plan).expect("an unedited R13 drawing applies");
             assert_eq!(outputs.drawing.bytes, unedited.loaded.as_ref().unwrap().bytes, "verbatim");

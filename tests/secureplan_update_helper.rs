@@ -138,6 +138,10 @@ mod mac {
 
     /// A signed app bundle whose executable appends `which` to `marker`.
     fn build_app(folder: &Path, version: &str, marker: &Path, which: &str) -> PathBuf {
+        build_app_as(folder, BUNDLE_ID, version, marker, which)
+    }
+
+    fn build_app_as(folder: &Path, bundle_id: &str, version: &str, marker: &Path, which: &str) -> PathBuf {
         let app = folder.join(DMG_APP);
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();
@@ -148,7 +152,7 @@ mod mac {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>fake</string>
-<key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
+<key>CFBundleIdentifier</key><string>{bundle_id}</string>
 <key>CFBundleName</key><string>SecurePlan CAD</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>{version}</string>
@@ -202,7 +206,20 @@ mod mac {
         dmg: PathBuf,
     }
 
+    /// What the disk image holds.
+    enum Image {
+        Good,
+        Unmountable,
+        OtherBundleId,
+        OtherVersion,
+        BrokenSignature,
+    }
+
     fn setup(tag: &str, damaged: bool) -> Setup {
+        setup_with(tag, if damaged { Image::Unmountable } else { Image::Good })
+    }
+
+    fn setup_with(tag: &str, image: Image) -> Setup {
         let dir = temp(tag);
         let marker = dir.join("launches.txt");
         let applications = dir.join("Applications");
@@ -211,12 +228,32 @@ mod mac {
         let staging = dir.join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let dmg = staging.join("SecurePlanCAD-macos-arm64.dmg");
-        if damaged {
-            std::fs::write(&dmg, b"not a disk image").unwrap();
-        } else {
-            let source = dir.join("dmg-root");
-            std::fs::create_dir_all(&source).unwrap();
-            build_app(&source, "0.2.0", &marker, "new");
+        let source = dir.join("dmg-root");
+        std::fs::create_dir_all(&source).unwrap();
+        match image {
+            Image::Unmountable => std::fs::write(&dmg, b"not a disk image").unwrap(),
+            Image::Good => {
+                build_app(&source, "0.2.0", &marker, "new");
+            }
+            Image::OtherBundleId => {
+                build_app_as(&source, "com.example.other", "0.2.0", &marker, "new");
+            }
+            Image::OtherVersion => {
+                build_app(&source, "0.3.0", &marker, "new");
+            }
+            Image::BrokenSignature => {
+                // Signed, then changed: the signature no longer matches.
+                let app = build_app(&source, "0.2.0", &marker, "new");
+                let executable = app.join("Contents/MacOS/fake");
+                let mut bytes = std::fs::read(&executable).unwrap();
+                let inside = bytes.len() / 3; // within the hashed pages, before the signature
+                bytes[inside] ^= 0xff;
+                std::fs::write(&executable, bytes).unwrap();
+                let verify = Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(&app).status().unwrap();
+                assert!(!verify.success(), "the tampered app still verifies");
+            }
+        }
+        if !matches!(image, Image::Unmountable) {
             make_dmg(&source, &dmg);
         }
         Setup { dir, app, marker, dmg }
@@ -245,6 +282,30 @@ mod mac {
         let launches = std::fs::read_to_string(&setup.marker).unwrap();
         assert!(!launches.contains("old"), "the old app ran: {launches}");
         std::fs::remove_dir_all(&setup.dir).ok();
+    }
+
+    /// Images that mount but hold the wrong app are refused before the swap:
+    /// the installed app stays, is reopened, and nothing is left beside it.
+    #[test]
+    fn a_wrong_app_in_the_image_is_refused_and_the_app_kept() {
+        for (tag, image, reason) in [
+            ("mac-bundle-id", Image::OtherBundleId, "does not hold SecurePlan CAD 0.2.0"),
+            ("mac-version", Image::OtherVersion, "does not hold SecurePlan CAD 0.2.0"),
+            ("mac-signature", Image::BrokenSignature, "signature did not check out"),
+        ] {
+            let setup = setup_with(tag, image);
+            let mut parent = start(&setup);
+            parent.exit();
+            let outcome = parent.outcome(Duration::from_secs(180));
+            assert!(!outcome.installed && outcome.message.contains(reason), "{tag}: {outcome:?}");
+            assert_eq!(version_of(&setup.app), "0.1.0", "{tag}: the installed app changed");
+            let leftovers: Vec<_> = std::fs::read_dir(setup.app.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(leftovers.len(), 1, "{tag}: copies were left beside the app: {leftovers:?}");
+            assert!(wait_for_line(&setup.marker, Duration::from_secs(60), |line| line == "old").is_some(), "{tag}: the app was not reopened");
+            let launches = std::fs::read_to_string(&setup.marker).unwrap();
+            assert!(!launches.contains("new"), "{tag}: the refused app ran: {launches}");
+            std::fs::remove_dir_all(&setup.dir).ok();
+        }
     }
 
     #[test]
