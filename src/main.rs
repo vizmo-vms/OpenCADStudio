@@ -47,6 +47,13 @@ fn main() -> iced::Result {
                 eprintln!("{}", hardening::DISABLED);
                 std::process::exit(2);
             }
+            // No drawing is read or written outside a session (DSK-08).
+            if let Some(refusal) =
+                hardening::headless_file_refusal(args.export.is_some(), args.dwg_thumbnail.is_some(), args.script.is_some())
+            {
+                eprintln!("{refusal}");
+                std::process::exit(2);
+            }
         }
         // Test builds only: stdin pairing injection for the smoke tests.
         #[cfg(feature = "secureplan-test")]

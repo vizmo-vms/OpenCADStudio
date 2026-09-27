@@ -1202,6 +1202,7 @@ pub fn module_event_to_message(event: ModuleEvent) -> Message {
 
 /// Quick-access chrome button (New / Open / Save / Save As / Print) in the top
 /// strip: an SVG icon that dispatches a command string, with a hover tooltip.
+#[cfg_attr(feature = "secureplan", allow(dead_code))]
 pub(super) fn quick_access_btn<'a>(
     icon_bytes: &'static [u8],
     label: &'static str,

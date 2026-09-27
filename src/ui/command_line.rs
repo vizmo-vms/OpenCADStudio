@@ -282,7 +282,12 @@ impl CommandLine {
     pub fn new() -> Self {
         let mut cl = Self::default();
         cl.history_height = HISTORY_HEIGHT_DEFAULT;
-        cl.push_info(&crate::tr!("command-line", "ready"));
+        // SecurePlan CAD names upstream only in About (DSK-08).
+        if cfg!(feature = "secureplan") {
+            cl.push_info("SecurePlan CAD ready.");
+        } else {
+            cl.push_info(&crate::tr!("command-line", "ready"));
+        }
         cl.push_info(&crate::tr!("command-line", "hint"));
         cl
     }

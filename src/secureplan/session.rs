@@ -322,6 +322,10 @@ pub struct Bound {
     /// its request run, the tab's own flag records only changes made after
     /// the snapshot; the commit keeps those and drops this one.
     pub held_dirty: bool,
+    /// The page opened this survey for import (the legacy `import` intent):
+    /// Open drawing runs once the survey's drawing and any recovery offer
+    /// are settled, then this clears (PUB-01, F13).
+    pub import_pending: bool,
 }
 
 impl Bound {
@@ -359,6 +363,7 @@ impl Bound {
             unresolved: false,
             lost_entities: 0,
             held_dirty: false,
+            import_pending: false,
         }
     }
 
@@ -564,8 +569,17 @@ impl OpenCADStudio {
 
     /// Hook for `update`: file-writing messages (Save, Save As, plotting,
     /// printing and exports) are refused while a bound document is active, or
-    /// open at all for the ones that cover every tab.
+    /// open at all for the ones that cover every tab. Nothing opens, creates
+    /// or saves a drawing outside a session (DSK-08).
     pub(crate) fn secureplan_blocks_message(&mut self, message: &Message) -> bool {
+        if self.secureplan_refuses_standalone(message) {
+            return true;
+        }
+        // No plugin manager (DSK-02, DSK-08), from any button or command.
+        if matches!(message, Message::PluginManagerOpen) {
+            self.command_line.push_error("The plugin manager is not available in SecurePlan CAD.");
+            return true;
+        }
         let active = matches!(
             message,
             Message::SaveFile
@@ -828,6 +842,7 @@ impl OpenCADStudio {
             bound.generation += 1;
             // What the page asks for now (openSession), over the launch's.
             bound.intent = body["intent"].as_str().and_then(Intent::parse).unwrap_or(pending.intent);
+            bound.import_pending = bound.intent == Intent::Import;
             bound.mode = mode;
             bound.label = label.clone().into();
             bound.overlay = Some(overlay);
@@ -854,7 +869,7 @@ impl OpenCADStudio {
         super::testdriver_event("opened", if mode == Mode::Edit { "edit" } else { "view" });
 
         if keep_local {
-            return Task::none();
+            return self.secureplan_continue_import(tab_id);
         }
         if preserved == Preserve::Failed {
             self.secureplan_block_replacement(tab_id);
@@ -942,16 +957,20 @@ impl OpenCADStudio {
         if self.secureplan_offer_recovery(tab_id) {
             return Task::none();
         }
-        let wants_import = self
-            .secureplan
-            .sessions
-            .by_tab(tab_id)
-            .is_some_and(|b| b.intent == Intent::Import && b.mode == Mode::Edit);
+        self.secureplan_continue_import(tab_id)
+    }
+
+    /// Open drawing, once, for a survey the page opened for import: after
+    /// its drawing opened, after a reconnect that kept the local edits, or
+    /// after the recovery offer was answered.
+    pub(crate) fn secureplan_continue_import(&mut self, tab_id: u64) -> Task<Message> {
         let may_pick = super::native_dialogs_allowed() || cfg!(test);
-        if wants_import && may_pick {
-            return self.secureplan_start_import(tab_id);
+        let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) else { return Task::none() };
+        if !(bound.import_pending && bound.mode == Mode::Edit && may_pick) {
+            return Task::none();
         }
-        Task::none()
+        bound.import_pending = false;
+        self.secureplan_start_import(tab_id)
     }
 
     /// Put `document` into tab `index` as a freshly opened drawing, loaded
@@ -1055,7 +1074,7 @@ impl OpenCADStudio {
         let bound = self.secureplan_active_bound()?;
         let tab = self.tabs.get(self.active_tab)?;
         let dot = if tab.dirty || bound.unapplied() { "● " } else { "" };
-        Some(format!("{dot}{} — SecurePlan — {} {}", bound.label.expose(), super::APP_NAME, super::VERSION))
+        Some(format!("{dot}{} — {}", bound.label.expose(), super::APP_NAME))
     }
 }
 
@@ -2028,13 +2047,13 @@ pub(crate) mod tests {
         assert_eq!(
             labels,
             [
-                "Import drawing",
+                "Open drawing",
                 "Align",
                 "Apply",
                 "Convert selection",
                 "Design overlay",
-                "Trusted websites",
-                "Revoke trust",
+                "Allowed websites",
+                "Remove website",
                 "Developer origins",
                 "Check for updates",
                 "Automatic update checks",
@@ -3092,8 +3111,78 @@ pub(crate) mod tests {
         // A pick for a survey that can no longer import is refused.
         h.app.secureplan.sessions.by_tab_mut(b).unwrap().mode = Mode::View;
         let file = h.dir().join("picked.dxf");
-        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(b, Some(file.into()))));
+        let generation = h.app.secureplan.sessions.by_tab(b).unwrap().generation;
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(b, generation, Some(file.into()))));
         assert!(!pending(&h, b));
+    }
+
+    /// The legacy import intent is edit, then Open drawing, once: also when
+    /// a reconnect keeps the local edits, and once the recovery offer is
+    /// answered (PUB-01, F13).
+    #[test]
+    fn an_import_intent_opens_drawing_after_a_kept_reconnect_or_a_recovery_offer() {
+        const REPLACE: &str = "Replace the survey's drawing?";
+        // A dirty document on the same plan reconnects for import.
+        let mut h = Harness::new("import_kept");
+        h.open(Some(("plan.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", sample("openSession-edit")["cadPlan"].clone(), BASE, "edit");
+        h.edit((100.0, 100.0), (900.0, 900.0));
+        let edited = h.entity_count();
+        let first = h.session;
+        h.web.send(&json!({ "type": "close", "requestId": "x1", "reason": "pageClosed" }));
+        h.pump_until_closed(first);
+        h.pair_again(23, None);
+        h.open(Some(("plan.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", sample("openSession-edit")["cadPlan"].clone(), BASE, "import");
+        assert_eq!(h.entity_count(), edited, "the reconnect replaced the edits");
+        assert_eq!(h.dialog_title().as_deref(), Some(REPLACE), "the reconnect lost Open drawing");
+        h.key(DialogKey::Cancel);
+        assert!(!h.bound().import_pending, "Open drawing would run again");
+        assert_eq!(h.entity_count(), edited);
+
+        // A recovery offer first: each answer continues with Open drawing.
+        for (answer, expected) in [(0, REPLACE), (1, "Drawing imported"), (2, "Drawing imported")] {
+            let mut h = Harness::new(&format!("import_recovery_{answer}"));
+            let original = Drawing { bytes: Arc::new(testutil::synthetic_dxf()), name: "kept.dxf".to_string().into(), format: Format::Dxf, format_version: "AC1032".into() };
+            let entry = recovery::Entry { origin: ORIGIN.into(), survey: SURVEY.into(), base_identity: "none".into(), plan_version: None, saved: std::time::SystemTime::now(), drawing: original.clone(), original: Some(original), lost_entities: 0, alignment: None };
+            h.app.secureplan.recovery.save(&entry).unwrap();
+            let file = h.dir().join("picked.dxf");
+            std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+            h.app.secureplan.test_pick = Some(file);
+            h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
+            assert_eq!(h.dialog_title().as_deref(), Some("Recovered edits"));
+            // Restore, Discard, or Decide later (Escape).
+            match answer {
+                0 => h.key(DialogKey::Activate),
+                1 => {
+                    h.key(DialogKey::Next);
+                    h.key(DialogKey::Activate);
+                }
+                _ => h.key(DialogKey::Cancel),
+            }
+            assert_eq!(h.dialog_title().as_deref(), Some(expected), "answer {answer}");
+            assert!(!h.bound().import_pending);
+        }
+    }
+
+    /// A file chosen for an empty survey is not imported once a plan update
+    /// put a drawing there while the picker was open: the user never agreed
+    /// to replace it (PUB-01).
+    #[test]
+    fn a_pick_made_before_a_plan_update_replaces_nothing() {
+        let mut h = Harness::new("stale_pick");
+        h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        let tab_id = h.tab_id();
+        let opened_for = h.bound().generation;
+        plan_update(&mut h, Some(("restored.dxf", "image/vnd.dxf", testutil::synthetic_dxf())), BASE);
+        assert!(h.bound().loaded.is_some() && h.bound().busy.is_none(), "the plan update did not finish");
+        let file = h.dir().join("picked.dxf");
+        std::fs::write(&file, testutil::synthetic_dxf()).unwrap();
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(tab_id, opened_for, Some(file.clone().into()))));
+        assert!(h.bound().pending_original.is_none(), "the stale pick replaced the new drawing");
+        assert!(last_error(&h.app).contains("changed while you chose a file"), "{}", last_error(&h.app));
+        // A pick for the drawing there now goes ahead.
+        let current = h.bound().generation;
+        let _ = h.app.update(Message::SecurePlan(Msg::ImportPicked(tab_id, current, Some(file.into()))));
+        assert!(h.bound().pending_original.is_some());
     }
 
     #[test]

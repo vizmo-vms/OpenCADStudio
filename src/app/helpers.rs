@@ -578,6 +578,7 @@ pub(super) fn title_case_word(value: &str) -> String {
 /// the platform default rather than something invented here, which would put
 /// this back where it started.
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(feature = "secureplan", allow(dead_code))]
 pub(super) fn build_window_icon() -> Option<Vec<u8>> {
     const W: u32 = 32;
     static LOGO: &[u8] = include_bytes!("../../assets/logo.svg");

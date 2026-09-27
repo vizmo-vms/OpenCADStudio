@@ -302,7 +302,11 @@ impl OpenCADStudio {
             })
             .into()
         } else if tab.is_start {
-            start_page_view(
+            // SecurePlan CAD's home screen replaces the Start page (DSK-08).
+            #[cfg(feature = "secureplan")]
+            let page = self.secureplan_home_view();
+            #[cfg(not(feature = "secureplan"))]
+            let page = start_page_view(
                 &self.patrons,
                 &self.videos,
                 self.videos_loading,
@@ -315,7 +319,8 @@ impl OpenCADStudio {
                 &self.recent_limit_input,
                 self.start_action_w.clone(),
                 self.start_section,
-            )
+            );
+            page
         } else if is_paper {
             shader(ViewportPane::model(
                 &tab.scene,
@@ -2121,7 +2126,9 @@ bg={bg_ms:.1}ms n={view_count}"
             // Clean-screen mode drops the ribbon for a full-canvas view; the
             // status bar stays so the mode can be toggled back off.
             let mut col = column![];
-            if !self.clean_screen {
+            // SecurePlan CAD's home screen has no ribbon tools (DSK-08).
+            let secureplan_home = cfg!(feature = "secureplan") && self.tabs[self.active_tab].is_start;
+            if !self.clean_screen && !secureplan_home {
                 col = col.push(self.ribbon.view(
                     is_paper,
                     self.tabs[self.active_tab].is_start,
@@ -2137,8 +2144,12 @@ bg={bg_ms:.1}ms n={view_count}"
                     self.hovered_doc_tab,
                 ));
             }
-            col.push(center_stack)
-                .push({
+            let col = col.push(center_stack);
+            // Nor a status bar: it shows only in a survey session (DSK-08).
+            let col = if secureplan_home {
+                col
+            } else {
+                col.push({
                     let is_model = tab.scene.current_layout == "Model";
                     let scale_pill_enabled = is_model
                         || tab.scene.active_viewport.is_some()
@@ -2254,8 +2265,8 @@ bg={bg_ms:.1}ms n={view_count}"
                             }),
                     )
                 })
-                .width(Fill)
-                .height(Fill)
+            };
+            col.width(Fill).height(Fill)
         })
         .style(|theme: &Theme| container::Style {
             background: Some(Background::Color(theme.palette().background.base.color)),
@@ -3153,6 +3164,7 @@ pub(super) fn doc_tab_bar<'a>(
         );
     }
 
+    #[cfg(not(feature = "secureplan"))]
     let new_btn = button(text("+").size(14))
         .on_press(Message::TabNew)
         .height(iced::Length::Fixed(28.0))
@@ -3177,6 +3189,8 @@ pub(super) fn doc_tab_bar<'a>(
             }
         });
 
+    // SecurePlan CAD creates no drawings of its own (DSK-08).
+    #[cfg(not(feature = "secureplan"))]
     items.push(
         container(new_btn)
             .padding(iced::Padding {
@@ -3325,6 +3339,7 @@ fn start_action_shape(mut style: button::Style) -> button::Style {
     style
 }
 
+#[cfg_attr(feature = "secureplan", allow(dead_code))]
 pub(super) fn start_page_view<'a>(
     patrons: &'a [(String, i64)],
     videos: &'a [crate::videos::VideoEntry],

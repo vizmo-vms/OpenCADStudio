@@ -2,13 +2,13 @@
 # Build the release disk image of SecurePlan CAD for one macOS architecture
 # (DSK-05): "SecurePlan CAD.app" (bundle id in.vizmo.secureplan.cad, the
 # secureplan-cad: scheme, no document types), ad-hoc signed with
-# `codesign --force --deep -s -`, with an Applications shortcut.
+# `codesign --force --deep -s -`, with an Applications shortcut and the Vizmo
+# volume icon.
 #
 #   packaging/secureplan/make-release-dmg.sh <release build dir> <arm64|x86_64> <output .dmg>
 #
 # <release build dir> holds `OpenCADStudio` and `ocs_launcher` from
 # `cargo build --release --features secureplan --target <target>`.
-# Needs rsvg-convert (librsvg) for the icon.
 set -euo pipefail
 
 build_dir="${1:?usage: make-release-dmg.sh <build dir> <arm64|x86_64> <output .dmg>}"
@@ -19,7 +19,7 @@ version="$(sed -n 's/^pub const VERSION: &str = "\(.*\)";$/\1/p' "$root/src/secu
 test -n "$version"
 
 work="$(mktemp -d)"
-trap 'hdiutil detach "$work/mnt" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+trap 'hdiutil detach "$work/mnt" >/dev/null 2>&1 || true; hdiutil detach "$work/rwmnt" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 app="$work/root/SecurePlan CAD.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
@@ -36,15 +36,8 @@ for binary in "$app/Contents/MacOS/OpenCADStudio" "$app/Contents/MacOS/OpenCADSt
   fi
 done
 
-iconset="$work/AppIcon.iconset"
-mkdir -p "$iconset"
-for size in 16 32 64 128 256 512 1024; do
-  rsvg-convert -w "$size" -h "$size" "$root/assets/logo.svg" -o "$iconset/icon_${size}x${size}.png"
-done
-for base in 16 32 128 256 512; do
-  cp "$iconset/icon_$((base * 2))x$((base * 2)).png" "$iconset/icon_${base}x${base}@2x.png"
-done
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+# The Vizmo icon (DSK-08), made by packaging/secureplan/make-icons.py.
+cp "$root/packaging/secureplan/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 
 plist="$app/Contents/Info.plist"
 sed "s/__VERSION__/$version/g" "$root/packaging/Info.plist" > "$plist"
@@ -62,15 +55,26 @@ fi
 codesign --force --deep -s - --timestamp=none "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 ln -s /Applications "$work/root/Applications"
+# The volume's Vizmo icon (DSK-08): .VolumeIcon.icns at the volume root, and
+# the custom-icon Finder flag on the root, set on a writable image below.
+cp "$root/packaging/secureplan/AppIcon.icns" "$work/root/.VolumeIcon.icns"
 
 rm -f "$out"
+rw="$work/rw.dmg"
 for attempt in 1 2 3 4 5; do
-  if hdiutil create -volname "SecurePlan CAD" -srcfolder "$work/root" -ov -format UDZO "$out"; then
+  if hdiutil create -volname "SecurePlan CAD" -srcfolder "$work/root" -ov -format UDRW "$rw"; then
     break
   fi
   echo "hdiutil create failed (attempt $attempt); retrying in 5 s" >&2
   sleep 5
 done
+test -s "$rw"
+mkdir -p "$work/rwmnt"
+hdiutil attach -nobrowse -noautoopen -mountpoint "$work/rwmnt" "$rw"
+# FinderInfo: finderFlags (bytes 8-9) = kHasCustomIcon (0x0400).
+xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 "$work/rwmnt"
+hdiutil detach "$work/rwmnt"
+hdiutil convert "$rw" -format UDZO -o "$out"
 test -s "$out"
 hdiutil verify "$out"
 
@@ -78,5 +82,11 @@ hdiutil verify "$out"
 mkdir -p "$work/mnt"
 hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$work/mnt" "$out"
 codesign --verify --deep --strict "$work/mnt/SecurePlan CAD.app"
+cmp "$root/packaging/secureplan/AppIcon.icns" "$work/mnt/.VolumeIcon.icns"
+flags="$(xattr -px com.apple.FinderInfo "$work/mnt" | tr -d ' \n')"
+if (( (0x${flags:16:2} & 0x04) == 0 )); then
+  echo "error: the volume has no custom icon flag" >&2
+  exit 1
+fi
 hdiutil detach "$work/mnt"
 echo "Built $out (SecurePlan CAD $version, $arch, ad-hoc signed)."

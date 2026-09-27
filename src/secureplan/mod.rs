@@ -21,6 +21,9 @@ pub mod convert;
 pub mod export;
 pub mod handoff;
 pub mod hardening;
+pub mod home;
+#[cfg(test)]
+mod win_resources;
 pub mod import;
 pub mod layout;
 pub mod overlay;
@@ -53,7 +56,7 @@ pub const APP_NAME: &str = "SecurePlan CAD";
 pub const CONFIG_DIR_NAME: &str = "SecurePlanCAD";
 /// SecurePlan CAD's own semantic version, `MAJOR.MINOR.PATCH` with MAJOR ≤ 255
 /// (MSI ProductVersion). Independent of upstream's calendar version.
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 /// Bridge protocol version (BRG-07).
 pub const PROTOCOL: u32 = 1;
 /// Release tags are `secureplan-cad-vX.Y.Z` (DSK-05).
@@ -141,7 +144,7 @@ mod tests {
 
     #[test]
     fn version_is_a_valid_release_version() {
-        assert_eq!(release_tag(VERSION).as_deref(), Some("secureplan-cad-v0.1.0"));
+        assert_eq!(release_tag(VERSION).as_deref(), Some("secureplan-cad-v0.2.0"));
     }
 
     #[test]

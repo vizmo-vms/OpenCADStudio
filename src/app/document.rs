@@ -677,7 +677,10 @@ impl DocumentTab {
                 .to_string_lossy()
                 .to_string(),
             None => {
-                if self.is_start {
+                // SecurePlan CAD's home screen (DSK-08).
+                if self.is_start && cfg!(feature = "secureplan") {
+                    "Home".to_string()
+                } else if self.is_start {
                     t!("Start").into_owned()
                 } else {
                     self.tab_title.clone()

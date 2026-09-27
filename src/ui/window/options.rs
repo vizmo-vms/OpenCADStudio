@@ -348,8 +348,9 @@ pub fn view_window<'a>(
         Space::new().height(10),
         row![
             text(crate::t!("Installed plugins and their sources")).size(12).width(Fill),
+            // SecurePlan CAD has no plugin manager (DSK-08): disabled.
             button(text(crate::t!("Plugins…")).size(11))
-                .on_press(Message::PluginManagerOpen)
+                .on_press_maybe((!cfg!(feature = "secureplan")).then_some(Message::PluginManagerOpen))
                 .padding([4, 10])
                 .style(button::secondary),
         ]

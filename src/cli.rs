@@ -16,19 +16,47 @@ use std::sync::OnceLock;
 
 use clap::Parser;
 
-/// Open CAD Studio command-line options.
-#[derive(Parser, Debug, Default)]
-#[command(
-    name = "OpenCADStudio",
-    version = env!("OCS_FULL_VERSION"),
-    long_version = concat!(
-        env!("OCS_FULL_VERSION"),
+/// The name `--version` prints. SecurePlan CAD names itself and its own
+/// version, with upstream's in the long version (DSK-08); the usage line
+/// keeps the binary's file name.
+#[cfg(feature = "secureplan")]
+pub const PRODUCT_NAME: &str = "SecurePlan CAD";
+#[cfg(not(feature = "secureplan"))]
+pub const PRODUCT_NAME: &str = "OpenCADStudio";
+
+fn product_version() -> &'static str {
+    #[cfg(feature = "secureplan")]
+    return crate::app::secureplan::VERSION;
+    #[cfg(not(feature = "secureplan"))]
+    env!("OCS_FULL_VERSION")
+}
+
+fn long_version() -> String {
+    let details = concat!(
         "\nrevision: ", env!("OCS_GIT_REV"),
         "\ncommit date: ", env!("OCS_COMMIT_DATE"),
         "\nprofile: ", env!("OCS_BUILD_PROFILE"),
         "\nfeatures: ", env!("OCS_BUILD_FEATURES"),
-    ),
-    about = crate::t!("Open CAD Studio — 2D/3D CAD editor").into_owned(),
+    );
+    #[cfg(feature = "secureplan")]
+    return format!("{}\nbuilt on Open CAD Studio {}{details}", product_version(), env!("OCS_FULL_VERSION"));
+    #[cfg(not(feature = "secureplan"))]
+    format!("{}{details}", env!("OCS_FULL_VERSION"))
+}
+
+/// Open CAD Studio command-line options.
+#[derive(Parser, Debug, Default)]
+#[command(
+    name = "OpenCADStudio",
+    display_name = PRODUCT_NAME,
+    version = product_version(),
+    long_version = long_version(),
+    // SecurePlan CAD names upstream only in About (DSK-08).
+    about = if cfg!(feature = "secureplan") {
+        "SecurePlan CAD — the desktop CAD companion of SecurePlan".to_string()
+    } else {
+        crate::t!("Open CAD Studio — 2D/3D CAD editor").into_owned()
+    },
     long_about = None,
 )]
 pub struct Cli {

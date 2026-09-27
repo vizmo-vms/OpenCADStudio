@@ -15,6 +15,10 @@ impl OpenCADStudio {
     /// Record a freshly opened file at the top of the recents list. Returns
     /// the background task that decodes its thumbnail.
     pub(super) fn push_recent(&mut self, path: PathBuf) -> iced::Task<crate::app::Message> {
+        // SecurePlan CAD keeps no recent drawings (DSK-08).
+        if cfg!(feature = "secureplan") {
+            return iced::Task::none();
+        }
         self.recent_files.retain(|r| r != &path);
         self.recent_thumbs.remove(&path);
         self.recent_files.insert(0, path);
@@ -37,6 +41,10 @@ impl OpenCADStudio {
     /// late. Cached per path (a `None` result is cached too); safe to call
     /// repeatedly.
     pub(super) fn refresh_recent_thumbs(&mut self) -> iced::Task<crate::app::Message> {
+        // Nor reads any recent drawing's thumbnail (DSK-08).
+        if cfg!(feature = "secureplan") {
+            return iced::Task::none();
+        }
         let missing: Vec<std::path::PathBuf> = self
             .recent_files
             .iter()

@@ -43,6 +43,29 @@ fn info_card<'a>(
     .into()
 }
 
+/// The text About's **Copy info** puts on the clipboard. SecurePlan CAD
+/// names itself first and upstream after it (DSK-08).
+pub(crate) fn copy_info() -> String {
+    let details = format!(
+        "Revision: {}\nCommit date: {}\nProfile: {}\nFeatures: {}\nOS: {}\nArch: {}",
+        env!("OCS_GIT_REV"),
+        env!("OCS_COMMIT_DATE"),
+        env!("OCS_BUILD_PROFILE"),
+        env!("OCS_BUILD_FEATURES"),
+        platform_name(),
+        architecture_name(),
+    );
+    #[cfg(feature = "secureplan")]
+    return format!(
+        "{} v{}\nBuilt on Open CAD Studio v{}\n{details}",
+        crate::app::secureplan::APP_NAME,
+        crate::app::secureplan::VERSION,
+        env!("OCS_FULL_VERSION"),
+    );
+    #[cfg(not(feature = "secureplan"))]
+    format!("Open CAD Studio v{}\n{details}", env!("OCS_FULL_VERSION"))
+}
+
 pub(crate) fn platform_name() -> &'static str {
     #[cfg(target_arch = "wasm32")]
     {
@@ -140,6 +163,13 @@ pub fn view_window(
         .on_press(Message::AboutCopyInfo)
         .style(button::primary)
         .padding([6, 16]);
+
+    // SecurePlan CAD names its upstream, licence and source only here (DSK-08).
+    #[cfg(feature = "secureplan")]
+    let hero = {
+        let [product, licence] = crate::app::secureplan::home::about_lines();
+        column![hero, text(product).size(12), text(licence).size(12)].spacing(6)
+    };
 
     container(
         column![

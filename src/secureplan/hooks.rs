@@ -21,11 +21,19 @@
 //!   Keep);
 //! - `src/io/mod.rs`: the entity admission limit (DSK-01);
 //! - `src/app/view/mod.rs`: the subscription, the prompt-only window, the
-//!   viewport overlay layer and the dialog layer above the in-canvas modals;
+//!   viewport overlay layer, the dialog layer above the in-canvas modals, and
+//!   the home screen in place of the Start page, with no ribbon on it and no
+//!   new-tab button (DSK-08);
+//! - `src/app/document.rs`: the home tab's name; `src/app/mod.rs`: the
+//!   window icon (and the Start page's now unused parts in `src/app/mod.rs`,
+//!   `src/app/helpers.rs` and `src/ui/ribbon/widgets.rs`);
+//!   `src/ui/window/about.rs`: SecurePlan CAD's licence and source link;
+//!   `build.rs`: the Windows executable's icon (DSK-08);
 //! - `src/app/startup.rs`, `src/ui/window/options.rs`,
 //!   `src/io/file_association.rs`: no file-association prompt, control or
 //!   registration;
-//! - `src/ui/ribbon/mod.rs`: the SecurePlan ribbon tab;
+//! - `src/ui/ribbon/mod.rs`: the SecurePlan ribbon tab, and no New, Open,
+//!   Save, Save As or Print quick-access buttons (DSK-08);
 //! - `src/app/commands/mod.rs`: SecurePlan commands and the command guard;
 //! - `src/io/xref.rs`, `src/io/mod.rs`, `src/scene/model/image_model.rs`,
 //!   `src/scene/model/pdf_raster.rs`, `src/scene/text/font_face.rs`,
@@ -33,7 +41,16 @@
 //!   `src/scene/model/material_model.rs`, `src/scene/centerline.rs`,
 //!   `src/app/annotation_data.rs`: the external-resource guard;
 //! - `src/io/mod.rs`, `src/app/automation.rs`, `src/main.rs`: diagnostics
-//!   without file paths.
+//!   without file paths;
+//! - `src/main.rs`, `src/app/automation.rs`: release builds refuse
+//!   `--export`, `--dwg-thumbnail` and `--script` (DSK-08);
+//! - `src/app/startup.rs`: no donation prompt; `src/app/view/mod.rs`: no
+//!   status bar on the home screen (DSK-08);
+//! - `src/cli.rs`, `src/ui/command_line.rs`,
+//!   `src/ui/window/options/spacemouse.rs`, `src/input/spacemouse/navlib.rs`,
+//!   `src/io/pdf_export.rs`, `src/ui/window/plugin_manager.rs`,
+//!   `src/app/update/mod.rs`: "SecurePlan CAD" where upstream's name showed
+//!   outside About (DSK-08).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +63,7 @@ use super::bridge::{self, Bridge, BridgeEvent};
 use super::guards::{command_verb, CommandGuard};
 use super::pairing::{self, LaunchRequest};
 use super::redact::Redacted;
-use super::settings::{self, Settings};
+use super::settings::{self, is_built_in, Settings, BUILT_IN_ORIGIN};
 use super::trust::{Decision, PromptButton, Trust};
 use super::ui::trust_dialog::{self, DialogKey};
 use super::ui::{Action, Dialog};
@@ -79,8 +96,9 @@ pub enum Msg {
     ExportPicked(u64, super::export::JobKey, Option<Redacted<PathBuf>>),
     /// An export was written to its file, on a worker.
     ExportSaved(super::export::SaveDone),
-    /// The import file dialog closed (tab id, chosen file).
-    ImportPicked(u64, Option<Redacted<PathBuf>>),
+    /// The import file dialog closed (tab id, the drawing generation it was
+    /// opened for, chosen file).
+    ImportPicked(u64, u64, Option<Redacted<PathBuf>>),
     /// Mouse input in a dialog field.
     FormInput(usize, String),
     FormCycle(usize),
@@ -154,6 +172,10 @@ pub struct State {
     pub quitting: bool,
     /// Updates from the fork's GitHub Releases (DSK-07).
     pub update: super::update::Updater,
+    /// No standalone CAD use (DSK-08): nothing opens, creates or saves a
+    /// drawing outside a session. Off only in unit tests, where upstream's
+    /// own tests open and save drawings of their own.
+    pub no_standalone: bool,
 }
 
 impl Default for State {
@@ -192,6 +214,7 @@ impl Default for State {
             notice: None,
             quitting: false,
             update: Default::default(),
+            no_standalone: !cfg!(test),
         };
         // Recovery copies older than 30 days go, with a notice (DSK-03).
         // Unit tests never touch the user's folder.
@@ -385,7 +408,7 @@ impl OpenCADStudio {
                     Task::none()
                 }
                 DialogKey::Activate | DialogKey::Space => {
-                    let accept = self.secureplan.trust.prompt().is_some_and(|p| p.focus == PromptButton::Trust);
+                    let accept = self.secureplan.trust.prompt().is_some_and(|p| p.focus == PromptButton::Allow);
                     self.secureplan_answer_trust(accept)
                 }
                 DialogKey::Cancel => self.secureplan_answer_trust(false),
@@ -453,15 +476,24 @@ impl OpenCADStudio {
                 self.secureplan_export_saved(done);
                 Task::none()
             }
-            Msg::ImportPicked(tab_id, Some(path)) => {
+            Msg::ImportPicked(tab_id, generation, Some(path)) => {
                 // The tab the picker was opened for, if it may still import.
                 if let Err(reason) = self.secureplan_can_edit_tab(tab_id) {
                     self.command_line.push_error(&reason);
                     return Task::none();
                 }
+                // The drawing the user agreed to replace, or the empty survey,
+                // is still the one there: nothing replaced it meanwhile (a
+                // plan update, a reconnect or a restore) (PUB-01).
+                if self.secureplan.sessions.by_tab(tab_id).is_some_and(|bound| bound.generation != generation) {
+                    self.command_line.push_error(
+                        "SecurePlan: the survey's drawing changed while you chose a file, so nothing was imported. Choose Open drawing again.",
+                    );
+                    return Task::none();
+                }
                 self.secureplan_import_path(tab_id, path.expose())
             }
-            Msg::ImportPicked(_, None) => Task::none(),
+            Msg::ImportPicked(_, _, None) => Task::none(),
             #[cfg(feature = "secureplan-test")]
             Msg::Driver(command) => self.secureplan_driver(command),
             Msg::Bridge(event) => self.secureplan_bridge_event(event),
@@ -486,6 +518,7 @@ impl OpenCADStudio {
             position: iced::window::Position::Centered,
             resizable: false,
             exit_on_close_request: false,
+            icon: super::home::window_icon(),
             ..Default::default()
         });
         self.secureplan.prompt_window = Some(id);
@@ -560,10 +593,9 @@ impl OpenCADStudio {
         let Some(bridge) = &self.secureplan.bridge else { return };
         let settings = &self.secureplan.settings;
         let allowed = settings
-            .trusted_origins
-            .iter()
+            .allowed_origins()
+            .into_iter()
             .filter(|origin| super::trust::origin_eligible(origin, settings.developer_loopback_origins))
-            .cloned()
             .collect();
         bridge.set_trusted_origins(allowed);
     }
@@ -706,7 +738,11 @@ impl OpenCADStudio {
         match (self.secureplan.trust.prompt(), &self.secureplan.dialog) {
             (Some(prompt), _) => trust_dialog::view(base, prompt),
             (None, Some(dialog)) => super::ui::view(base, dialog),
-            (None, None) => base,
+            // An empty survey offers Open drawing over its empty document.
+            (None, None) => match self.secureplan_empty_session_card() {
+                Some(card) => iced::widget::stack![base, card].into(),
+                None => base,
+            },
         }
     }
 
@@ -821,14 +857,17 @@ impl OpenCADStudio {
                     Task::none()
                 }
             }
+            // Answering the recovery offer continues an import the page
+            // asked for.
             Action::RecoveryRestore(tab_id) => {
                 self.secureplan_restore_recovery(tab_id);
-                Task::none()
+                self.secureplan_continue_import(tab_id)
             }
             Action::RecoveryDiscard(tab_id) => {
                 self.secureplan_discard_recovery(tab_id);
-                Task::none()
+                self.secureplan_continue_import(tab_id)
             }
+            Action::RecoveryLater(tab_id) => self.secureplan_continue_import(tab_id),
             Action::Repair(session, accept) => {
                 if let Some(bridge) = self.secureplan_bridge() {
                     bridge.confirm(session, accept);
@@ -836,6 +875,11 @@ impl OpenCADStudio {
                 Task::none()
             }
             Action::Command(command) => self.dispatch_command(command),
+            Action::ImportReplace(tab_id) => self.secureplan_pick_import(tab_id),
+            Action::ShowSurvey(tab_id) => match self.secureplan_tab_index(tab_id) {
+                Some(index) => self.update(Message::TabSwitch(index)),
+                None => Task::none(),
+            },
             Action::AlignConfirm => self.secureplan_confirm_align(),
             Action::ApplyConfirm => self.secureplan_confirm_apply(),
             Action::ApplyReset => {
@@ -872,37 +916,66 @@ impl OpenCADStudio {
             self.command_line.push_error(&refused.to_string());
             return Some(Task::none());
         }
+        // A recent-file open is refused before its path is looked at, so a
+        // network path is never touched (DSK-08).
+        if command.starts_with("OPEN_RECENT:") && self.secureplan_refuses_standalone(&Message::OpenRecent(Default::default())) {
+            return Some(Task::none());
+        }
         let argument = command.split_whitespace().nth(1);
         match command_verb(command).as_str() {
             // Registration as the .dwg/.dxf opener is not part of SecurePlan CAD (DSK-05).
             "FILEASSOC" => self.command_line.push_error("FILEASSOC is not available in SecurePlan CAD."),
+            // Upstream's donation, report, web-version, changelog and help
+            // pages: upstream appears only in About; and no plugin manager
+            // (DSK-08).
+            verb @ ("DONATE" | "REPORT" | "WEBVERSION" | "CHANGELOG" | "HELP" | "PLUGINS" | "PLUGINMANAGER") => {
+                self.command_line.push_error(&format!("{verb} is not available in SecurePlan CAD."));
+            }
+            // "Allowed websites" (BRG-02): the list, also as a dialog for the
+            // home screen's button.
             "SECUREPLANTRUST" => {
-                let origins = &self.secureplan.settings.trusted_origins;
-                let listing = if origins.is_empty() { "none".to_string() } else { origins.join(", ") };
-                self.command_line.push_output(&format!("SecurePlan trusted websites: {listing}"));
-                let developer = if self.secureplan.settings.developer_loopback_origins { "on" } else { "off" };
-                self.command_line.push_output(&format!("Developer loopback origins: {developer}"));
+                let settings = &self.secureplan.settings;
+                let listing = std::iter::once(format!("{BUILT_IN_ORIGIN} (built in)"))
+                    .chain(settings.trusted_origins.iter().cloned())
+                    .collect::<Vec<_>>();
+                let developer = if settings.developer_loopback_origins { "on" } else { "off" };
+                let developer = format!("Developer loopback origins (http://localhost, http://127.0.0.1): {developer}");
+                self.command_line.push_output(&format!("SecurePlan allowed websites: {}", listing.join(", ")));
+                self.command_line.push_output(&developer);
+                let mut lines = vec!["SecurePlan CAD connects only to these websites:".to_string()];
+                lines.extend(listing.iter().map(|origin| format!("• {origin}")));
+                lines.push(developer);
+                let mut buttons = Vec::new();
+                if !settings.trusted_origins.is_empty() {
+                    buttons.push(("Remove a website".to_string(), Action::Command("SECUREPLANREVOKE")));
+                }
+                buttons.push(("Close".to_string(), Action::Dismiss));
+                self.secureplan.dialog = Some(Dialog::choice("Allowed websites", lines, buttons));
             }
             "SECUREPLANREVOKE" => match argument {
+                Some(origin) if is_built_in(origin) => {
+                    self.command_line.push_error(&format!("{origin} is built in and cannot be removed."));
+                }
                 Some(origin) if self.secureplan.settings.revoke(origin) => {
                     self.secureplan_save_settings();
                     self.secureplan_sync_trust();
-                    self.command_line.push_output(&format!("SecurePlan no longer trusts {origin}."));
+                    self.command_line.push_output(&format!("SecurePlan no longer allows {origin}."));
                 }
-                // From the ribbon: list the trusted websites and start the
-                // command so the user types (or pastes) the one to revoke.
+                // From the ribbon: list the websites the user allowed and
+                // start the command so the user types (or pastes) the one to
+                // remove.
                 None => {
                     let origins = &self.secureplan.settings.trusted_origins;
                     if origins.is_empty() {
-                        self.command_line.push_output("SecurePlan trusts no websites.");
+                        self.command_line.push_output(&format!("No websites were added. {BUILT_IN_ORIGIN} is built in."));
                     } else {
-                        self.command_line.push_output(&format!("SecurePlan trusted websites: {}", origins.join(", ")));
-                        self.command_line.push_info("Type the website to revoke and press Enter.");
+                        self.command_line.push_output(&format!("Websites you allowed: {}", origins.join(", ")));
+                        self.command_line.push_info("Type the website to remove and press Enter.");
                         self.command_line.input = "SECUREPLANREVOKE ".to_string();
                         return Some(self.focus_cmd_input());
                     }
                 }
-                _ => self.command_line.push_error("Usage: SECUREPLANREVOKE <trusted website origin>"),
+                _ => self.command_line.push_error("Usage: SECUREPLANREVOKE <allowed website origin>"),
             },
             "SECUREPLANDEVORIGINS" => match argument.map(str::to_ascii_uppercase).as_deref() {
                 // From the ribbon: toggle.
@@ -923,8 +996,21 @@ impl OpenCADStudio {
             },
             // The SecurePlan tab's buttons as a keyboard menu with visible focus.
             "SECUREPLAN" => {
-                let mut buttons: Vec<(String, Action)> =
-                    super::ribbon::COMMANDS.iter().map(|(command, label, _)| (label.to_string(), Action::Command(command))).collect();
+                // The home screen offers only what needs no survey drawing.
+                // It lists the connected surveys first, as the home screen
+                // does, so the keyboard reaches them too (DSK-06).
+                let home = self.tabs[self.active_tab].is_start;
+                let surveys = if home { self.secureplan_connected_surveys() } else { Vec::new() };
+                let mut buttons: Vec<(String, Action)> = surveys
+                    .into_iter()
+                    .map(|(index, label, _)| (format!("Show {label}"), Action::ShowSurvey(self.tabs[index].id)))
+                    .collect();
+                buttons.extend(
+                    super::ribbon::COMMANDS
+                        .iter()
+                        .filter(|(command, ..)| !(home && super::ribbon::needs_drawing(command)))
+                        .map(|(command, label, _)| (label.to_string(), Action::Command(command))),
+                );
                 buttons.push(("Close".to_string(), Action::Dismiss));
                 self.secureplan.dialog = Some(Dialog::choice("SecurePlan", vec!["Choose a SecurePlan action.".to_string()], buttons));
             }
@@ -968,18 +1054,9 @@ impl OpenCADStudio {
         format!("{title}{}", self.secureplan_update_title_suffix())
     }
 
+    /// "SecurePlan CAD", and "<survey> — SecurePlan CAD" in a session (DSK-08).
     fn secureplan_window_title_without_update(&self) -> String {
-        if let Some(title) = self.secureplan_window_title_for_bound() {
-            return title;
-        }
-        let product = format!("{} {}", super::APP_NAME, super::VERSION);
-        match self.tabs.get(self.active_tab) {
-            Some(tab) => {
-                let dot = if tab.dirty { "● " } else { "" };
-                format!("{dot}{product} - {}", tab.tab_display_name())
-            }
-            None => product,
-        }
+        self.secureplan_window_title_for_bound().unwrap_or_else(|| super::APP_NAME.to_string())
     }
 }
 
@@ -1076,8 +1153,11 @@ mod tests {
 
     #[test]
     fn title_names_the_secureplan_product() {
-        let app = app_with_drawing();
-        assert!(app.secureplan_window_title().contains("SecurePlan CAD 0.1.0"));
+        // Outside a session the title is the product alone: no drawing name,
+        // no dirty marker, no version (DSK-08).
+        let mut app = app_with_drawing();
+        app.tabs[app.active_tab].dirty = true;
+        assert_eq!(app.secureplan_window_title(), "SecurePlan CAD");
     }
 
     #[test]
@@ -1177,6 +1257,38 @@ mod tests {
         assert!(matches!(opened, BridgeEvent::Opened { .. }));
         let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
         assert!(app.main_window.is_some(), "the editor opens with the session");
+    }
+
+    /// F13: https://secureplan.vizmo.dev pairs with no prompt, even from a
+    /// link start, and cannot be removed; an https look-alike still prompts
+    /// and an http one never pairs (BRG-02).
+    #[test]
+    fn the_built_in_website_pairs_without_a_prompt_and_cannot_be_removed() {
+        let (mut app, bridge, events, _) = link_started_app(94);
+        let request = launch(BUILT_IN_ORIGIN, 94);
+        assert_eq!(cold_start(&[launch_url(&request)], &app.secureplan.settings), ColdStart::Windowless);
+        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+        assert_eq!(app.secureplan.prompt_window, None, "the built-in website was prompted for");
+        assert!(!app.secureplan_dialog_open());
+        let _web = connect_web(bridge.port(), &request).expect("the built-in website pairs");
+        assert!(matches!(next_event(&events), BridgeEvent::Opened { .. }));
+
+        let _ = app.dispatch_command(&format!("SECUREPLANREVOKE {BUILT_IN_ORIGIN}"));
+        assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("built in")));
+        assert!(app.secureplan.settings.is_trusted(BUILT_IN_ORIGIN));
+        let _ = app.dispatch_command("SECUREPLANTRUST");
+        let Some(Dialog::Choice { title, lines, form }) = &app.secureplan.dialog else { panic!("no Allowed websites") };
+        assert_eq!(title, "Allowed websites");
+        assert!(lines.iter().any(|l| l.contains(BUILT_IN_ORIGIN) && l.contains("built in")), "{lines:?}");
+        assert!(form.buttons.iter().all(|(label, _)| label != "Remove a website"), "nothing the user added to remove");
+        app.secureplan.dialog = None;
+
+        let (mut app, _bridge, _events, _) = link_started_app(95);
+        let look_alike = launch("https://secureplan.vizmo.dev:8443", 95);
+        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&look_alike).into())));
+        assert!(app.secureplan.prompt_window.is_some(), "an https look-alike was not prompted for");
+        let plain = launch_url(&launch("http://secureplan.vizmo.dev", 96));
+        assert_eq!(cold_start(&[plain], &app.secureplan.settings), ColdStart::Exit, "an http look-alike may pair");
     }
 
     #[test]

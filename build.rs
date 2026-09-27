@@ -119,20 +119,42 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OCS_PATREON_TOKEN");
 
     // Release builds generate the icon before compiling.
+    // SecurePlan CAD carries the committed Vizmo icon instead (DSK-08).
     #[cfg(windows)]
     {
-        println!("cargo:rerun-if-changed=packaging/windows/AppIcon.ico");
-        if Path::new("packaging/windows/AppIcon.ico").exists() {
+        let icon = if std::env::var_os("CARGO_FEATURE_SECUREPLAN").is_some() {
+            "packaging/secureplan/AppIcon.ico"
+        } else {
+            "packaging/windows/AppIcon.ico"
+        };
+        println!("cargo:rerun-if-changed={icon}");
+        if Path::new(icon).exists() {
             let mut res = winresource::WindowsResource::new();
-            res.set_icon("packaging/windows/AppIcon.ico");
-            res.set("ProductVersion", &full_version);
-            res.set("FileVersion", &app_version);
+            res.set_icon(icon);
+            if std::env::var_os("CARGO_FEATURE_SECUREPLAN").is_some() {
+                // SecurePlan CAD's own name and version (DSK-08).
+                println!("cargo:rerun-if-changed=src/secureplan/mod.rs");
+                let source = std::fs::read_to_string("src/secureplan/mod.rs").expect("src/secureplan/mod.rs");
+                let (strings, numeric) = secureplan_win_resources(&source).expect("VERSION in src/secureplan/mod.rs");
+                for (key, value) in &strings {
+                    res.set(key, value);
+                }
+                res.set_version_info(winresource::VersionInfo::FILEVERSION, numeric);
+                res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, numeric);
+            } else {
+                res.set("ProductVersion", &full_version);
+                res.set("FileVersion", &app_version);
+            }
             if let Err(e) = res.compile() {
                 println!("cargo:warning=failed to embed Windows icon: {e}");
             }
         }
     }
 }
+
+// SecurePlan CAD's Windows version resource, shared with its test.
+#[cfg(windows)]
+include!("src/secureplan/win_resources.rs");
 
 /// Runs `git` with `args` and returns trimmed stdout, or `None` when git is
 /// missing, fails (no repository, unknown tag), or prints nothing.

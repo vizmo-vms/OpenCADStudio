@@ -471,9 +471,13 @@ fn registry_error_message(error: &str) -> (Cow<'static, str>, Cow<'static, str>)
     {
         (
             t!("Unable to verify the server certificate"),
-            t!(
-                "Open CAD Studio could not trust the certificate presented for the plugin registry. Check your system certificate and proxy settings, then retry."
-            ),
+            if cfg!(feature = "secureplan") {
+                "SecurePlan CAD could not trust the certificate presented for the plugin registry. Check your system certificate and proxy settings, then retry.".into()
+            } else {
+                t!(
+                    "Open CAD Studio could not trust the certificate presented for the plugin registry. Check your system certificate and proxy settings, then retry."
+                )
+            },
         )
     } else if error.contains("timed out") || error.contains("timeout") {
         (

@@ -14,11 +14,8 @@ if ($Version -notmatch '^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $windows = Join-Path $root 'packaging\windows'
-$icon = Join-Path $windows 'AppIcon.ico'
-if (-not (Test-Path $icon)) {
-  magick (Join-Path $root 'assets\logo.svg') -define icon:auto-resize=16,24,32,48,64,128,256 $icon
-  if ($LASTEXITCODE -ne 0) { throw 'magick failed' }
-}
+# The Vizmo icon (DSK-08), made by packaging/secureplan/make-icons.py.
+$icon = Join-Path $root 'packaging\secureplan\AppIcon.ico'
 $candle = Join-Path $env:WIX 'bin\candle.exe'
 $light = Join-Path $env:WIX 'bin\light.exe'
 $objects = Join-Path ([IO.Path]::GetTempPath()) ('secureplan-msi-' + [guid]::NewGuid().ToString('N'))

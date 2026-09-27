@@ -43,6 +43,12 @@ pub fn serve() {
 /// process exit code (0 on success). No window is created.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_headless(input: &std::path::Path, output: &std::path::Path) -> i32 {
+    // SecurePlan CAD release builds convert no drawings (DSK-08).
+    #[cfg(feature = "secureplan")]
+    if let Some(refusal) = crate::app::secureplan::hardening::headless_file_refusal(true, false, false) {
+        eprintln!("{refusal}");
+        return 2;
+    }
     let doc = match crate::io::load_file(input) {
         Ok(doc) => doc,
         Err(e) => {
