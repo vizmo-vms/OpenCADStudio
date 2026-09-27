@@ -1,14 +1,25 @@
 // Check for a newer published native release.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "secureplan")))]
 const RELEASES_API: &str =
     "https://api.github.com/repos/HakanSeven12/OpenCADStudio/releases/latest";
+#[cfg(not(feature = "secureplan"))]
 pub const RELEASES_PAGE: &str =
     "https://github.com/HakanSeven12/OpenCADStudio/releases/latest";
+/// SecurePlan CAD is released from the `vizmo-vms/OpenCADStudio` fork
+/// (DSK-07). Its updater (`secureplan::update`) makes the request itself,
+/// with the automatic-check setting, the platform asset and the checksum
+/// download; the upstream check below stays inert in that build.
+#[cfg(all(not(target_arch = "wasm32"), feature = "secureplan"))]
+pub(crate) const RELEASES_API: &str =
+    "https://api.github.com/repos/vizmo-vms/OpenCADStudio/releases/latest";
+#[cfg(feature = "secureplan")]
+pub const RELEASES_PAGE: &str =
+    "https://github.com/vizmo-vms/OpenCADStudio/releases/latest";
 
 /// Give release assets time to propagate before offering an update.
 #[cfg(not(target_arch = "wasm32"))]
-const MIN_RELEASE_AGE_SECS: u64 = 60 * 60;
+pub(crate) const MIN_RELEASE_AGE_SECS: u64 = 60 * 60;
 
 /// What `check_for_update` reports when a newer release exists.
 #[derive(Debug, Clone)]
@@ -39,9 +50,14 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch_latest_if_outdated() -> Option<UpdateInfo> {
     // SecurePlan CAD checks its own releases instead (DSK-07).
-    if cfg!(feature = "secureplan") {
-        return None;
-    }
+    #[cfg(feature = "secureplan")]
+    return None;
+    #[cfg(not(feature = "secureplan"))]
+    upstream_latest_if_outdated()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "secureplan")))]
+fn upstream_latest_if_outdated() -> Option<UpdateInfo> {
     let agent = crate::network::agent(std::time::Duration::from_secs(5));
     let body = agent
         .get(RELEASES_API)
@@ -95,7 +111,7 @@ fn fetch_latest_if_outdated() -> Option<UpdateInfo> {
 /// Only handles the fixed `YYYY-MM-DDTHH:MM:SSZ` format the GitHub API
 /// emits; returns `None` for anything else.
 #[cfg(not(target_arch = "wasm32"))]
-fn parse_iso8601_utc(s: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_utc(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
         || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
@@ -137,7 +153,7 @@ fn parse_iso8601_utc(s: &str) -> Option<u64> {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), any(test, not(feature = "secureplan"))))]
 fn is_newer(latest: &str, installed: &str) -> bool {
     let parse = |version: &str| {
         let version = version.trim_start_matches('v');

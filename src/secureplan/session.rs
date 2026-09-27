@@ -2027,7 +2027,19 @@ pub(crate) mod tests {
         let labels: Vec<&str> = form.buttons.iter().map(|(label, _)| label.as_str()).collect();
         assert_eq!(
             labels,
-            ["Import drawing", "Align", "Apply", "Convert selection", "Design overlay", "Trusted websites", "Revoke trust", "Developer origins", "Close"]
+            [
+                "Import drawing",
+                "Align",
+                "Apply",
+                "Convert selection",
+                "Design overlay",
+                "Trusted websites",
+                "Revoke trust",
+                "Developer origins",
+                "Check for updates",
+                "Automatic update checks",
+                "Close"
+            ]
         );
         assert_eq!(form.focus, 0, "focus starts on the first action");
         // Down to "Developer origins", then Enter.
@@ -2222,6 +2234,58 @@ pub(crate) mod tests {
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))));
         h.key(DialogKey::Activate);
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "the Apply dialog follows");
+    }
+
+    /// PUB-04 with an R13 drawing, through the real edit and undo commands:
+    /// undo still leaves the drawing changed (the edit counter moved), so
+    /// Apply is refused with advice that works: Discard edits and reopening
+    /// the survey reloads the stored drawing, which applies byte for byte.
+    #[test]
+    fn an_r13_edit_undone_is_still_refused_and_discard_and_reopen_applies_it() {
+        let r13 = crate::io::save_to_bytes(&testutil::synthetic_document(), "dwg", acadrust::DxfVersion::AC1012).unwrap();
+        assert_eq!(&r13[..6], b"AC1012");
+        // R13 headers declare no units ($INSUNITS came with R2000): choose mm.
+        let align_mm_and_open_apply = |h: &mut Harness| {
+            let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+            assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "no alignment form");
+            h.key(DialogKey::Right);
+            h.key(DialogKey::Activate);
+            assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "the Apply dialog follows");
+        };
+        let mut h = Harness::new("r13_undo");
+        h.open(Some(("r13.dwg", Format::Dwg, r13.clone())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        assert_eq!(h.bound().loaded.as_ref().map(|d| d.format_version.clone()).as_deref(), Some("AC1012"));
+        let before = h.entity_count();
+        assert_eq!(h.app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 1000,1000"}"#)["ok"], true);
+        assert_eq!(h.entity_count(), before + 1, "the line was drawn");
+        assert_eq!(h.app.automation_op(r#"{"op":"undo"}"#)["ok"], true);
+        assert_eq!(h.entity_count(), before, "the line was undone");
+        align_mm_and_open_apply(&mut h);
+        h.key(DialogKey::Activate);
+        let Some(Dialog::Choice { title, lines, .. }) = &h.app.secureplan.dialog else { panic!("Apply was not stopped") };
+        assert_eq!(title, "Apply stopped");
+        let message = &lines[0];
+        assert!(message.contains("DWG R13 (AC1012)") && message.contains("even after undoing"), "{message}");
+        assert!(message.contains("Discard edits") && message.contains("open the survey from SecurePlan again"), "{message}");
+        assert!(!message.contains("Undo the edits"), "{message}");
+        h.app.secureplan.dialog = None;
+
+        // The advice: close, Discard edits, open the survey again.
+        let tab_id = h.tab_id();
+        let index = h.app.active_tab;
+        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::CloseDiscard(tab_id))));
+        assert!(h.app.secureplan_tab_index(tab_id).is_none(), "closed");
+        let old = h.session;
+        h.pump_until_closed(old);
+        h.pair_again(41, Some(SURVEY));
+        h.open(Some(("r13.dwg", Format::Dwg, r13.clone())), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
+        align_mm_and_open_apply(&mut h);
+        h.key(DialogKey::Activate);
+        let (request, transfers) = h.receive("applyRequest");
+        let drawing = &transfers[&request["drawing"]["transferId"].as_u64().unwrap()];
+        assert_eq!(drawing.1, r13, "the stored R13 drawing is applied byte for byte");
+        assert_eq!(request["drawing"]["formatVersion"], "AC1012");
     }
 
     #[test]

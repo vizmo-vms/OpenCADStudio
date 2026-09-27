@@ -213,6 +213,13 @@ pub fn load_drawing(_name: &str, bytes: Vec<u8>) -> Result<(acadrust::CadDocumen
         }
     };
     document.source_path = None;
+    // R13 and R14 DWG layers have no plot flag (R2000 added it) and the
+    // reader leaves it off, which would publish nothing: they all plot.
+    if format == Format::Dwg && document.dwg_source_version.unwrap_or(document.version) < acadrust::DxfVersion::AC1015 {
+        for layer in document.layers.iter_mut() {
+            layer.is_plottable = true;
+        }
+    }
     let entities = document.entities().count();
     if entities == 0 {
         return Err(ImportError::new(ErrorCode::ImportFailed, "The drawing is empty."));
@@ -571,6 +578,22 @@ impl OpenCADStudio {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// R13/R14 DWGs carry no layer plot flag; read, every layer plots, so
+    /// their content is published (and can be aligned).
+    #[test]
+    fn pre_r2000_dwg_layers_plot() {
+        for version in [acadrust::DxfVersion::AC1012, acadrust::DxfVersion::AC1014] {
+            let bytes = crate::io::save_to_bytes(&testutil::synthetic_document(), "dwg", version).unwrap();
+            let (document, report) = load_drawing("old.dwg", bytes).unwrap();
+            assert_eq!(report.version, version.as_str());
+            assert!(document.layers.iter().all(|layer| layer.is_plottable), "{version:?}: a layer does not plot");
+            let mut scene = crate::scene::Scene::new();
+            scene.document = document;
+            scene.rebuild_derived_caches();
+            assert!(super::super::publish::visible_extents(&scene).is_some(), "{version:?}: nothing would be published");
+        }
+    }
     use crate::app::secureplan::testutil;
 
     #[test]

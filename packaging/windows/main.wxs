@@ -2,8 +2,9 @@
 <!-- SecurePlan CAD: a per-user install that needs no administrator rights,
      with its own identity (UpgradeCode, Add/Remove Programs entry, install
      folder). It registers no .dwg/.dxf associations and installs no
-     thumbnail extension; the installer registers only the secureplan-cad:
-     scheme (release workflow). -->
+     thumbnail extension; it registers only the secureplan-cad: link scheme,
+     for the current user (HKCU\Software\Classes), removed on uninstall
+     (DSK-04). -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
   <Product
     Id='*'
@@ -66,6 +67,20 @@
         </Directory>
       </Directory>
 
+      <!-- The secureplan-cad: link scheme the SecurePlan web page opens
+           (DSK-04), per user, pointing at the installed executable. -->
+      <Component Id='UrlScheme' Guid='8abe5bc1-75e9-4d0e-915b-4f25a2abccc5'>
+        <RegistryKey Root='HKCU' Key='Software\Classes\secureplan-cad' ForceDeleteOnUninstall='yes'>
+          <RegistryValue Type='string' Value='URL:SecurePlan CAD' />
+          <RegistryValue Type='string' Name='URL Protocol' Value='' />
+          <RegistryValue
+            Key='shell\open\command'
+            Type='string'
+            Value='"[APPLICATIONROOTDIRECTORY]SecurePlanCAD.exe" "%1"'
+            KeyPath='yes' />
+        </RegistryKey>
+      </Component>
+
       <Directory Id='ProgramMenuFolder'>
         <Directory Id='ProgramMenuDir' Name='SecurePlan CAD'>
           <Component Id='ProgramMenuDirComp' Guid='9c316f44-162e-48eb-a4eb-f80e0f662bdd'>
@@ -112,6 +127,7 @@
     <Feature Id='Complete' Title='SecurePlan CAD' Level='1' Display='expand'>
       <ComponentRef Id='MainExecutable' />
       <ComponentRef Id='ProgramMenuDirComp' />
+      <ComponentRef Id='UrlScheme' />
       <Feature
         Id='DesktopShortcut'
         Title='!(loc.DesktopShortcut)'

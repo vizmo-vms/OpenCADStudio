@@ -49,6 +49,13 @@ pub enum Action {
     ExportCancel,
     /// Run a SecurePlan ribbon command (the keyboard menu of the tab).
     Command(&'static str),
+    /// The updater (DSK-07): **Update**, keep recovery copies and update,
+    /// Apply tab `.0` first, **Install and restart**, and cancel a download.
+    UpdateStart,
+    UpdateKeepAndStart,
+    UpdateApplyFirst(u64),
+    UpdateInstall,
+    UpdateCancelDownload,
 }
 
 /// A form field.
@@ -200,6 +207,7 @@ pub enum Dialog {
     Align(Box<align_dialog::AlignDialog>),
     Apply(Box<apply_dialog::ApplyDialog>),
     Export(Box<export_dialog::ExportDialog>),
+    Update(Box<update_dialog::UpdateDialog>),
 }
 
 impl Dialog {
@@ -228,6 +236,7 @@ impl Dialog {
             Dialog::Align(dialog) => &mut dialog.form,
             Dialog::Apply(dialog) => &mut dialog.form,
             Dialog::Export(dialog) => &mut dialog.form,
+            Dialog::Update(dialog) => &mut dialog.form,
         }
     }
 
@@ -237,6 +246,7 @@ impl Dialog {
             Dialog::Align(dialog) => &dialog.form,
             Dialog::Apply(dialog) => &dialog.form,
             Dialog::Export(dialog) => &dialog.form,
+            Dialog::Update(dialog) => &dialog.form,
         }
     }
 }
@@ -365,6 +375,7 @@ pub fn view<'a>(base: Element<'a, Message>, dialog: &'a Dialog) -> Element<'a, M
         Dialog::Align(dialog) => ("Align the drawing to the survey", align_dialog::view(dialog)),
         Dialog::Apply(dialog) => ("Apply to SecurePlan", apply_dialog::view(dialog)),
         Dialog::Export(dialog) => ("Export CAD with the SecurePlan design", export_dialog::view(dialog)),
+        Dialog::Update(dialog) => ("Update available", update_dialog::view(dialog)),
     };
     crate::ui::modal::modal(
         base,

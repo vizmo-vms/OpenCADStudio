@@ -3,8 +3,9 @@
 //! editor exactly as upstream draws and runs it.
 //!
 //! Hook points in upstream files:
-//! - `src/main.rs`: a process started by links alone decides before any
-//!   window whether to start, and then starts without the editor window;
+//! - `src/main.rs`: the update helper (`--secureplan-update-helper`) runs
+//!   before anything else; a process started by links alone decides before
+//!   any window whether to start, and then starts without the editor window;
 //! - `src/app/mod.rs`: the `Message::SecurePlan` variant, the `secureplan`
 //!   state field, the window title, and booting without the editor window;
 //! - `src/app/update/mod.rs`: `Message::SecurePlan` dispatch, keyboard
@@ -12,7 +13,10 @@
 //!   button, and refusing Save, Save As, plotting, printing and exports for a
 //!   bound document;
 //! - `src/app/update/file.rs`: no save of a bound document, a recovery copy
-//!   instead of its autosave, and recovery copies kept on exit;
+//!   instead of its autosave, recovery copies kept on exit, and a pending
+//!   update's helper started on exit;
+//! - `src/io/update_check.rs`: the fork's release endpoints (the upstream
+//!   check stays inert; `update` checks with the SecurePlan settings);
 //! - `src/app/update/command.rs`: closing a bound document (Apply, Discard or
 //!   Keep);
 //! - `src/io/mod.rs`: the entity admission limit (DSK-01);
@@ -82,6 +86,12 @@ pub enum Msg {
     FormCycle(usize),
     /// A dialog button.
     Action(Action),
+    /// Time for the automatic update check (startup, then daily; DSK-07).
+    UpdateDue,
+    /// An update check finished (`true` when the user asked for it).
+    UpdateChecked(bool, super::update::Checked),
+    /// An update download finished and was verified, or failed.
+    UpdateDownloaded(Result<super::update::Staged, String>),
     /// A `secureplan-test` stdin driver command.
     #[cfg(feature = "secureplan-test")]
     Driver(super::testdriver::Command),
@@ -142,6 +152,8 @@ pub struct State {
     pub notice: Option<String>,
     /// The main window is closing and SecurePlan drawings are being decided.
     pub quitting: bool,
+    /// Updates from the fork's GitHub Releases (DSK-07).
+    pub update: super::update::Updater,
 }
 
 impl Default for State {
@@ -179,6 +191,7 @@ impl Default for State {
             test_panic_next_job: false,
             notice: None,
             quitting: false,
+            update: Default::default(),
         };
         // Recovery copies older than 30 days go, with a notice (DSK-03).
         // Unit tests never touch the user's folder.
@@ -191,8 +204,32 @@ impl Default for State {
                     if deleted == 1 { "was" } else { "were" }
                 ));
             }
+            // What the update helper did before this start (DSK-07).
+            super::update::sweep_stale(&state.update.staging_root);
+            if let Some(outcome) = super::update_helper::result_path().and_then(|path| super::update_helper::take_outcome(&path)) {
+                state.show_update_outcome(outcome);
+            }
         }
         state
+    }
+}
+
+impl State {
+    /// At the first start after an update: a notice when it installed, the
+    /// reason in a dialog when it did not (DSK-07).
+    pub(crate) fn show_update_outcome(&mut self, outcome: super::update_helper::Outcome) {
+        if outcome.installed {
+            let line = format!("SecurePlan: {}", outcome.message);
+            self.notice = Some(match self.notice.take() {
+                Some(notice) => format!("{notice} {line}"),
+                None => line,
+            });
+        } else {
+            self.dialog = Some(Dialog::notice(
+                "Update not installed",
+                vec![format!("SecurePlan CAD {} was not installed.", outcome.version), outcome.message],
+            ));
+        }
     }
 }
 
@@ -378,6 +415,9 @@ impl OpenCADStudio {
                 Task::none()
             }
             Msg::Action(action) => self.secureplan_action(action),
+            Msg::UpdateDue => self.secureplan_check_updates(false),
+            Msg::UpdateChecked(manual, checked) => self.secureplan_update_checked(manual, checked),
+            Msg::UpdateDownloaded(result) => self.secureplan_update_downloaded(result),
             Msg::Tick => {
                 if let Some(notice) = self.secureplan.notice.take() {
                     self.command_line.push_info(&notice);
@@ -639,6 +679,10 @@ impl OpenCADStudio {
         if self.secureplan_dialog_open() {
             subscriptions.push(iced::event::listen_with(dialog_key));
         }
+        // Automatic update checks: at startup, then daily, unless turned off.
+        if self.secureplan.update.automatic(&self.secureplan.settings) {
+            subscriptions.push(Subscription::run(super::update::schedule));
+        }
         if !self.secureplan.sessions.bound.is_empty() || self.secureplan.notice.is_some() || !self.secureplan.sessions.deferred.is_empty() {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::SecurePlan(Msg::Tick)));
         }
@@ -806,6 +850,14 @@ impl OpenCADStudio {
                 self.secureplan_export_cancel();
                 Task::none()
             }
+            Action::UpdateStart => self.secureplan_update_start(),
+            Action::UpdateKeepAndStart => self.secureplan_update_keep_and_start(),
+            Action::UpdateApplyFirst(tab_id) => self.secureplan_update_apply_first(tab_id),
+            Action::UpdateInstall => self.secureplan_update_install(),
+            Action::UpdateCancelDownload => {
+                self.secureplan_update_cancel_download();
+                Task::none()
+            }
         };
         // An export dialog that waited for this one comes up now.
         self.secureplan_show_waiting_export();
@@ -884,6 +936,23 @@ impl OpenCADStudio {
                 Some(Some(kind)) => return Some(self.secureplan_open_convert(Some(kind))),
                 Some(None) => self.command_line.push_error("Usage: SECUREPLANCONVERT [WALLS|ROUTE]"),
             },
+            // Updates (DSK-07): check now; automatic checks on or off.
+            "SECUREPLANUPDATE" => return Some(self.secureplan_update_command()),
+            "SECUREPLANAUTOUPDATE" => match argument.map(str::to_ascii_uppercase).as_deref() {
+                None => {
+                    let on = self.secureplan.settings.update_checks_off;
+                    return self.secureplan_dispatch(if on { "SECUREPLANAUTOUPDATE ON" } else { "SECUREPLANAUTOUPDATE OFF" });
+                }
+                Some(value @ ("ON" | "OFF")) => {
+                    self.secureplan.settings.update_checks_off = value == "OFF";
+                    self.secureplan_save_settings();
+                    self.command_line.push_output(&format!(
+                        "Automatic update checks (at startup and daily): {}. SECUREPLANUPDATE checks now.",
+                        value.to_ascii_lowercase()
+                    ));
+                }
+                _ => self.command_line.push_error("Usage: SECUREPLANAUTOUPDATE ON|OFF"),
+            },
             "SECUREPLANOVERLAY" => {
                 self.secureplan.overlay_visible = !self.secureplan.overlay_visible;
                 let state = if self.secureplan.overlay_visible { "shown" } else { "hidden" };
@@ -895,6 +964,11 @@ impl OpenCADStudio {
     }
 
     pub(crate) fn secureplan_window_title(&self) -> String {
+        let title = self.secureplan_window_title_without_update();
+        format!("{title}{}", self.secureplan_update_title_suffix())
+    }
+
+    fn secureplan_window_title_without_update(&self) -> String {
         if let Some(title) = self.secureplan_window_title_for_bound() {
             return title;
         }
@@ -983,6 +1057,21 @@ mod tests {
         assert!(crate::io::file_association::register_as_handler().is_err());
         assert!(crate::io::file_association::unregister_handler().is_err());
         assert!(pollster::block_on(crate::io::file_association::set_default_app()).is_err());
+    }
+
+    #[test]
+    fn the_first_start_after_an_update_reports_its_outcome() {
+        use crate::app::secureplan::update_helper::Outcome;
+        let mut app = app_with_drawing();
+        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: true, message: "SecurePlan CAD was updated to 0.2.0.".into() });
+        assert!(app.secureplan.dialog.is_none(), "a successful update opens no dialog");
+        let _ = app.update(Message::SecurePlan(Msg::Tick));
+        let history: Vec<String> = app.command_line.history.iter().map(|entry| entry.text.clone()).collect();
+        assert!(history.iter().any(|line| line.contains("updated to 0.2.0")), "{history:?}");
+        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: false, message: "Windows Installer stopped with error 1603; SecurePlan CAD is unchanged.".into() });
+        let Some(Dialog::Choice { title, lines, .. }) = &app.secureplan.dialog else { panic!("no dialog for a failed update") };
+        assert_eq!(title, "Update not installed");
+        assert!(lines.iter().any(|line| line.contains("1603")), "{lines:?}");
     }
 
     #[test]
