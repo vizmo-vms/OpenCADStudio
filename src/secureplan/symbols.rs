@@ -80,6 +80,8 @@ pub struct WebSymbol {
     /// The label's top, below the device's centre.
     pub label_top: f64,
     pub label_size: f64,
+    /// The label's box width: longer labels wrap onto more lines.
+    pub label_width: f64,
     pub label_bold: bool,
 }
 
@@ -103,6 +105,7 @@ impl DeviceKind {
                 rotates: false,
                 label_top: 370.0,
                 label_size: 190.0,
+                label_width: 760.0,
                 label_bold: true,
             },
             DeviceKind::Equipment => WebSymbol {
@@ -113,6 +116,7 @@ impl DeviceKind {
                 rotates: true,
                 label_top: 400.0,
                 label_size: 180.0,
+                label_width: 840.0,
                 label_bold: false,
             },
             DeviceKind::Asset => WebSymbol {
@@ -123,6 +127,7 @@ impl DeviceKind {
                 rotates: true,
                 label_top: 420.0,
                 label_size: 180.0,
+                label_width: 920.0,
                 label_bold: false,
             },
         }
@@ -157,14 +162,44 @@ fn solid(loops: Vec<Vec<Vector2>>, color: Color) -> EntityType {
     on_layer_zero(EntityType::Hatch(hatch), color)
 }
 
-/// Points along a Bezier curve (`control`, without its start `from`), close
-/// enough that no point of the curve is further than `tolerance` from them
-/// (Wang's bound for uniform subdivision).
-fn flatten(from: Vector2, control: &[Vector2], tolerance: f64, out: &mut Vec<Vector2>) {
+/// Generated vertices an icon block's linework may have. The web's icons
+/// need at most a few thousand; more falls back to the standard symbol.
+pub const MAX_ICON_VERTICES: usize = 50_000;
+/// Generated vertices of all the icon blocks of one export together.
+pub const MAX_EXPORT_ICON_VERTICES: usize = 1_000_000;
+
+/// Where an icon is drawn in its block: a `size` square centred at
+/// (0, `centre_y`), y up.
+#[derive(Clone, Copy)]
+struct IconBox {
+    size: f64,
+    centre_y: f64,
+}
+
+impl IconBox {
+    /// How many straight segments stand in for a Bezier curve (`from`, then
+    /// `control`) so that it is within [`ICON_TOLERANCE_MM`] where it can be
+    /// seen: Wang's bound for uniform subdivision, from control points held
+    /// within one icon size of the box (the canvas shows only the box, so a
+    /// control point far outside cannot ask for more). At most 32 for a
+    /// cubic in the largest icon.
+    fn segments(&self, from: Vector2, control: &[Vector2]) -> usize {
+        if std::iter::once(&from).chain(control).any(|p| p.x.is_nan() || p.y.is_nan()) {
+            return 1;
+        }
+        let hold = |p: Vector2| Vector2::new(p.x.clamp(-self.size, self.size), p.y.clamp(self.centre_y - self.size, self.centre_y + self.size));
+        let points: Vec<Vector2> = std::iter::once(from).chain(control.iter().copied()).map(hold).collect();
+        let degree = (points.len() - 1) as f64;
+        let second = points.windows(3).map(|w| (w[0] - w[1] * 2.0 + w[2]).length()).fold(0.0, f64::max);
+        let segments = (degree * (degree - 1.0) / 8.0 * second / ICON_TOLERANCE_MM).sqrt().ceil();
+        if segments.is_finite() { (segments as usize).clamp(1, 256) } else { 1 }
+    }
+}
+
+/// `segments` points along a Bezier curve (`control`, without its start
+/// `from`), evenly in its parameter.
+fn flatten(from: Vector2, control: &[Vector2], segments: usize, out: &mut Vec<Vector2>) {
     let points: Vec<Vector2> = std::iter::once(from).chain(control.iter().copied()).collect();
-    let degree = (points.len() - 1) as f64;
-    let second = points.windows(3).map(|w| (w[0] - w[1] * 2.0 + w[2]).length()).fold(0.0, f64::max);
-    let segments = ((degree * (degree - 1.0) / 8.0 * second / tolerance).sqrt().ceil() as usize).clamp(1, 256);
     for step in 1..=segments {
         let t = step as f64 / segments as f64;
         // De Casteljau.
@@ -184,11 +219,8 @@ fn paint_color(paint: &usvg::Paint) -> Color {
     }
 }
 
-/// The icon's fills and strokes in block coordinates: the SVG stretched over
-/// a `size` square centred at (0, `centre_y`), y up.
-fn icon_linework(tree: &usvg::Tree, size: f64, centre_y: f64, out: &mut Vec<EntityType>) {
-    let (width, height) = (tree.size().width() as f64, tree.size().height() as f64);
-    let (kx, ky) = (size / width, size / height);
+/// The icon's visible paths.
+fn icon_paths(tree: &usvg::Tree) -> Vec<&usvg::Path> {
     fn walk<'a>(group: &'a usvg::Group, paths: &mut Vec<&'a usvg::Path>) {
         for node in group.children() {
             match node {
@@ -200,13 +232,65 @@ fn icon_linework(tree: &usvg::Tree, size: f64, centre_y: f64, out: &mut Vec<Enti
     }
     let mut paths = Vec::new();
     walk(tree.root(), &mut paths);
-    for path in paths {
+    paths
+}
+
+/// A path's points in block coordinates: the SVG stretched over `frame`.
+fn block_point(tree: &usvg::Tree, frame: IconBox, path: &usvg::Path) -> impl Fn(usvg::tiny_skia_path::Point) -> Vector2 {
+    let (width, height) = (tree.size().width() as f64, tree.size().height() as f64);
+    let transform = path.abs_transform();
+    move |mut p| {
+        transform.map_point(&mut p);
+        Vector2::new((p.x as f64 / width - 0.5) * frame.size, frame.centre_y - (p.y as f64 / height - 0.5) * frame.size)
+    }
+}
+
+/// How many vertices [`icon_block`] generates for `tree` drawn as `kind`,
+/// counted without generating them.
+pub fn icon_vertices(kind: DeviceKind, tree: &usvg::Tree) -> usize {
+    let web = kind.web();
+    let frame = IconBox { size: web.icon_size, centre_y: -web.icon_offset_y };
+    icon_paths(tree)
+        .into_iter()
+        .map(|path| {
+            let at = block_point(tree, frame, path);
+            let mut last = Vector2::new(0.0, 0.0);
+            let mut count = 0usize;
+            for segment in path.data().segments() {
+                use usvg::tiny_skia_path::PathSegment;
+                count += match segment {
+                    PathSegment::MoveTo(p) | PathSegment::LineTo(p) => {
+                        last = at(p);
+                        1
+                    }
+                    PathSegment::QuadTo(c, p) => {
+                        let (from, c) = (last, at(c));
+                        last = at(p);
+                        frame.segments(from, &[c, last])
+                    }
+                    PathSegment::CubicTo(c1, c2, p) => {
+                        let from = last;
+                        last = at(p);
+                        frame.segments(from, &[at(c1), at(c2), last])
+                    }
+                    PathSegment::Close => 0,
+                };
+            }
+            // A fill and a stroke each keep a copy.
+            count * (usize::from(path.fill().is_some()) + usize::from(path.stroke().is_some()))
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// The icon's fills and strokes in block coordinates: the SVG stretched over
+/// a `size` square centred at (0, `centre_y`), y up.
+fn icon_linework(tree: &usvg::Tree, size: f64, centre_y: f64, out: &mut Vec<EntityType>) {
+    let (width, height) = (tree.size().width() as f64, tree.size().height() as f64);
+    let (kx, ky) = (size / width, size / height);
+    let frame = IconBox { size, centre_y };
+    for path in icon_paths(tree) {
         let transform = path.abs_transform();
-        let at = |p: usvg::tiny_skia_path::Point| {
-            let mut p = p;
-            transform.map_point(&mut p);
-            Vector2::new((p.x as f64 / width - 0.5) * size, centre_y - (p.y as f64 / height - 0.5) * size)
-        };
+        let at = block_point(tree, frame, path);
         // Subpaths as polylines, and whether each is closed.
         let mut subpaths: Vec<(Vec<Vector2>, bool)> = Vec::new();
         for segment in path.data().segments() {
@@ -221,13 +305,15 @@ fn icon_linework(tree: &usvg::Tree, size: f64, centre_y: f64, out: &mut Vec<Enti
                 PathSegment::QuadTo(c, p) => {
                     if let Some((points, _)) = subpaths.last_mut() {
                         let from = *points.last().expect("a subpath starts with a point");
-                        flatten(from, &[at(c), at(p)], ICON_TOLERANCE_MM, points);
+                        let control = [at(c), at(p)];
+                        flatten(from, &control, frame.segments(from, &control), points);
                     }
                 }
                 PathSegment::CubicTo(c1, c2, p) => {
                     if let Some((points, _)) = subpaths.last_mut() {
                         let from = *points.last().expect("a subpath starts with a point");
-                        flatten(from, &[at(c1), at(c2), at(p)], ICON_TOLERANCE_MM, points);
+                        let control = [at(c1), at(c2), at(p)];
+                        flatten(from, &control, frame.segments(from, &control), points);
                     }
                 }
                 PathSegment::Close => {
@@ -417,16 +503,51 @@ mod tests {
         // A quarter circle as a cubic, radius 1000.
         let k = 0.5523 * 1000.0;
         let control = [Vector2::new(1000.0, k), Vector2::new(k, 1000.0), Vector2::new(0.0, 1000.0)];
+        let frame = IconBox { size: 1000.0, centre_y: 0.0 };
         let mut points = vec![Vector2::new(1000.0, 0.0)];
-        flatten(points[0], &control, ICON_TOLERANCE_MM, &mut points);
+        flatten(points[0], &control, frame.segments(points[0], &control), &mut points);
         assert!(points.len() > 4 && points.len() < 64, "{}", points.len());
         for pair in points.windows(2) {
             let middle = (pair[0] + pair[1]) * 0.5;
             assert!(1000.0 - middle.length() <= ICON_TOLERANCE_MM + 0.3, "{}", middle.length());
         }
         // A straight "curve" is one segment.
+        let straight = [Vector2::new(1.0, 0.0), Vector2::new(2.0, 0.0), Vector2::new(3.0, 0.0)];
         let mut line = vec![Vector2::new(0.0, 0.0)];
-        flatten(line[0], &[Vector2::new(1.0, 0.0), Vector2::new(2.0, 0.0), Vector2::new(3.0, 0.0)], ICON_TOLERANCE_MM, &mut line);
+        flatten(line[0], &straight, frame.segments(line[0], &straight), &mut line);
         assert_eq!(line.len(), 2);
+        // Control points far outside the icon cannot ask for more than the
+        // box needs: at most 32 segments for a cubic in the largest icon.
+        let largest = IconBox { size: 430.0, centre_y: 0.0 };
+        let absurd = [Vector2::new(1e12, -1e12), Vector2::new(-1e12, 1e12), Vector2::new(0.0, 0.0)];
+        assert!(largest.segments(Vector2::new(0.0, 0.0), &absurd) <= 32);
+        assert_eq!(largest.segments(Vector2::new(f64::NAN, 0.0), &absurd), 1, "nothing finite to draw");
+    }
+
+    /// An adversarial icon: one path of 10,000 cubics with absurd control
+    /// points (the review's case). The count matches what is generated and
+    /// is bounded by the icon's drawn size, not by the control points.
+    #[test]
+    fn generated_vertices_are_counted_and_bounded_by_the_icon_size() {
+        let tree = crate::app::secureplan::icons::parse_svg(super::super::icons::tests::CIRCLE_SVG.as_bytes()).unwrap();
+        for kind in DeviceKind::ALL {
+            let generated: usize = icon_block(kind, &tree, None)
+                .iter()
+                .skip(2)
+                .map(|e| match e {
+                    EntityType::LwPolyline(p) => p.vertices.len(),
+                    EntityType::Hatch(h) => h.paths.iter().flat_map(|p| &p.edges).map(|e| if let BoundaryEdge::Polyline(p) = e { p.vertices.len() } else { 0 }).sum(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(icon_vertices(kind, &tree), generated, "{kind:?}: counted as generated");
+        }
+        let d = format!("M0 0{}", "C1e9 0 0 1e9 0 0".repeat(10_000));
+        let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="{d}" fill="none" stroke="#fbfaf4"/></svg>"##);
+        assert!(svg.len() < crate::app::secureplan::icons::MAX_ICON_BYTES);
+        let tree = crate::app::secureplan::icons::parse_svg(svg.as_bytes()).expect("within the parse budgets");
+        let count = icon_vertices(DeviceKind::Asset, &tree);
+        assert!(count <= 1 + 10_000 * 32, "{count}");
+        assert!(count > MAX_ICON_VERTICES, "over the icon budget: the standard symbol");
     }
 }
