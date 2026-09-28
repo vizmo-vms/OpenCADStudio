@@ -278,11 +278,12 @@ fn write_json(stream: &mut TcpStream, value: &Value) -> std::io::Result<()> {
 }
 
 /// Open `dir/primary.lock`. On Unix the folder and the lock must belong to
-/// the current user and are made private to them (0700 and 0600), so no
-/// other user can open the lock and hold it to keep the window from opening.
-/// A lock that an earlier build left readable by others is replaced rather
-/// than tightened: a descriptor another user opened then keeps only the old
-/// file.
+/// the current user (otherwise nothing may start) and are made private to
+/// them (0700 and 0600), so no other user can open the lock from now on and
+/// hold it to keep the window from opening. A lock an earlier build left
+/// readable is tightened in place, never replaced: every launch, and an
+/// older instance still running, keeps locking the same file, so there is
+/// still one window and a running older instance still takes hand-offs.
 #[cfg(unix)]
 fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -300,25 +301,14 @@ fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
     if folder.mode() & 0o077 != 0 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let path = dir.join("primary.lock");
-    let open = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path);
-    let file = open()?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(dir.join("primary.lock"))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != uid {
         return Err(foreign());
     }
-    if metadata.mode() & 0o077 == 0 {
-        return Ok(file);
-    }
-    drop(file);
-    let fresh = dir.join("primary.lock.new");
-    let _ = std::fs::remove_file(&fresh);
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&fresh)?;
-    std::fs::rename(&fresh, &path)?;
-    let file = open()?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Err(foreign());
+    if metadata.mode() & 0o077 != 0 {
+        // fchmod on the open file: the same inode, whoever holds it.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
 }
@@ -864,33 +854,89 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// DSK-04: the settings folder and `primary.lock` are private to the
-    /// user. A lock an earlier build left readable, already held through a
-    /// descriptor opened then (as another user could), is replaced, so the
-    /// launch still owns the window; a private lock is kept as it is.
+    /// A settings folder and lock as an earlier build left them: 0755 and
+    /// 0644. Returns the lock's inode.
     #[cfg(unix)]
-    #[test]
-    fn the_lock_is_private_and_a_readable_one_held_elsewhere_is_replaced() {
+    fn legacy_lock(dir: &Path) -> u64 {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
-        let dir = temp_dir("private-lock");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = dir.join("primary.lock");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let held = std::fs::File::open(&path).unwrap();
-        held.try_lock().unwrap();
-        let Claim::Primary(lock) = claim(&dir, &[], Duration::from_millis(200)) else { panic!("a lock held through a readable file kept the window") };
-        assert_eq!((mode(&dir), mode(&path)), (0o700, 0o600));
-        assert_ne!(held.metadata().unwrap().ino(), std::fs::metadata(&path).unwrap().ino());
-        assert!(!dir.join("primary.lock.new").exists());
-        assert!(matches!(claim(&dir, &[], Duration::from_millis(200)), Claim::Unanswered), "the new lock is not exclusive");
-        let inode = lock.metadata().unwrap().ino();
+        std::fs::metadata(&path).unwrap().ino()
+    }
+
+    #[cfg(unix)]
+    fn mode_and_inode(path: &Path) -> (u32, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).unwrap();
+        (metadata.mode() & 0o777, metadata.ino())
+    }
+
+    /// DSK-04: the settings folder and `primary.lock` become private to the
+    /// user (0700 and 0600). A readable lock from an earlier build is
+    /// tightened in place, never replaced, so it stays exclusive.
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_lock_is_made_private_in_place() {
+        let dir = temp_dir("private-lock");
+        let inode = legacy_lock(&dir);
+        let Claim::Primary(lock) = claim(&dir, &[], Duration::from_millis(200)) else { panic!("the free lock was not taken") };
+        assert_eq!(mode_and_inode(&dir).0, 0o700);
+        assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
+        assert!(matches!(claim(&dir, &[], Duration::from_millis(200)), Claim::Unanswered), "a second launch took the held lock");
         drop(lock);
-        let Claim::Primary(lock) = claim(&dir, &[], Duration::from_millis(200)) else { panic!("the private lock was not taken") };
-        assert_eq!(lock.metadata().unwrap().ino(), inode, "a private lock was replaced");
-        drop((lock, held));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: an older instance still running holds the readable lock. A new
+    /// launch tightens it in place but does not take the window: it hands its
+    /// request to that instance over the authenticated hand-off.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_older_instance_keeps_the_window_and_takes_hand_offs() {
+        let dir = temp_dir("legacy-primary");
+        let inode = legacy_lock(&dir);
+        let legacy = std::fs::OpenOptions::new().read(true).write(true).open(dir.join("primary.lock")).unwrap();
+        legacy.try_lock().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        let serving = serve(&dir.join("handoff.json"), move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
+        assert!(matches!(claim(&dir, &[Request::Launch(URL.into())], Duration::from_secs(5)), Claim::Forwarded));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()));
+        assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
+        serving.stop();
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_millis(300)), Claim::Unanswered), "the held lock was bypassed");
+        drop(legacy);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: launches that all find the readable lock at once agree on one
+    /// window: they lock the same file, tightened in place.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_launches_on_a_readable_lock_start_one_window() {
+        let dir = temp_dir("concurrent-migration");
+        let inode = legacy_lock(&dir);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let launches: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, start) = (dir.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    match claim(&dir, &[], Duration::from_millis(500)) {
+                        Claim::Primary(lock) => Some(lock),
+                        Claim::Unanswered => None,
+                        other => panic!("unexpected claim: {other:?}"),
+                    }
+                })
+            })
+            .collect();
+        let locks: Vec<_> = launches.into_iter().map(|launch| launch.join().unwrap()).collect();
+        assert_eq!(locks.iter().filter(|lock| lock.is_some()).count(), 1, "one primary");
+        assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
+        drop(locks);
         std::fs::remove_dir_all(&dir).ok();
     }
 
