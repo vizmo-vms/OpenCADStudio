@@ -25,7 +25,7 @@ import json
 import pathlib
 import time
 
-ASSETS = ("SecurePlanCAD-macos-arm64.dmg", "SecurePlanCAD-macos-x64.dmg", "SecurePlanCAD-windows-x64.msi")
+ASSETS = ("SecurePlanCAD-macos-arm64.dmg", "SecurePlanCAD-macos-x64.dmg", "SecurePlanCAD-windows-x64.msi", "SecurePlanCAD-linux-x64.deb")
 
 
 def main() -> None:

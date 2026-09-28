@@ -74,6 +74,8 @@ pub enum Action {
     UpdateApplyFirst(u64),
     UpdateInstall,
     UpdateCancelDownload,
+    /// Put this text on the clipboard (the Linux update's install command).
+    CopyText(String),
 }
 
 /// A form field.

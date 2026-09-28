@@ -6,8 +6,12 @@
 //! The helper must change nothing while the parent runs, then install,
 //! record the outcome and relaunch.
 //!
-//! - Linux (development only, no installer): the helper waits for the parent,
-//!   then its install fails; the outcome is recorded only after the exit.
+//! - Linux: with a Windows plan the helper waits for the parent, then its
+//!   install fails; the outcome is recorded only after the exit. With the
+//!   package plan it runs a stand-in `pkexec` (`SECUREPLAN_TEST_PKEXEC`, never
+//!   the system's) with the apt-get arguments after the exit and relaunches
+//!   the program; when the stand-in is refused, the verified package is kept
+//!   and the outcome says how to install it.
 //! - macOS: a synthetic installed app and DMG (a tiny C program, ad-hoc
 //!   signed); the new app is swapped in after the parent exits and relaunched
 //!   through Launch Services; a damaged image leaves the app and reopens it.
@@ -129,6 +133,59 @@ fn the_helper_from_the_production_launch_acts_only_after_the_parent_exits() {
     assert!(outcome.message.contains("Windows Installer could not start"), "{outcome:?}");
     wait_until(Duration::from_secs(30), "the staging folder to go", || !staging.exists());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// DSK-07 on Linux: nothing runs while the application does; then the
+/// system installer (a stand-in for pkexec) gets exactly the apt-get argument
+/// list, and the program relaunches. A refused installer keeps the package.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_linux_helper_runs_the_system_installer_after_the_parent_exits() {
+    use std::os::unix::fs::PermissionsExt;
+    for (case, exit_code) in [("installed", 0), ("refused", 127)] {
+        let dir = temp(&format!("linux-deb-{case}"));
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let deb = staging.join("SecurePlanCAD-linux-x64.deb");
+        std::fs::write(&deb, b"not really a package").unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let argv = dir.join("pkexec-argv");
+        let pkexec = script("pkexec", &format!("printf '%s\\n' \"$@\" > '{}'\nexit {exit_code}", argv.display()));
+        let relaunched = dir.join("relaunched");
+        let program = script("secureplan-cad", &format!("touch '{}'", relaunched.display()));
+        let target = Target::Linux { exe: program.clone() };
+        let mut parent = Parent::start(
+            Path::new(env!("CARGO_BIN_EXE_OpenCADStudio")),
+            &dir,
+            "0.2.3",
+            deb.clone(),
+            Some(target),
+            &[("SECUREPLAN_TEST_PKEXEC", &pkexec)],
+        );
+        assert!(staging.join("update-plan.json").is_file());
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!argv.exists() && !parent.outcome_written(), "{case}: the helper acted while the application ran");
+        parent.exit();
+        let outcome = parent.outcome(Duration::from_secs(60));
+        wait_until(Duration::from_secs(30), "the relaunch", || relaunched.exists());
+        let expected = ["/usr/bin/apt-get", "install", "-y", "--no-remove", "-o", "DPkg::Lock::Timeout=120", &deb.display().to_string()].join("\n");
+        assert_eq!(std::fs::read_to_string(&argv).unwrap().trim_end(), expected, "{case}");
+        if exit_code == 0 {
+            assert!(outcome.installed, "{outcome:?}");
+            wait_until(Duration::from_secs(30), "the staging folder to go", || !staging.exists());
+        } else {
+            assert!(!outcome.installed && outcome.message.contains("did not get permission"), "{outcome:?}");
+            assert_eq!(outcome.manual_command, Some(format!("sudo apt install {}", deb.display())));
+            std::thread::sleep(Duration::from_secs(1));
+            assert!(deb.is_file(), "the verified package was removed");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(target_os = "macos")]

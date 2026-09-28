@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SecurePlan CAD
+GenericName=CAD Editor
+Comment=Edit and apply the drawings of SecurePlan surveys
+Exec=/usr/bin/secureplan-cad %u
+Icon=in.vizmo.secureplan.cad
+Terminal=false
+Categories=Graphics;Engineering;
+Keywords=CAD;DWG;DXF;SecurePlan;Vizmo;
+MimeType=x-scheme-handler/secureplan-cad;
+StartupWMClass=in.vizmo.secureplan.cad

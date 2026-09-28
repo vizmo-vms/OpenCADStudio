@@ -12,8 +12,9 @@
 //! sides prove knowledge of the secret before the URL is sent, so a process
 //! that has taken over a stale port learns nothing.
 //!
-//! On Windows the operating system passes the first launch's URL as a process
-//! argument; that instance uses it once and never forwards it.
+//! On Windows and Linux the operating system passes the first launch's URL as
+//! a process argument (Linux: the `.desktop` file's `Exec=… %u`); that
+//! instance uses it once and never forwards it.
 //!
 //! One window: the primary holds an exclusive per-user lock on
 //! `primary.lock` for its lifetime (the operating system releases it when the
@@ -215,10 +216,11 @@ pub fn stop_serving() {
 }
 
 /// Tell the user why SecurePlan CAD did not start: on standard error, and in
-/// a message box on macOS and Windows, where nobody sees standard error.
+/// a message box, since an app started from a menu or a link has nobody
+/// reading standard error (on Linux the box needs `zenity`).
 pub fn report_start_problem(message: &str) {
     eprintln!("{message}");
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("SecurePlan CAD")

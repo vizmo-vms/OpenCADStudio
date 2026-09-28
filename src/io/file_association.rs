@@ -29,8 +29,13 @@ const SECUREPLAN_REFUSAL: &str = "SecurePlan CAD does not register as a drawing 
 /// Linux desktop-file name and the Wayland window app_id. Matches
 /// `CFBundleIdentifier` in packaging/Info.plist and the installed `*.desktop`
 /// basename.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), not(feature = "secureplan")))]
 pub(crate) const APP_ID: &str = "io.github.HakanSeven12.OpenCadStudio";
+/// SecurePlan CAD's own id (DSK-05): its macOS bundle identifier, and on
+/// Linux its `.desktop` basename and window app_id / WM_CLASS
+/// (packaging/secureplan/linux/in.vizmo.secureplan.cad.desktop).
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "secureplan"))]
+pub(crate) const APP_ID: &str = crate::app::secureplan::update_helper::BUNDLE_ID;
 
 /// Silently register this app as *a* handler (not necessarily the default) for
 /// .dwg / .dxf, so it appears in the OS "Open with" list. Unlike

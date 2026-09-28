@@ -16,7 +16,9 @@
 //!   (HTTPS, port 443, the existing allowlist); then check the size the
 //!   release lists and the SHA-256 checksum. Anything else refuses the update
 //!   and leaves the installed copy untouched.
-//! - **Install** with the detached helper in [`super::update_helper`].
+//! - **Install** with the detached helper in [`super::update_helper`]. On
+//!   Linux, when `pkexec` is missing, the verified package is kept instead and
+//!   the user is shown where it is and the command that installs it.
 //!
 //! The updater does not depend on pairing, so a build below the web's minimum
 //! version (BRG-04) can still update itself.
@@ -39,7 +41,12 @@ use crate::app::{Message, OpenCADStudio};
 /// Where release assets are downloaded from: `<base>/<tag>/<asset name>`.
 pub const DOWNLOAD_BASE: &str = "https://github.com/vizmo-vms/OpenCADStudio/releases/download";
 /// The fixed, versionless release asset names (DSK-05).
-pub const ASSETS: [&str; 3] = ["SecurePlanCAD-macos-arm64.dmg", "SecurePlanCAD-macos-x64.dmg", "SecurePlanCAD-windows-x64.msi"];
+pub const ASSETS: [&str; 4] = [
+    "SecurePlanCAD-macos-arm64.dmg",
+    "SecurePlanCAD-macos-x64.dmg",
+    "SecurePlanCAD-windows-x64.msi",
+    "SecurePlanCAD-linux-x64.deb",
+];
 pub const SUMS_NAME: &str = "SHA256SUMS";
 /// How often the automatic check runs after the one at startup.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -63,6 +70,8 @@ pub fn platform_asset() -> Option<&'static str> {
         Some(ASSETS[1])
     } else if cfg!(all(windows, target_arch = "x86_64")) {
         Some(ASSETS[2])
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(ASSETS[3])
     } else {
         None
     }
@@ -507,6 +516,9 @@ pub struct Updater {
     /// Unit tests stand in for the running copy's install location.
     #[cfg(test)]
     pub test_target: Option<Target>,
+    /// Unit tests stand in for the system's `pkexec`.
+    #[cfg(test)]
+    pub test_pkexec: Option<PathBuf>,
     /// Unit tests record the helper launches instead of starting them.
     #[cfg(test)]
     pub launched: Mutex<Vec<update_helper::Plan>>,
@@ -533,6 +545,8 @@ impl Default for Updater {
             pending: Mutex::new(None),
             #[cfg(test)]
             test_target: None,
+            #[cfg(test)]
+            test_pkexec: None,
             #[cfg(test)]
             launched: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -602,7 +616,7 @@ impl OpenCADStudio {
         if update.asset.is_none() {
             self.secureplan.dialog = Some(Dialog::notice(
                 "Updates",
-                vec!["SecurePlan CAD updates itself on macOS and Windows only.".into(), installed_line()],
+                vec![update_helper::UNSUPPORTED.into(), installed_line()],
             ));
             return Task::none();
         }
@@ -762,6 +776,15 @@ impl OpenCADStudio {
         update_helper::target()
     }
 
+    /// The `pkexec` the Linux install needs (unit tests use their own).
+    fn secureplan_update_pkexec(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(pkexec) = &self.secureplan.update.test_pkexec {
+            return pkexec.clone();
+        }
+        update_helper::pkexec_path()
+    }
+
     pub(crate) fn secureplan_update_cancel_download(&mut self) {
         if let Some(cancel) = &self.secureplan.update.downloading {
             cancel.store(true, Ordering::SeqCst);
@@ -807,9 +830,13 @@ impl OpenCADStudio {
     /// exits, installs and opens the new version (DSK-07).
     pub(crate) fn secureplan_update_install(&mut self) -> Task<Message> {
         let Some(staged) = self.secureplan.update.staged.take() else { return Task::none() };
-        let prepared = self
-            .secureplan_update_target()
-            .and_then(|target| update_helper::prepare(&staged, &target, update_helper::result_path()));
+        let target = self.secureplan_update_target();
+        // Linux without pkexec: the user installs the kept package themselves.
+        if let Some((lines, command)) = target.as_ref().ok().and_then(|target| update_helper::manual_install(target, &staged, &self.secureplan_update_pkexec())) {
+            self.secureplan.dialog = Some(manual_install_dialog("Install the update", lines, command));
+            return Task::none();
+        }
+        let prepared = target.and_then(|target| update_helper::prepare(&staged, &target, update_helper::result_path()));
         let launch = match prepared {
             Ok(launch) => launch,
             Err(reason) => {
@@ -894,6 +921,12 @@ impl OpenCADStudio {
     }
 }
 
+/// The update SecurePlan CAD could not install itself (Linux): what to do,
+/// with **Copy command** for the install command.
+pub(crate) fn manual_install_dialog(title: &str, lines: Vec<String>, command: String) -> Dialog {
+    Dialog::choice(title, lines, vec![("Copy command".into(), Action::CopyText(command)), ("OK".into(), Action::Dismiss)])
+}
+
 /// **Install and restart** or **Later**. Focus, Enter and Escape all rest
 /// on **Later**, which keeps the download; installing takes a deliberate
 /// choice of the other button.
@@ -906,7 +939,10 @@ fn ready_dialog(release: &Release) -> Dialog {
         form,
         lines: vec![
             format!("SecurePlan CAD {} was downloaded, and its size and SHA-256 checksum match the release.", release.version),
-            "Install and restart keeps a recovery copy of any unapplied SecurePlan work, closes SecurePlan CAD, installs the update and opens it again. Later keeps the download until SecurePlan CAD closes.".into(),
+            format!(
+                "Install and restart keeps a recovery copy of any unapplied SecurePlan work, closes SecurePlan CAD, installs the update{} and opens it again. Later keeps the download until SecurePlan CAD closes.",
+                if cfg!(target_os = "linux") { " (the system asks for your password)" } else { "" }
+            ),
         ],
     }
 }
@@ -1373,13 +1409,64 @@ pub(crate) mod tests {
         let root = test_root("app-target");
         let mut app = OpenCADStudio::new_for_test();
         use_mock(&mut app, &mock, &root);
-        // Unit tests run on Linux, where SecurePlan CAD does not update itself.
+        // The unit-test binary is not the packaged /usr/bin/secureplan-cad
+        // (nor an installed app elsewhere), so it cannot update itself.
         app.secureplan.update.test_target = None;
         let _ = app.dispatch_command("SECUREPLANUPDATE");
         action(&mut app, Action::UpdateStart);
         assert_eq!(dialog(&app).as_deref(), Some("Update not installed"));
         assert!(!mock.requests().iter().any(|request| request.target.starts_with("/download")), "it downloaded anyway");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Linux: with pkexec the helper installs the package with it after the
+    /// exit; without pkexec the app does not quit, keeps the verified package
+    /// past the session and shows where it is and the command to copy.
+    #[test]
+    fn a_linux_update_installs_with_pkexec_or_keeps_the_package_for_the_user() {
+        const DEB: &str = "SecurePlanCAD-linux-x64.deb";
+        let exe = PathBuf::from(update_helper::LINUX_EXE);
+        for pkexec_present in [true, false] {
+            let mock = Mock::start();
+            mock.release("9.0.0", DEB, b"package", 2 * HOUR);
+            let root = test_root(&format!("app-linux-{pkexec_present}"));
+            let mut app = OpenCADStudio::new_for_test();
+            use_mock(&mut app, &mock, &root);
+            app.secureplan.update.asset = Some(DEB);
+            app.secureplan.update.test_target = Some(Target::Linux { exe: exe.clone() });
+            let pkexec = root.join("pkexec");
+            if pkexec_present {
+                std::fs::write(&pkexec, b"").unwrap();
+            }
+            app.secureplan.update.test_pkexec = Some(pkexec);
+            let _ = app.dispatch_command("SECUREPLANUPDATE");
+            action(&mut app, Action::UpdateStart);
+            let staged = app.secureplan.update.staged.clone().expect("a verified download");
+            action(&mut app, Action::UpdateInstall);
+            if pkexec_present {
+                let plans = launched(&app);
+                assert_eq!(plans.len(), 1, "the helper starts as the application exits");
+                assert_eq!(plans[0].install, update_helper::Install::Deb { deb: staged.file.clone(), exe: exe.clone() });
+            } else {
+                assert_eq!(dialog(&app).as_deref(), Some("Install the update"));
+                let Some(Dialog::Choice { lines, form, .. }) = &app.secureplan.dialog else { unreachable!() };
+                assert!(lines.iter().any(|line| line.contains(&staged.file.display().to_string())), "{lines:?}");
+                let command = update_helper::manual_install_command(&staged.file);
+                assert!(lines.iter().any(|line| line.ends_with(&command)), "{lines:?}");
+                assert_eq!(form.buttons[0], ("Copy command".to_string(), Action::CopyText(command)));
+                assert!(!app.secureplan.update.install_pending() && launched(&app).is_empty(), "it quit to install");
+                let _ = app.exit_app();
+                assert!(staged.file.is_file(), "the package the user was told about was removed");
+                assert!(launched(&app).is_empty());
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_x64_updates_from_the_deb_asset() {
+        assert_eq!(platform_asset(), Some("SecurePlanCAD-linux-x64.deb"));
     }
 
     #[test]

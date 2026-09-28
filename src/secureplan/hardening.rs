@@ -108,6 +108,47 @@ pub fn headless_file_refusal(export: bool, thumbnail: bool, script: bool) -> Opt
     )
 }
 
+/// Linux (DSK-02): no core file. A crash must not write the process memory
+/// (drawings, pairing secrets, session keys) to a core file in the working
+/// directory or to systemd-coredump's store, which honour `RLIMIT_CORE`, so
+/// the soft and hard limits are set to 0 before anything else runs. macOS
+/// starts apps with this limit already at 0.
+///
+/// A crash handler that the system pipes core dumps to (Ubuntu's apport) is
+/// not bound by the limit; see the SecurePlan CAD documentation.
+/// `PR_SET_DUMPABLE` is deliberately not cleared: that also denies
+/// `/proc/<pid>/root` to the user's own xdg-desktop-portal, which then
+/// refuses every request from SecurePlan CAD, the file chooser included.
+#[cfg(target_os = "linux")]
+pub fn disable_core_dumps() -> std::io::Result<()> {
+    #[repr(C)]
+    struct Limit {
+        current: std::ffi::c_ulong,
+        maximum: std::ffi::c_ulong,
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: std::ffi::c_int, limit: *const Limit) -> std::ffi::c_int;
+    }
+    /// `RLIMIT_CORE` in <sys/resource.h> on every Linux architecture.
+    const RLIMIT_CORE: std::ffi::c_int = 4;
+    let none = Limit { current: 0, maximum: 0 };
+    // SAFETY: plain libc call with a valid pointer to a correctly laid out
+    // `struct rlimit` (two `rlim_t`, which is `unsigned long` on Linux).
+    if unsafe { setrlimit(RLIMIT_CORE, &none) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Process hardening for `main`, before anything else runs.
+pub fn harden_process() {
+    #[cfg(target_os = "linux")]
+    if disable_core_dumps().is_err() {
+        eprintln!("SecurePlan CAD could not turn off core dumps.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +272,25 @@ mod tests {
         let reference = trap.url("http", "/logo.png");
         assert!(crate::scene::model::image_model::resolve_image(&reference).is_none());
         assert!(!trap.was_contacted(), "the image reference was fetched");
+    }
+
+    /// DSK-02: on Linux a crash writes no core file, and the process stays
+    /// dumpable, so the user's own xdg-desktop-portal still answers it.
+    /// (Lowering the limit in the test process harms no other test.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_turns_off_core_dumps_but_keeps_the_portal_working() {
+        harden_process();
+        let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+        let core = limits.lines().find(|line| line.starts_with("Max core file size")).unwrap();
+        let values: Vec<&str> = core.split_whitespace().skip(4).take(2).collect();
+        assert_eq!(values, ["0", "0"], "{core}");
+        unsafe extern "C" {
+            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+        }
+        const PR_GET_DUMPABLE: std::ffi::c_int = 3;
+        // SAFETY: PR_GET_DUMPABLE takes no further arguments.
+        assert_eq!(unsafe { prctl(PR_GET_DUMPABLE) }, 1);
     }
 
     #[test]

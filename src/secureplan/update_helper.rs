@@ -20,6 +20,15 @@
 //!   was; a failed swap is undone. The update is refused beforehand when the
 //!   app runs under App Translocation, outside an app bundle, or from a folder
 //!   the user cannot write.
+//! - **Linux (x64 .deb):** the system installer, `pkexec apt-get install` of
+//!   the verified package, which asks for the user's password. The update is
+//!   refused beforehand unless the app runs as the packaged
+//!   `/usr/bin/secureplan-cad`; without `pkexec` the app keeps the verified
+//!   package and shows its location and the command to install it. When the
+//!   installer cannot get permission (no polkit authentication agent, or the
+//!   password was refused) or stops with an error, the package is kept and the
+//!   next start shows the same. The command is built as an argument list and
+//!   never passes through a shell.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,6 +47,16 @@ pub const DMG_APP: &str = "SecurePlan CAD.app";
 /// (`packaging/windows/main.wxs`).
 pub const WINDOWS_INSTALL_DIR: [&str; 2] = ["Programs", "SecurePlan CAD"];
 pub const WINDOWS_EXE: &str = "SecurePlanCAD.exe";
+/// Where the Linux package installs the program
+/// (`packaging/secureplan/make-release-deb.sh`).
+pub const LINUX_EXE: &str = "/usr/bin/secureplan-cad";
+/// The system installer the Linux helper runs, through polkit's `pkexec`.
+pub const PKEXEC: &str = "/usr/bin/pkexec";
+pub const APT_GET: &str = "/usr/bin/apt-get";
+/// How long apt-get waits for another package manager to finish.
+const DPKG_LOCK_WAIT_SECS: u32 = 120;
+/// The plan's file name in the staging folder.
+const PLAN_FILE: &str = "update-plan.json";
 /// How long the helper waits for the application to exit.
 const EXIT_WAIT: Duration = Duration::from_secs(120);
 
@@ -49,6 +68,8 @@ pub enum Target {
     Windows { exe: PathBuf },
     /// The `.app` bundle.
     Mac { app: PathBuf },
+    /// The program the `.deb` package installed.
+    Linux { exe: PathBuf },
 }
 
 /// How the helper installs.
@@ -57,6 +78,7 @@ pub enum Target {
 pub enum Install {
     Msi { msi: PathBuf, exe: PathBuf },
     Dmg { dmg: PathBuf, app: PathBuf },
+    Deb { deb: PathBuf, exe: PathBuf },
 }
 
 /// The helper's instructions, written to the staging folder.
@@ -89,6 +111,10 @@ pub struct Outcome {
     pub version: String,
     pub installed: bool,
     pub message: String,
+    /// Linux: the command that installs the kept download by hand, when the
+    /// system installer could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
 }
 
 // ── Before the update (in the application) ──────────────────────────────────
@@ -101,10 +127,15 @@ pub fn target() -> Result<Target, String> {
     } else if cfg!(windows) {
         let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
         windows_target(&exe, local.as_deref()).map(|exe| Target::Windows { exe })
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        linux_target(&exe).map(|exe| Target::Linux { exe })
     } else {
-        Err("SecurePlan CAD updates itself on macOS and Windows only.".into())
+        Err(UNSUPPORTED.into())
     }
 }
+
+/// Where SecurePlan CAD does not update itself.
+pub const UNSUPPORTED: &str = "SecurePlan CAD updates itself on macOS, on Windows and on Linux x64 only.";
 
 /// The `.app` holding `exe` (`X.app/Contents/MacOS/<exe>`), if the update can
 /// replace it: not translocated, and its folder writable by this user.
@@ -140,6 +171,77 @@ pub fn windows_target(exe: &Path, local_app_data: Option<&Path>) -> Result<PathB
     Ok(installed)
 }
 
+/// The packaged program, if `exe` is it.
+pub fn linux_target(exe: &Path) -> Result<PathBuf, String> {
+    if exe != Path::new(LINUX_EXE) {
+        return Err("This copy of SecurePlan CAD was not installed from the SecurePlan CAD package, so it cannot update itself. Install the package (SecurePlanCAD-linux-x64.deb) from the releases page.".into());
+    }
+    Ok(exe.to_path_buf())
+}
+
+/// The system installer's command for the verified package `deb`: the
+/// program and its arguments, run without a shell. `-y` because the user
+/// already chose Install and polkit asks for the password; `--no-remove` so
+/// that the update never removes another package; the lock timeout waits for
+/// a package manager that is already running (such as unattended upgrades).
+pub fn deb_install_command(pkexec: &Path, deb: &Path) -> (PathBuf, Vec<std::ffi::OsString>) {
+    let mut args: Vec<std::ffi::OsString> = [APT_GET, "install", "-y", "--no-remove", "-o"].iter().map(Into::into).collect();
+    args.push(format!("DPkg::Lock::Timeout={DPKG_LOCK_WAIT_SECS}").into());
+    args.push(deb.as_os_str().to_owned());
+    (pkexec.to_path_buf(), args)
+}
+
+/// The command that installs the kept, verified package `deb` by hand.
+pub fn manual_install_command(deb: &Path) -> String {
+    format!("sudo apt install {}", shell_quoted(&deb.display().to_string()))
+}
+
+/// What the user can do when SecurePlan CAD cannot run the system installer
+/// itself: where the verified package is, and the command that installs it.
+pub fn manual_install_lines(deb: &Path) -> Vec<String> {
+    vec![
+        format!("The downloaded package was verified and is kept at: {}", deb.display()),
+        format!("To install it, run this command in a terminal: {}", manual_install_command(deb)),
+    ]
+}
+
+/// `text` quoted for a POSIX shell when it needs quoting; for the command
+/// shown to the user only (SecurePlan CAD never runs it through a shell).
+fn shell_quoted(text: &str) -> String {
+    let plain = !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+:=,@%".contains(&b));
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// Where `pkexec` is: the system's, or (`secureplan-test` builds only) a
+/// stand-in named by `SECUREPLAN_TEST_PKEXEC`, so the helper tests never
+/// start the real installer.
+pub fn pkexec_path() -> PathBuf {
+    #[cfg(feature = "secureplan-test")]
+    if let Some(stand_in) = std::env::var_os("SECUREPLAN_TEST_PKEXEC") {
+        return PathBuf::from(stand_in);
+    }
+    PathBuf::from(PKEXEC)
+}
+
+/// Before **Install and restart**: when this copy cannot run the system
+/// installer (Linux without `pkexec`), what to tell the user instead of
+/// quitting, and the command to copy. The verified download must then be
+/// kept for them.
+pub fn manual_install(target: &Target, staged: &Staged, pkexec: &Path) -> Option<(Vec<String>, String)> {
+    match target {
+        Target::Linux { .. } if !pkexec.is_file() => {
+            let mut lines = vec!["SecurePlan CAD cannot install the update itself: pkexec, which asks for your password to install packages, is not available.".to_string()];
+            lines.extend(manual_install_lines(&staged.file));
+            Some((lines, manual_install_command(&staged.file)))
+        }
+        _ => None,
+    }
+}
+
 /// Write the plan for `staged` into its staging folder; on Windows also copy
 /// this executable there to run the helper from.
 pub fn prepare(staged: &Staged, target: &Target, result: Option<PathBuf>) -> Result<Launch, String> {
@@ -151,6 +253,9 @@ pub fn prepare(staged: &Staged, target: &Target, result: Option<PathBuf>) -> Res
             (Install::Msi { msi: staged.file.clone(), exe: exe.clone() }, helper)
         }
         Target::Mac { app } => (Install::Dmg { dmg: staged.file.clone(), app: app.clone() }, current),
+        // The package replaces the program by rename; the helper keeps running
+        // from the replaced file.
+        Target::Linux { exe } => (Install::Deb { deb: staged.file.clone(), exe: exe.clone() }, current),
     };
     let plan = Plan {
         version: staged.release.version.clone(),
@@ -159,7 +264,7 @@ pub fn prepare(staged: &Staged, target: &Target, result: Option<PathBuf>) -> Res
         result,
         staging: staged.dir.clone(),
     };
-    let plan_path = staged.dir.join("update-plan.json");
+    let plan_path = staged.dir.join(PLAN_FILE);
     let json = serde_json::to_vec_pretty(&plan).map_err(|_| "SecurePlan CAD could not prepare the update.".to_string())?;
     std::fs::write(&plan_path, json).map_err(|_| "SecurePlan CAD could not prepare the update.".to_string())?;
     Ok(Launch { helper, plan_path, plan })
@@ -192,6 +297,7 @@ pub fn launch(launch: Launch) {
                     version: launch.plan.version.clone(),
                     installed: false,
                     message: "The installer helper could not start, so the update was not installed.".into(),
+                    manual_command: None,
                 });
             }
             let _ = std::fs::remove_dir_all(&launch.plan.staging);
@@ -346,13 +452,33 @@ pub fn run(plan_path: &Path) -> i32 {
     }
 }
 
+/// Why the helper did not install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotInstalled {
+    pub message: String,
+    /// Linux: the verified download is kept, and this command installs it.
+    pub manual_command: Option<String>,
+}
+
+impl From<String> for NotInstalled {
+    fn from(message: String) -> Self {
+        Self { message, manual_command: None }
+    }
+}
+
+impl From<&str> for NotInstalled {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 /// The helper's steps. Nothing is installed or relaunched unless the
 /// application has exited; after an install attempt, successful or not,
 /// SecurePlan CAD opens again and finds the outcome.
 pub fn run_plan(
     plan: &Plan,
     wait: impl FnOnce() -> Result<(), String>,
-    install: impl FnOnce() -> Result<(), String>,
+    install: impl FnOnce() -> Result<(), NotInstalled>,
     relaunch: impl FnOnce() -> Result<(), String>,
 ) -> Option<Outcome> {
     let record = |outcome: &Outcome| {
@@ -362,22 +488,28 @@ pub fn run_plan(
     };
     if let Err(message) = wait() {
         // The application is still running: leave everything as it is.
-        let outcome = Outcome { version: plan.version.clone(), installed: false, message };
+        let outcome = Outcome { version: plan.version.clone(), installed: false, message, manual_command: None };
         record(&outcome);
         return Some(outcome);
     }
     let mut outcome = match install() {
-        Ok(()) => Outcome { version: plan.version.clone(), installed: true, message: format!("SecurePlan CAD was updated to {}.", plan.version) },
-        Err(message) => Outcome { version: plan.version.clone(), installed: false, message },
+        Ok(()) => Outcome {
+            version: plan.version.clone(),
+            installed: true,
+            message: format!("SecurePlan CAD was updated to {}.", plan.version),
+            manual_command: None,
+        },
+        Err(failed) => Outcome { version: plan.version.clone(), installed: false, message: failed.message, manual_command: failed.manual_command },
     };
-    // The download is no longer needed either way.
-    match &plan.install {
-        Install::Msi { msi, .. } => {
-            let _ = std::fs::remove_file(msi);
-        }
-        Install::Dmg { dmg, .. } => {
-            let _ = std::fs::remove_file(dmg);
-        }
+    let keep = outcome.manual_command.is_some();
+    // The download is no longer needed, unless the user is told to install
+    // it themselves.
+    if !keep {
+        let _ = std::fs::remove_file(match &plan.install {
+            Install::Msi { msi, .. } => msi,
+            Install::Dmg { dmg, .. } => dmg,
+            Install::Deb { deb, .. } => deb,
+        });
     }
     record(&outcome);
     if relaunch().is_err() {
@@ -385,8 +517,13 @@ pub fn run_plan(
         record(&outcome);
     }
     // On Windows the helper runs from the staging folder and cannot delete
-    // itself; the next start sweeps what is left.
-    let _ = std::fs::remove_dir_all(&plan.staging);
+    // itself; the next start sweeps what is left (a kept download included,
+    // once it is a day old).
+    if keep {
+        let _ = std::fs::remove_file(plan.staging.join(PLAN_FILE));
+    } else {
+        let _ = std::fs::remove_dir_all(&plan.staging);
+    }
     Some(outcome)
 }
 
@@ -405,16 +542,17 @@ fn wait_for_stdin_eof(limit: Duration) -> Result<(), String> {
         .map_err(|_| "SecurePlan CAD did not close, so the update was not installed.".to_string())
 }
 
-fn install(plan: &Plan) -> Result<(), String> {
+fn install(plan: &Plan) -> Result<(), NotInstalled> {
     match &plan.install {
-        Install::Msi { msi, .. } => install_msi(msi),
-        Install::Dmg { dmg, app } => install_dmg(dmg, app, &plan.version, &plan.staging),
+        Install::Msi { msi, .. } => Ok(install_msi(msi)?),
+        Install::Dmg { dmg, app } => Ok(install_dmg(dmg, app, &plan.version, &plan.staging)?),
+        Install::Deb { deb, .. } => install_deb(&pkexec_path(), deb),
     }
 }
 
 fn relaunch(install: &Install) -> Result<(), String> {
     let mut command = match install {
-        Install::Msi { exe, .. } => std::process::Command::new(exe),
+        Install::Msi { exe, .. } | Install::Deb { exe, .. } => std::process::Command::new(exe),
         Install::Dmg { app, .. } => {
             // Launch Services starts a new copy (the old one has exited).
             let mut open = std::process::Command::new("/usr/bin/open");
@@ -468,6 +606,43 @@ fn install_msi(msi: &Path) -> Result<(), String> {
         Some(1618) => Err("Another installation was in progress; SecurePlan CAD is unchanged. Try the update again later.".into()),
         Some(code) => Err(format!("Windows Installer stopped with error {code}; SecurePlan CAD is unchanged.")),
         None => Err("Windows Installer stopped; SecurePlan CAD is unchanged.".into()),
+    }
+}
+
+/// Install the verified package with the system installer, which asks for
+/// the user's password through polkit.
+fn install_deb(pkexec: &Path, deb: &Path) -> Result<(), NotInstalled> {
+    if !deb.is_file() {
+        return Err("The downloaded package is missing, so the update was not installed.".into());
+    }
+    let (program, args) = deb_install_command(pkexec, deb);
+    let status = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    deb_install_result(status.ok().map(|status| status.code()), deb)
+}
+
+/// What the system installer's exit means. `None`: `pkexec` could not start;
+/// `Some(None)`: it ended by a signal. pkexec exits 126 when the user
+/// dismissed the password dialog and 127 when it could not get permission
+/// (no authentication agent, or the password was refused); otherwise the
+/// code is apt-get's (0, or 100 for an error).
+pub fn deb_install_result(code: Option<Option<i32>>, deb: &Path) -> Result<(), NotInstalled> {
+    let kept = |reason: String| {
+        let mut lines = vec![reason];
+        lines.extend(manual_install_lines(deb));
+        Err(NotInstalled { message: lines.join(" "), manual_command: Some(manual_install_command(deb)) })
+    };
+    match code {
+        Some(Some(0)) => Ok(()),
+        Some(Some(126)) => Err("The installation was cancelled; SecurePlan CAD is unchanged.".into()),
+        None => kept("pkexec, which asks for your password to install packages, could not start, so the update was not installed.".into()),
+        Some(Some(127)) => kept("The system installer did not get permission to install the update (no password dialog was available, or the password was not accepted), so the update was not installed.".into()),
+        Some(Some(code)) => kept(format!("The system installer (apt-get) stopped with error {code}, so the update was not installed.")),
+        Some(None) => kept("The system installer stopped, so the update was not installed.".into()),
     }
 }
 
@@ -752,6 +927,133 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    fn deb_plan(dir: &Path) -> Plan {
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let deb = staging.join("SecurePlanCAD-linux-x64.deb");
+        std::fs::write(&deb, b"deb").unwrap();
+        std::fs::write(staging.join(PLAN_FILE), b"{}").unwrap();
+        Plan {
+            version: "0.2.3".into(),
+            parent_pid: 1,
+            install: Install::Deb { deb, exe: PathBuf::from(LINUX_EXE) },
+            result: Some(dir.join("config/update-result.json")),
+            staging,
+        }
+    }
+
+    #[test]
+    fn a_linux_update_needs_the_packaged_program() {
+        assert_eq!(linux_target(Path::new(LINUX_EXE)), Ok(PathBuf::from("/usr/bin/secureplan-cad")));
+        for other in ["/home/u/OpenCADStudio/target/release/OpenCADStudio", "/usr/local/bin/secureplan-cad", "/usr/bin/secureplan-cad (deleted)"] {
+            assert!(linux_target(Path::new(other)).unwrap_err().contains("SecurePlanCAD-linux-x64.deb"), "{other}");
+        }
+    }
+
+    /// The installer runs as an argument list: a path with spaces, quotes or
+    /// shell syntax stays one argument and nothing is interpreted.
+    #[test]
+    fn the_linux_installer_command_is_an_argument_list() {
+        let deb = Path::new("/tmp/odd $(touch x); 'dir'/SecurePlanCAD-linux-x64.deb");
+        let (program, args) = deb_install_command(Path::new(PKEXEC), deb);
+        assert_eq!(program, PathBuf::from("/usr/bin/pkexec"));
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
+        let expected: [&std::ffi::OsStr; 7] = [
+            "/usr/bin/apt-get".as_ref(),
+            "install".as_ref(),
+            "-y".as_ref(),
+            "--no-remove".as_ref(),
+            "-o".as_ref(),
+            "DPkg::Lock::Timeout=120".as_ref(),
+            deb.as_os_str(),
+        ];
+        assert_eq!(args, expected);
+        // The command shown to the user is quoted for a shell.
+        assert_eq!(manual_install_command(deb), r#"sudo apt install '/tmp/odd $(touch x); '\''dir'\''/SecurePlanCAD-linux-x64.deb'"#);
+        assert_eq!(
+            manual_install_command(Path::new("/tmp/secureplan-cad-update-7-9/SecurePlanCAD-linux-x64.deb")),
+            "sudo apt install /tmp/secureplan-cad-update-7-9/SecurePlanCAD-linux-x64.deb"
+        );
+    }
+
+    /// pkexec's and apt-get's exits: installed; cancelled (download removed);
+    /// no permission, no pkexec or an installer error (download kept, with
+    /// its location and the command).
+    #[test]
+    fn the_linux_installer_outcome_keeps_the_package_when_the_user_must_install_it() {
+        let deb = Path::new("/tmp/secureplan-cad-update-7-9/SecurePlanCAD-linux-x64.deb");
+        assert_eq!(deb_install_result(Some(Some(0)), deb), Ok(()));
+        let cancelled = deb_install_result(Some(Some(126)), deb).unwrap_err();
+        assert!(cancelled.message.contains("cancelled") && cancelled.manual_command.is_none(), "{cancelled:?}");
+        for (code, reason) in [
+            (Some(Some(127)), "did not get permission"),
+            (None, "pkexec"),
+            (Some(Some(100)), "error 100"),
+            (Some(None), "stopped"),
+        ] {
+            let failed = deb_install_result(code, deb).unwrap_err();
+            assert!(failed.message.contains(reason), "{code:?}: {}", failed.message);
+            assert!(failed.message.contains(&format!("kept at: {}", deb.display())), "{}", failed.message);
+            assert_eq!(failed.manual_command.as_deref(), Some("sudo apt install /tmp/secureplan-cad-update-7-9/SecurePlanCAD-linux-x64.deb"));
+        }
+    }
+
+    #[test]
+    fn a_kept_linux_package_stays_for_the_user_and_the_old_copy_reopens() {
+        let dir = temp("deb-kept");
+        let plan = deb_plan(&dir);
+        let Install::Deb { deb, .. } = plan.install.clone() else { unreachable!() };
+        let relaunched = Cell::new(false);
+        let outcome = run_plan(
+            &plan,
+            || Ok(()),
+            || deb_install_result(Some(Some(127)), &deb),
+            || {
+                relaunched.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(relaunched.get() && !outcome.installed);
+        assert!(deb.is_file(), "the verified package was removed");
+        assert!(!plan.staging.join(PLAN_FILE).exists(), "the plan stayed");
+        assert_eq!(outcome.manual_command, Some(manual_install_command(&deb)));
+        assert_eq!(take_outcome(plan.result.as_ref().unwrap()), Some(outcome));
+        // A successful or cancelled install removes it as on other systems.
+        for result in [Ok(()), deb_install_result(Some(Some(126)), &deb)] {
+            let plan = deb_plan(&dir);
+            run_plan(&plan, || Ok(()), || result.clone(), || Ok(())).unwrap();
+            assert!(!plan.staging.exists(), "the download stayed after {result:?}");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Without pkexec the app does not quit: it shows the kept package and
+    /// the command. Other systems and a present pkexec install as usual.
+    #[test]
+    fn without_pkexec_the_user_is_told_how_to_install() {
+        let dir = temp("no-pkexec");
+        let file = dir.join("SecurePlanCAD-linux-x64.deb");
+        std::fs::write(&file, b"deb").unwrap();
+        let release = super::super::update::Release {
+            version: "0.2.3".into(),
+            tag: "secureplan-cad-v0.2.3".into(),
+            notes: String::new(),
+            published: 0,
+            asset: super::super::update::Asset { name: "SecurePlanCAD-linux-x64.deb".into(), size: 3 },
+        };
+        let staged = Staged { release, dir: dir.clone(), file: file.clone() };
+        let linux = Target::Linux { exe: PathBuf::from(LINUX_EXE) };
+        let (lines, command) = manual_install(&linux, &staged, &dir.join("missing-pkexec")).expect("no pkexec");
+        assert!(lines[0].contains("pkexec") && lines.iter().any(|line| line.contains(&file.display().to_string())), "{lines:?}");
+        assert_eq!(command, manual_install_command(&file));
+        let present = dir.join("pkexec");
+        std::fs::write(&present, b"").unwrap();
+        assert_eq!(manual_install(&linux, &staged, &present), None);
+        assert_eq!(manual_install(&Target::Mac { app: dir.join("SecurePlan CAD.app") }, &staged, &dir.join("missing-pkexec")), None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn packaging_matches_the_helper() {
         let plist = include_str!("../../packaging/Info.plist");
@@ -762,5 +1064,12 @@ mod tests {
         let dmg = include_str!("../../packaging/secureplan/make-release-dmg.sh");
         assert!(dmg.contains(&format!("app=\"$work/root/{DMG_APP}\"")), "the release DMG must hold {DMG_APP}");
         assert!(dmg.contains(&format!("= \"{BUNDLE_ID}\" ]")), "the release DMG must check the bundle id");
+        let deb = include_str!("../../packaging/secureplan/make-release-deb.sh");
+        assert!(deb.contains(&format!("program=\"{LINUX_EXE}\"")), "the package must install {LINUX_EXE}");
+        assert!(deb.contains(&format!("desktop_id=\"{BUNDLE_ID}\"")), "the package's .desktop file must be {BUNDLE_ID}.desktop");
+        let desktop = include_str!("../../packaging/secureplan/linux/in.vizmo.secureplan.cad.desktop");
+        assert!(desktop.lines().any(|line| line == format!("Exec={LINUX_EXE} %u")), "{desktop}");
+        assert!(desktop.lines().any(|line| line == format!("StartupWMClass={BUNDLE_ID}")), "{desktop}");
+        assert!(desktop.lines().any(|line| line == "MimeType=x-scheme-handler/secureplan-cad;"), "{desktop}");
     }
 }

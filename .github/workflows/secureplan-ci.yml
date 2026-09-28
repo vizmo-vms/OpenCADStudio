@@ -2,14 +2,15 @@ name: SecurePlan CI
 
 # Checks for the SecurePlan CAD companion build (`--features secureplan`):
 # the upstream default-feature build, the SecurePlan tests and clippy, the
-# protocol-vector copy, and per-target debug artifacts for manual checkpoints.
+# protocol-vector copy, the Linux package (built, installed and removed on the
+# runner), and per-target debug artifacts for manual checkpoints.
 # This workflow never publishes anything.
 
 on:
   push:
     branches: [secureplan]
   pull_request:
-    branches: [secureplan]
+    branches: [secureplan, "secureplan-*"]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +45,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y \
             libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev
+            libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev \
+            dpkg-dev desktop-file-utils
 
       - name: Upstream build (default features)
         run: cargo build --locked
@@ -93,6 +95,14 @@ jobs:
             echo "::error::the release binary answered a stdin test command"
             exit 1
           fi
+
+      # DSK-05: the release build packaged as the Linux .deb installs with apt,
+      # registers the secureplan-cad: scheme and menu entry, and is removed
+      # cleanly (the release workflow publishes the same package).
+      - name: Linux package (build, install, remove)
+        run: |
+          packaging/secureplan/make-release-deb.sh target/release/OpenCADStudio secureplan-cad-ci.deb
+          packaging/secureplan/check-deb-install.sh secureplan-cad-ci.deb
 
       # DSK-08: release builds read or write no drawing outside a session.
       - name: Release build refuses the headless drawing modes
