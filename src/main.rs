@@ -10,6 +10,10 @@ use OpenCADStudio::{cli, io, mcp};
 #[cfg(target_arch = "wasm32")]
 use OpenCADStudio::sys;
 
+/// SecurePlan CAD cannot hold its one-window lock or serve other launches.
+#[cfg(feature = "secureplan")]
+const UNAVAILABLE: &str = "SecurePlan CAD cannot use its settings folder, so it cannot make sure only one copy is open. Check that your user account can write to its application settings folder, then start SecurePlan CAD again.";
+
 fn main() -> iced::Result {
     // Web (wasm) uses the single-window entry; native uses the multi-window
     // daemon. Trunk calls `main` from its generated JS bootstrap. The web build
@@ -71,15 +75,20 @@ fn main() -> iced::Result {
         // Launch URLs reach a running copy over the authenticated per-user
         // channel only; when none answers, this instance serves them. (The
         // unauthenticated single-instance hand-off is off in SecurePlan CAD.)
+        // One SecurePlan CAD window: a copy that handed its URLs over exits.
         #[cfg(feature = "secureplan")]
-        let launch_urls = if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
-            if args.files.is_empty() {
-                return Ok(());
-            }
-            Vec::new()
-        } else {
-            launch_urls
-        };
+        if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
+            return Ok(());
+        }
+        // Started by the macOS launcher while a link is on its way over the
+        // hand-off: no editor window until a session opens, as for a link
+        // start (BRG-02). The flag carries no pairing data.
+        #[cfg(feature = "secureplan")]
+        let awaiting_launch = args.secureplan_awaiting_launch && launch_urls.is_empty();
+        #[cfg(feature = "secureplan")]
+        if awaiting_launch {
+            OpenCADStudio::app::secureplan::begin_awaiting_launch();
+        }
         // Started by links alone: a link no website may use opens nothing;
         // otherwise the editor stays hidden until a session opens (DSK-04).
         #[cfg(feature = "secureplan")]
@@ -182,6 +191,41 @@ fn main() -> iced::Result {
         // has already returned above — the plugin runner, which is this same
         // binary re-spawning itself, most of all. A flag list here would rot
         // the first time a mode is added; a position cannot.
+        //
+        // SecurePlan CAD keeps one window: the primary holds a per-user lock
+        // for its lifetime. Any other launch hands its URLs (or, without one,
+        // a request to show the window) to the primary over the authenticated
+        // per-user channel and exits, retrying while the primary is still
+        // starting. With no primary (a crash's stale descriptor included)
+        // this launch takes the lock and is the primary.
+        #[cfg(feature = "secureplan")]
+        let primary_lock = {
+            use OpenCADStudio::app::secureplan::handoff::{self, Claim, Request};
+            let requests: Vec<Request> = if awaiting_launch {
+                Vec::new()
+            } else if launch_urls.is_empty() {
+                vec![Request::Focus]
+            } else {
+                launch_urls.iter().cloned().map(Request::Launch).collect()
+            };
+            match handoff::claim_window(&requests) {
+                Claim::Primary(lock) => lock,
+                Claim::Forwarded => return Ok(()),
+                // The launcher that started this awaiting copy keeps handing
+                // its link over, and starts another copy if it must.
+                Claim::Unanswered if awaiting_launch => return Ok(()),
+                Claim::Unanswered => {
+                    handoff::report_start_problem(
+                        "SecurePlan CAD is already open but is not responding. Wait a moment and try again. If it stays unresponsive, quit SecurePlan CAD and start it again.",
+                    );
+                    std::process::exit(1);
+                }
+                Claim::Unavailable => {
+                    handoff::report_start_problem(UNAVAILABLE);
+                    std::process::exit(1);
+                }
+            }
+        };
         if !args.new_instance {
             if let io::single_instance::Claim::Existing(stream) = io::single_instance::claim() {
                 // Only bare files forward. `--read-only` / `--script` / `--new`
@@ -200,7 +244,10 @@ fn main() -> iced::Result {
 
         // This instance receives later launches, and uses its own once.
         #[cfg(feature = "secureplan")]
-        OpenCADStudio::app::secureplan::handoff::start_primary(launch_urls);
+        if OpenCADStudio::app::secureplan::handoff::start_primary(primary_lock, launch_urls).is_err() {
+            OpenCADStudio::app::secureplan::handoff::report_start_problem(UNAVAILABLE);
+            std::process::exit(1);
+        }
 
         // GUI: stash the startup config for `app::boot` to pick up.
         let script_lines = args

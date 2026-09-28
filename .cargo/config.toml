@@ -29,3 +29,10 @@ rustflags = [
 rustflags = [
     "-Clink-arg=/STACK:16777216",
 ]
+
+# Widget tests render with tiny-skia. Each iced_test simulator otherwise makes
+# its own wgpu instance, and test threads starting the Vulkan loader at the
+# same moment crash the test binary (SIGSEGV inside
+# vkEnumerateInstanceExtensionProperties). Only iced_test reads this variable.
+[env]
+ICED_TEST_BACKEND = "tiny-skia"

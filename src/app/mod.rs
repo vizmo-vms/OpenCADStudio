@@ -4449,7 +4449,7 @@ impl OpenCADStudio {
         // SecurePlan CAD started by a `secureplan-cad:` link shows no editor
         // until a session opens (or only the trust prompt for a new website).
         #[cfg(feature = "secureplan")]
-        let open_main = if s.secureplan.cold_start { Task::none() } else { s.open_main_window() };
+        let open_main = if s.secureplan.cold_start { s.secureplan_cold_start_expiry() } else { s.open_main_window() };
         #[cfg(not(feature = "secureplan"))]
         let open_main = s.open_main_window();
         let check_update = Task::perform(

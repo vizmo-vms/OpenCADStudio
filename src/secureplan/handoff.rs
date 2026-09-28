@@ -1,4 +1,7 @@
-//! Per-user hand-off of launch URLs between instances (DSK-04).
+//! Per-user hand-off of launch URLs between instances (DSK-04), and the
+//! single SecurePlan CAD window: any later launch, with or without a URL,
+//! goes to the running instance and exits. Without a URL it asks the running
+//! instance to bring its window to the front.
 //!
 //! Pairing data never travels as a forwarded process argument, never through
 //! upstream's unauthenticated single-instance port, and never into logs. The
@@ -11,11 +14,23 @@
 //!
 //! On Windows the operating system passes the first launch's URL as a process
 //! argument; that instance uses it once and never forwards it.
+//!
+//! One window: the primary holds an exclusive per-user lock on
+//! `primary.lock` for its lifetime (the operating system releases it when the
+//! process ends, however it ends), and a process that cannot take the lock or
+//! serve the hand-off never shows a window. A launch that finds the lock held
+//! keeps handing its request over until the owner takes it, and gives up
+//! without a window after [`CLAIM_WAIT`]. The owner answers only once its
+//! application has taken the request, and refuses everything once it begins
+//! to exit, so the other launch retries and starts afresh instead of losing
+//! it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
@@ -50,15 +65,166 @@ pub fn forward_launches(urls: &[String]) -> bool {
     !urls.is_empty() && urls.iter().all(|url| send_launch(&path, url).is_ok())
 }
 
-/// Called by the instance that shows the editor: serve later hand-offs, then
-/// deliver this process's own launch URLs once.
-pub fn start_primary(urls: Vec<String>) {
-    if let Some(path) = descriptor_path() {
-        let _ = serve(&path, super::deliver_launch);
+/// The flag the macOS launcher starts the GUI with while a launch URL is on
+/// its way over the hand-off: start without the editor window, as a link
+/// start does (BRG-02). It carries no pairing data.
+pub const AWAITING_LAUNCH_ARG: &str = "--secureplan-awaiting-launch";
+
+/// How long a launch keeps trying to reach the instance that owns the window.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(10);
+const CLAIM_RETRY: Duration = Duration::from_millis(50);
+/// How long the running instance waits for its application to take a
+/// handed-over request before refusing it (the other launch then retries).
+pub const TAKE_WAIT: Duration = Duration::from_secs(5);
+/// How long the macOS launcher keeps handing a link over.
+pub const LAUNCHER_WAIT: Duration = Duration::from_secs(30);
+
+/// What a launch turned out to be.
+#[derive(Debug)]
+pub enum Claim {
+    /// This process owns the window: the lock is held until it exits.
+    Primary(std::fs::File),
+    /// The running instance took every request, or, for the macOS launcher's
+    /// awaiting start (no requests), is ready to take the launcher's link.
+    Forwarded,
+    /// Another instance owns the window but did not answer in time.
+    Unanswered,
+    /// The lock cannot be taken at all (no usable settings folder) and no
+    /// running instance answered: nothing may start.
+    Unavailable,
+}
+
+/// Become the primary, or hand `requests` to the instance that is.
+pub fn claim_window(requests: &[Request]) -> Claim {
+    match crate::config::config_dir() {
+        Some(dir) => claim(&dir, requests, CLAIM_WAIT),
+        None => Claim::Unavailable,
     }
+}
+
+/// [`claim_window`] in `dir` (tests use their own). Owning the lock is
+/// ownership of the window; the descriptor is readiness to take requests.
+pub fn claim(dir: &Path, requests: &[Request], wait: Duration) -> Claim {
+    let descriptor = dir.join("handoff.json");
+    let lock = std::fs::create_dir_all(dir).and_then(|_| {
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("primary.lock"))
+    });
+    let deadline = Instant::now() + wait;
+    let mut pending: Vec<&Request> = requests.iter().collect();
+    loop {
+        let attempt = lock.as_ref().ok().map(std::fs::File::try_lock);
+        let owned_elsewhere = match attempt {
+            Some(Ok(())) => return Claim::Primary(lock.expect("opened")),
+            Some(Err(std::fs::TryLockError::WouldBlock)) => true,
+            // No lock can be taken here: only a running owner can help.
+            Some(Err(std::fs::TryLockError::Error(_))) | None => false,
+        };
+        if requests.is_empty() {
+            // The launcher hands its link to an owner that is ready.
+            if ready(&descriptor) {
+                return Claim::Forwarded;
+            }
+        } else {
+            pending.retain(|request| send(&descriptor, request).is_err());
+            if pending.is_empty() {
+                return Claim::Forwarded;
+            }
+        }
+        if !owned_elsewhere {
+            return Claim::Unavailable;
+        }
+        if Instant::now() >= deadline {
+            return Claim::Unanswered;
+        }
+        std::thread::sleep(CLAIM_RETRY);
+    }
+}
+
+/// The macOS launcher's hand-over of `urls`: whenever the running instance
+/// does not take them and no standby it started is still running, it starts
+/// one (`start`, an awaiting GUI that becomes the primary once the window is
+/// free). `true` once every URL was taken; `false` when `wait` ran out.
+pub fn deliver_with_standby<S>(
+    path: &Path,
+    urls: Vec<String>,
+    wait: Duration,
+    mut start: impl FnMut() -> Option<S>,
+    running: impl Fn(&S) -> bool,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    let mut pending = urls;
+    let mut standby: Option<S> = None;
+    loop {
+        pending.retain(|url| send_launch(path, url).is_err());
+        if pending.is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if !standby.as_ref().is_some_and(&running) {
+            standby = start();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// What another launch asks of the running instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    Launch(String),
+    /// Bring the window to the front.
+    Focus,
+}
+
+/// The primary's lock, listener and descriptor, held until the process exits.
+static PRIMARY: Mutex<Option<(std::fs::File, Serving, PathBuf)>> = Mutex::new(None);
+/// Set once the primary is shutting down: its application takes no more
+/// handed-over requests.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Whether this primary is shutting down.
+pub fn stopping() -> bool {
+    STOPPING.load(Ordering::SeqCst)
+}
+
+/// Called by the instance that shows the editor, holding `lock` from
+/// [`claim_window`]: serve later hand-offs, then deliver this process's own
+/// launch URLs once. An instance that cannot serve must not start: other
+/// launches could never reach it.
+pub fn start_primary(lock: std::fs::File, urls: Vec<String>) -> std::io::Result<()> {
+    let path = descriptor_path().ok_or_else(|| std::io::Error::other("no settings folder"))?;
+    let serving = serve(&path, super::hand_off)?;
+    *PRIMARY.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock, serving, path));
     for url in urls {
         super::deliver_launch(url);
     }
+    Ok(())
+}
+
+/// The primary is exiting: refuse every hand-off from now on (the other
+/// launch retries, and starts afresh once this process has ended) and
+/// withdraw the descriptor.
+pub fn stop_serving() {
+    let primary = PRIMARY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, serving, path)) = primary.as_ref() {
+        STOPPING.store(true, Ordering::SeqCst);
+        serving.stop();
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Tell the user why SecurePlan CAD did not start: on standard error, and in
+/// a message box on macOS and Windows, where nobody sees standard error.
+pub fn report_start_problem(message: &str) {
+    eprintln!("{message}");
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("SecurePlan CAD")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// Why a hand-off failed. Carries no URL content.
@@ -132,28 +298,46 @@ fn write_descriptor(path: &Path, port: u16, secret: &[u8; 32]) -> std::io::Resul
     std::fs::rename(&temporary, path)
 }
 
-/// Serve hand-offs for this instance: every authenticated launch URL is
-/// passed to `deliver`.
-pub fn serve(path: &Path, deliver: impl Fn(String) + Send + Sync + 'static) -> std::io::Result<()> {
+/// A running hand-off listener.
+#[derive(Debug)]
+pub struct Serving {
+    stopped: std::sync::Arc<AtomicBool>,
+}
+
+impl Serving {
+    /// Refuse every hand-off from now on, including one already being
+    /// authenticated.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Serve hand-offs for this instance: every authenticated request is passed
+/// to `take`, and the other launch is told it was delivered only when `take`
+/// returns `true` before the listener stops.
+pub fn serve(path: &Path, take: impl Fn(Request) -> bool + Send + Sync + 'static) -> std::io::Result<Serving> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let secret = random32()?;
     write_descriptor(path, listener.local_addr()?.port(), &secret)?;
-    let deliver = std::sync::Arc::new(deliver);
+    let take = std::sync::Arc::new(take);
+    let stopped = std::sync::Arc::new(AtomicBool::new(false));
+    let serving = Serving { stopped: stopped.clone() };
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let deliver = std::sync::Arc::clone(&deliver);
-            std::thread::spawn(move || {
-                if let Some(url) = accept_one(stream, &secret) {
-                    deliver(url);
-                }
-            });
+            if stopped.load(Ordering::SeqCst) {
+                continue;
+            }
+            let (take, stopped) = (std::sync::Arc::clone(&take), std::sync::Arc::clone(&stopped));
+            std::thread::spawn(move || accept_one(stream, &secret, |request| !stopped.load(Ordering::SeqCst) && take(request)));
         }
     });
-    Ok(())
+    Ok(serving)
 }
 
-/// One hand-off: prove the secret, check the client's proof, take the URL.
-fn accept_one(stream: TcpStream, secret: &[u8; 32]) -> Option<String> {
+/// One hand-off: prove the secret, check the client's proof, and let `take`
+/// have the URL or the focus request. The client hears `ok: true` only when
+/// `take` took it.
+fn accept_one(stream: TcpStream, secret: &[u8; 32], take: impl FnOnce(Request) -> bool) -> Option<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
     let mut writer = stream.try_clone().ok()?;
@@ -163,16 +347,39 @@ fn accept_one(stream: TcpStream, secret: &[u8; 32]) -> Option<String> {
     let server_nonce = random32().ok()?;
     let server_proof = proof(secret, SERVER_LABEL, &client_nonce).finalize().into_bytes();
     write_json(&mut writer, &json!({ "proof": to_hex(&server_proof), "nonce": to_hex(&server_nonce) })).ok()?;
-    let launch = read_json(&mut reader)?;
-    let client_proof: [u8; 32] = from_hex(launch["proof"].as_str()?)?;
-    let url = launch["url"].as_str()?.to_string();
-    let accepted = proof(secret, CLIENT_LABEL, &server_nonce).verify_slice(&client_proof).is_ok() && is_launch_url(&url);
-    let _ = write_json(&mut writer, &json!({ "ok": accepted }));
-    accepted.then_some(url)
+    let message = read_json(&mut reader)?;
+    let client_proof: [u8; 32] = from_hex(message["proof"].as_str()?)?;
+    let request = match message["op"].as_str()? {
+        "launch" => Request::Launch(message["url"].as_str()?.to_string()),
+        "focus" => Request::Focus,
+        _ => return None,
+    };
+    let accepted = proof(secret, CLIENT_LABEL, &server_nonce).verify_slice(&client_proof).is_ok()
+        && match &request {
+            Request::Launch(url) => is_launch_url(url),
+            Request::Focus => true,
+        };
+    let taken = accepted && take(request);
+    write_json(&mut writer, &json!({ "ok": taken })).ok()
 }
 
-/// Pass `url` to the running instance described by `path`.
-pub fn send_launch(path: &Path, url: &str) -> Result<(), HandoffError> {
+/// Whether the instance described by `path` is ready: it proves the secret.
+/// Nothing is sent, so it acts on nothing.
+fn ready(path: &Path) -> bool {
+    authenticated(path).is_ok()
+}
+
+/// A connection whose far end has proved the secret.
+struct Authenticated {
+    secret: [u8; 32],
+    server_nonce: [u8; 32],
+    writer: TcpStream,
+    reader: BufReader<TcpStream>,
+}
+
+/// Connect to the instance described by `path` and check that it knows the
+/// secret, before anything is sent.
+fn authenticated(path: &Path) -> Result<Authenticated, HandoffError> {
     let descriptor: Value = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -194,8 +401,25 @@ pub fn send_launch(path: &Path, url: &str) -> Result<(), HandoffError> {
     proof(&secret, SERVER_LABEL, &client_nonce)
         .verify_slice(&server_proof)
         .map_err(|_| HandoffError::Unauthenticated)?;
+    Ok(Authenticated { secret, server_nonce, writer, reader })
+}
+
+/// Pass `url` to the running instance described by `path`.
+pub fn send_launch(path: &Path, url: &str) -> Result<(), HandoffError> {
+    send(path, &Request::Launch(url.to_string()))
+}
+
+/// Pass `request` to the running instance described by `path`.
+pub fn send(path: &Path, request: &Request) -> Result<(), HandoffError> {
+    let Authenticated { secret, server_nonce, mut writer, mut reader } = authenticated(path)?;
     let client_proof = proof(&secret, CLIENT_LABEL, &server_nonce).finalize().into_bytes();
-    write_json(&mut writer, &json!({ "op": "launch", "proof": to_hex(&client_proof), "url": url })).map_err(|_| HandoffError::Io)?;
+    let message = match request {
+        Request::Launch(url) => json!({ "op": "launch", "proof": to_hex(&client_proof), "url": url }),
+        Request::Focus => json!({ "op": "focus", "proof": to_hex(&client_proof) }),
+    };
+    write_json(&mut writer, &message).map_err(|_| HandoffError::Io)?;
+    // The answer comes once the running application has taken the request.
+    reader.get_ref().set_read_timeout(Some(TAKE_WAIT + IO_TIMEOUT)).map_err(|_| HandoffError::Io)?;
     let done = read_json(&mut reader).ok_or(HandoffError::Io)?;
     if done["ok"] == true {
         Ok(())
@@ -238,8 +462,8 @@ mod tests {
         let path = temp_path("deliver");
         let (sender, receiver) = mpsc::channel();
         let sender = std::sync::Mutex::new(sender);
-        serve(&path, move |url| {
-            let _ = sender.lock().unwrap().send(url);
+        serve(&path, move |request| {
+            sender.lock().unwrap().send(request).is_ok()
         })
         .unwrap();
         #[cfg(unix)]
@@ -248,7 +472,7 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert_eq!(send_launch(&path, URL), Ok(()));
-        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), URL);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -281,10 +505,10 @@ mod tests {
     #[test]
     fn a_client_without_the_secret_is_refused() {
         let path = temp_path("client");
-        let (sender, receiver) = mpsc::channel::<String>();
+        let (sender, receiver) = mpsc::channel::<Request>();
         let sender = std::sync::Mutex::new(sender);
-        serve(&path, move |url| {
-            let _ = sender.lock().unwrap().send(url);
+        serve(&path, move |request| {
+            sender.lock().unwrap().send(request).is_ok()
         })
         .unwrap();
         // Speak the protocol without knowing the secret.
@@ -298,9 +522,292 @@ mod tests {
         assert!(read_json(&mut reader).is_some());
         write_json(&mut writer, &json!({ "op": "launch", "proof": to_hex(&[0u8; 32]), "url": URL })).unwrap();
         assert_eq!(read_json(&mut reader).unwrap()["ok"], false);
+        // Nor may it ask for the window.
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        write_json(&mut writer, &json!({ "op": "hello", "nonce": to_hex(&[3u8; 32]) })).unwrap();
+        assert!(read_json(&mut reader).is_some());
+        write_json(&mut writer, &json!({ "op": "focus", "proof": to_hex(&[0u8; 32]) })).unwrap();
+        assert_eq!(read_json(&mut reader).unwrap()["ok"], false);
         assert!(receiver.recv_timeout(Duration::from_millis(300)).is_err(), "delivered without the secret");
         assert_eq!(send_launch(&temp_path("missing"), URL), Err(HandoffError::NoRunningInstance));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A launch without a URL asks the running instance for its window, and
+    /// sends nothing else.
+    #[test]
+    fn a_plain_launch_asks_the_running_instance_for_its_window() {
+        let path = temp_path("focus");
+        let (sender, receiver) = mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        serve(&path, move |request| {
+            sender.lock().unwrap().send(request).is_ok()
+        })
+        .unwrap();
+        assert_eq!(send(&path, &Request::Focus), Ok(()));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Focus);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        // A crash left the descriptor behind: nothing listens, so this launch
+        // starts as the primary.
+        let stale = temp_path("stale");
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        write_descriptor(&stale, closed.local_addr().unwrap().port(), &[9u8; 32]).unwrap();
+        drop(closed);
+        assert_eq!(send(&stale, &Request::Focus), Err(HandoffError::NoRunningInstance));
+        std::fs::remove_dir_all(stale.parent().unwrap()).ok();
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("secureplan_claim_{tag}_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    /// A primary as `main` runs one: it serves once it holds the lock, after
+    /// `delay` (its start-up). When `stop` is set it exits: it refuses
+    /// hand-offs, withdraws its descriptor, and ends `closing` later.
+    fn primary(dir: PathBuf, delay: Duration, stop: std::sync::Arc<AtomicBool>, seen: mpsc::Sender<Request>) -> std::thread::JoinHandle<bool> {
+        closing_primary(dir, delay, Duration::ZERO, stop, seen, true)
+    }
+
+    fn closing_primary(
+        dir: PathBuf,
+        delay: Duration,
+        closing: Duration,
+        stop: std::sync::Arc<AtomicBool>,
+        seen: mpsc::Sender<Request>,
+        takes: bool,
+    ) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            let Claim::Primary(lock) = claim(&dir, &[], Duration::ZERO) else { return false };
+            std::thread::sleep(delay);
+            let seen = std::sync::Mutex::new(seen);
+            let serving = serve(&dir.join("handoff.json"), move |request| takes && seen.lock().unwrap().send(request).is_ok()).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            serving.stop();
+            let _ = std::fs::remove_file(dir.join("handoff.json"));
+            std::thread::sleep(closing);
+            drop(lock);
+            true
+        })
+    }
+
+    /// The launcher's standby as `main` runs one with the awaiting flag: it
+    /// waits for the window, serves once it owns it, and leaves otherwise.
+    /// The flag is set while it runs.
+    fn standby(dir: PathBuf, seen: mpsc::Sender<Request>, starts: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> std::sync::Arc<AtomicBool> {
+        starts.fetch_add(1, Ordering::SeqCst);
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        std::thread::spawn(move || {
+            if let Claim::Primary(lock) = claim(&dir, &[], Duration::from_secs(10)) {
+                let seen = std::sync::Mutex::new(seen);
+                let serving = serve(&dir.join("handoff.json"), move |request| seen.lock().unwrap().send(request).is_ok()).unwrap();
+                std::thread::sleep(Duration::from_secs(5));
+                serving.stop();
+                drop(lock);
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+        running
+    }
+
+    /// DSK-04, one window: launches at the same moment make one primary; the
+    /// others hand over to it.
+    #[test]
+    fn simultaneous_launches_make_one_primary() {
+        let dir = temp_dir("simultaneous");
+        let (sender, receiver) = mpsc::channel();
+        let launches: Vec<_> = (0..6)
+            .map(|_| {
+                let (dir, sender) = (dir.clone(), sender.clone());
+                std::thread::spawn(move || match claim(&dir, &[Request::Focus], Duration::from_secs(10)) {
+                    Claim::Primary(lock) => {
+                        let sender = std::sync::Mutex::new(sender);
+                        serve(&dir.join("handoff.json"), move |request| {
+                            sender.lock().unwrap().send(request).is_ok()
+                        })
+                        .unwrap();
+                        Some(lock)
+                    }
+                    Claim::Forwarded => None,
+                    other => panic!("the primary never answered: {other:?}"),
+                })
+            })
+            .collect();
+        let locks: Vec<_> = launches.into_iter().map(|launch| launch.join().unwrap()).collect();
+        assert_eq!(locks.iter().filter(|lock| lock.is_some()).count(), 1, "one primary");
+        for _ in 0..5 {
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Focus);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A launch while the primary is still starting (its descriptor not yet
+    /// written, a crash's stale one in its place) waits for it; a launch
+    /// after the primary ended starts afresh; a primary that never answers
+    /// is not joined by a second window.
+    #[test]
+    fn a_launch_waits_for_a_starting_primary_and_takes_over_an_ended_one() {
+        let dir = temp_dir("delayed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        write_descriptor(&dir.join("handoff.json"), closed.local_addr().unwrap().port(), &[9u8; 32]).unwrap();
+        drop(closed);
+        let (sender, receiver) = mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let first = primary(dir.clone(), Duration::from_millis(400), stop.clone(), sender.clone());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(claim(&dir, &[Request::Launch(URL.into())], Duration::from_secs(10)), Claim::Forwarded));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()));
+        // The macOS launcher's awaiting start has nothing to send: next to a
+        // ready primary it leaves (the launcher hands its link there).
+        assert!(matches!(claim(&dir, &[], Duration::from_secs(10)), Claim::Forwarded));
+        stop.store(true, Ordering::SeqCst);
+        assert!(first.join().unwrap());
+        // The primary is gone, its listener with it (its descriptor stale):
+        // the next launch is the primary.
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        write_descriptor(&dir.join("handoff.json"), closed.local_addr().unwrap().port(), &[9u8; 32]).unwrap();
+        drop(closed);
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_secs(10)), Claim::Primary(_)));
+        // A primary that holds the window but never answers.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let silent = primary(dir.clone(), Duration::from_secs(3600), stop.clone(), sender);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_millis(300)), Claim::Unanswered));
+        stop.store(true, Ordering::SeqCst);
+        drop(silent);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: a hand-off still being authenticated when the primary begins
+    /// to exit is refused, never acknowledged and then lost; the next one is
+    /// not served at all.
+    #[test]
+    fn a_hand_off_completing_after_shutdown_began_is_refused() {
+        let path = temp_path("stopping");
+        let (sender, receiver) = mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        let serving = serve(&path, move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
+        let descriptor: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let port = descriptor["port"].as_u64().unwrap() as u16;
+        let secret: [u8; 32] = from_hex(descriptor["secret"].as_str().unwrap()).unwrap();
+        // The client has authenticated the primary...
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let client_nonce = [5u8; 32];
+        write_json(&mut writer, &json!({ "op": "hello", "nonce": to_hex(&client_nonce) })).unwrap();
+        let answer = read_json(&mut reader).unwrap();
+        let server_proof: [u8; 32] = from_hex(answer["proof"].as_str().unwrap()).unwrap();
+        assert!(proof(&secret, SERVER_LABEL, &client_nonce).verify_slice(&server_proof).is_ok());
+        let server_nonce: [u8; 32] = from_hex(answer["nonce"].as_str().unwrap()).unwrap();
+        // ...when the primary begins to exit; then it proves itself.
+        serving.stop();
+        let client_proof = proof(&secret, CLIENT_LABEL, &server_nonce).finalize().into_bytes();
+        write_json(&mut writer, &json!({ "op": "launch", "proof": to_hex(&client_proof), "url": URL })).unwrap();
+        assert_eq!(read_json(&mut reader).unwrap()["ok"], false, "acknowledged during shutdown");
+        assert!(receiver.recv_timeout(Duration::from_millis(300)).is_err(), "taken during shutdown");
+        assert!(send_launch(&path, URL).is_err());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// DSK-04: the macOS launcher's awaiting start next to a primary that is
+    /// exiting (the window's owner, no longer ready) waits and then owns
+    /// the window, instead of leaving with the link undelivered.
+    #[test]
+    fn an_awaiting_start_waits_for_an_exiting_primary_and_takes_over() {
+        let dir = temp_dir("exiting");
+        let (sender, _receiver) = mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let first = closing_primary(dir.clone(), Duration::ZERO, Duration::from_millis(500), stop.clone(), sender, true);
+        while !dir.join("handoff.json").exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::SeqCst);
+        while dir.join("handoff.json").exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(claim(&dir, &[], Duration::from_secs(10)), Claim::Primary(_)), "the awaiting start left");
+        assert!(first.join().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: the macOS launcher keeps a standby running until its link is
+    /// taken. Next to an exiting primary, its standby becomes the primary
+    /// and gets the link. Next to a primary that is ready but does not take
+    /// the link and then exits, standbys that left are started again until
+    /// one owns the window.
+    #[test]
+    fn the_launcher_hands_its_link_over_through_shutdown_and_concurrent_starts() {
+        for (case, takes) in [("exiting", true), ("refusing", false)] {
+            let dir = temp_dir(&format!("standby_{case}"));
+            let (sender, receiver) = mpsc::channel();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let first = closing_primary(dir.clone(), Duration::ZERO, Duration::from_millis(400), stop.clone(), sender.clone(), takes);
+            while !dir.join("handoff.json").exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if case == "exiting" {
+                stop.store(true, Ordering::SeqCst);
+                while dir.join("handoff.json").exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(600));
+                    stop.store(true, Ordering::SeqCst);
+                });
+            }
+            let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let delivered = deliver_with_standby(
+                &dir.join("handoff.json"),
+                vec![URL.to_string()],
+                Duration::from_secs(20),
+                || Some(standby(dir.clone(), sender.clone(), starts.clone())),
+                |running| running.load(Ordering::SeqCst),
+            );
+            assert!(delivered, "{case}: the link was not delivered");
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()), "{case}");
+            assert!(receiver.recv_timeout(Duration::from_millis(300)).is_err(), "{case}: delivered twice");
+            let starts = starts.load(Ordering::SeqCst);
+            if case == "exiting" {
+                assert_eq!(starts, 1, "{case}");
+            } else {
+                assert!(starts >= 2, "{case}: a standby that left was not replaced ({starts})");
+            }
+            assert!(first.join().unwrap());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// DSK-04: without a lock no launch starts as the primary. With a running
+    /// owner it hands over; without one it is refused. A listener that
+    /// cannot write its descriptor fails, so `main` does not start.
+    #[test]
+    fn no_launch_owns_the_window_without_the_lock_or_the_descriptor() {
+        let dir = temp_dir("unlockable");
+        std::fs::create_dir_all(dir.join("primary.lock")).unwrap();
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_secs(1)), Claim::Unavailable));
+        assert!(matches!(claim(&dir, &[], Duration::from_secs(1)), Claim::Unavailable));
+        let (sender, receiver) = mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        let _serving = serve(&dir.join("handoff.json"), move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_secs(1)), Claim::Forwarded));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Focus);
+        std::fs::remove_dir_all(&dir).ok();
+        let dir = temp_dir("undescribable");
+        std::fs::create_dir_all(dir.join("handoff.json")).unwrap();
+        assert!(serve(&dir.join("handoff.json"), |_| true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
