@@ -11,7 +11,8 @@
 //! Devices are drawn as the SecurePlan canvas draws them (schema version 2):
 //! a circle in the device colour with a `#fbfaf4` ring, the device's icon,
 //! equipment's badge and the label, at the canvas's sizes times the device's
-//! symbol scale and the web's icon scale. Coverage is filled in the camera's
+//! symbol scale and the web's icon scale. A long label wraps onto more lines
+//! as the canvas wraps it in its box. Coverage is filled in the camera's
 //! colour at the document's coverage opacity, with a stroke of the same
 //! colour. Labels are `#17233b` (the web's) on a light viewport background
 //! and `#fbfaf4` on a dark one. As on the web canvas, equipment's badge and
@@ -23,8 +24,9 @@
 //! rendered once per icon and pixel-size bucket. The geometry is built into
 //! a canvas cache that is rebuilt only when the overlay, the mapping, the
 //! view or the viewport changes, not on every redraw. Off-screen devices and
-//! coverage are skipped, a symbol under a few pixels is a plain dot, and
-//! labels, badges and icons too small to read are left out.
+//! coverage are skipped, a symbol under a few pixels is a plain dot (without
+//! its label and badge, which show at every size the symbol does, as on the
+//! web canvas), and an icon too small to see is left out.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,8 +247,8 @@ pub fn parse(bytes: &[u8]) -> Result<Overlay, String> {
 const DOT_BELOW_PX: f32 = 2.5;
 /// The dot's side, in pixels.
 const DOT_PX: f32 = 3.0;
-/// Text smaller than this (pixels) is left out.
-const MIN_TEXT_PX: f32 = 7.0;
+/// The advance of the web canvas's monospace font per unit of font size.
+const MONO_ADVANCE: f32 = 0.6;
 /// An icon smaller than this (pixels) is left out; the circle remains.
 const MIN_ICON_PX: f32 = 6.0;
 /// Coverage outline width, world mm (the web's `strokeWidth`).
@@ -282,7 +284,8 @@ enum Shape {
     Area { points: Vec<Point>, color: Color, stroke: f32 },
     /// A device too small for its symbol.
     Dot { at: Point, color: Color },
-    Device { at: Point, kind: DeviceKind, color: Color, radius: f32, ring: f32, inside: Inside, badge: Option<Caption>, label: Option<Caption> },
+    /// `label` is the element label's lines, top first.
+    Device { at: Point, kind: DeviceKind, color: Color, radius: f32, ring: f32, inside: Inside, badge: Option<Caption>, label: Vec<Caption> },
     /// A device under a previous alignment: a grey outline.
     Ghost { at: Point, radius: f32 },
 }
@@ -297,6 +300,35 @@ const BEFORE: Color = Color { r: 0.6, g: 0.6, b: 0.6, a: 0.6 };
 fn turned(at: Point, angle: f32, [x, y]: [f32; 2]) -> Point {
     let (sin, cos) = angle.sin_cos();
     Point::new(at.x + x * cos - y * sin, at.y + x * sin + y * cos)
+}
+
+/// `text` in lines as the web canvas wraps an element label (Konva's word
+/// wrap) in a box `width` wide at font size `size`, for a monospace font:
+/// each line takes as many characters as fit, broken after its last space or
+/// dash when it has one, and trimmed.
+fn web_lines(text: &str, width: f32, size: f32) -> Vec<String> {
+    let fit = ((width / (MONO_ADVANCE * size)).floor() as usize).max(1);
+    let breaks = |c: char| c == ' ' || c == '-';
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        let mut rest: Vec<char> = line.chars().collect();
+        if rest.len() <= fit {
+            lines.push(line.to_string());
+            continue;
+        }
+        while !rest.is_empty() {
+            let cut = if breaks(rest[fit]) { fit } else { rest[..fit].iter().rposition(|&c| breaks(c)).map_or(fit, |i| i + 1) };
+            lines.push(rest[..cut].iter().collect::<String>().trim_end().to_string());
+            rest.drain(..cut);
+            let blank = rest.iter().take_while(|c| c.is_whitespace()).count();
+            rest.drain(..blank);
+            if !rest.is_empty() && rest.len() <= fit {
+                lines.push(rest.iter().collect());
+                break;
+            }
+        }
+    }
+    lines
 }
 
 /// The overlay's shapes on screen for `mapping`, with `project` taking CAD
@@ -375,11 +407,15 @@ fn shapes(overlay: &Overlay, mapping: &Mapping, before: bool, project: &dyn Fn([
         }
         let rotation = device.rotation_deg.to_radians() as f32;
         let angle = if web.rotates { east + rotation } else { east };
+        // As on the web canvas, labels show at every size the symbol does.
         let label_size = web.label_size as f32 * k;
-        let show_label = overlay.display.show_labels && label_size >= MIN_TEXT_PX && !device.label.trim().is_empty();
-        let label_chars = if show_label { device.label.chars().count().min(80) as f32 } else { 0.0 };
-        let reach = (radius + ring / 2.0).max(if show_label { (web.label_top + web.label_size) as f32 * k } else { 0.0 });
-        if !near(at, reach + label_chars * 0.3 * label_size) {
+        let lines = if overlay.display.show_labels && !device.label.trim().is_empty() {
+            web_lines(&device.label.chars().take(80).collect::<String>(), web.label_width as f32, web.label_size as f32)
+        } else {
+            Vec::new()
+        };
+        let label_reach = if lines.is_empty() { 0.0 } else { (web.label_width as f32 / 2.0).hypot((web.label_top + web.label_size * lines.len() as f64) as f32) * k };
+        if !near(at, (radius + ring / 2.0).max(label_reach)) {
             continue;
         }
         let icon_size = web.icon_size as f32 * k;
@@ -395,7 +431,7 @@ fn shapes(overlay: &Overlay, mapping: &Mapping, before: bool, project: &dyn Fn([
             }
         };
         let badge_size = BADGE_SIZE_MM as f32 * k;
-        let badge = device.badge.as_ref().filter(|_| device.kind == DeviceKind::Equipment && badge_size >= MIN_TEXT_PX).map(|text| Caption {
+        let badge = device.badge.as_ref().filter(|_| device.kind == DeviceKind::Equipment).map(|text| Caption {
             text: text.clone(),
             at: turned(at, angle, [0.0, (BADGE_TOP_MM + BADGE_SIZE_MM / 2.0) as f32 * k]),
             size: badge_size,
@@ -403,14 +439,18 @@ fn shapes(overlay: &Overlay, mapping: &Mapping, before: bool, project: &dyn Fn([
             color: rgb(WEB_LIGHT),
             rotation: angle,
         });
-        let label = show_label.then(|| Caption {
-            text: device.label.chars().take(80).collect(),
-            at: turned(at, angle, [0.0, (web.label_top + web.label_size / 2.0) as f32 * k]),
-            size: label_size,
-            bold: web.label_bold,
-            color: ink,
-            rotation: angle,
-        });
+        let label = lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| Caption {
+                text,
+                at: turned(at, angle, [0.0, (web.label_top + web.label_size * (i as f64 + 0.5)) as f32 * k]),
+                size: label_size,
+                bold: web.label_bold,
+                color: ink,
+                rotation: angle,
+            })
+            .collect();
         out.push(Shape::Device { at, kind: device.kind, color: device.color, radius, ring, inside, badge, label });
     }
     out
@@ -428,13 +468,29 @@ fn polygon(points: &[Point], closed: bool) -> canvas::Path {
     })
 }
 
+/// The font size turned text's outlines are made at, then scaled.
+const OUTLINE_PX: f32 = 64.0;
+
+type Outlines = std::collections::HashMap<(String, bool), std::rc::Rc<Vec<canvas::Path>>>;
+
+thread_local! {
+    /// Turned text's glyph outlines at [`OUTLINE_PX`], centred on the origin,
+    /// per text and weight. Shaping and outlining are most of the cost of
+    /// turned text, and a plan has few distinct labels, so they are made
+    /// once and only scaled, turned and moved per drawing.
+    static OUTLINES: RefCell<Outlines> = RefCell::default();
+}
+
+/// At most this many texts' outlines are kept.
+const MAX_OUTLINES: usize = 4096;
+
 fn caption(frame: &mut canvas::Frame, caption: &Caption) {
     let font = if caption.bold { iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::MONOSPACE } } else { iced::Font::MONOSPACE };
-    let text = |position: Point| canvas::Text {
+    let text = |position: Point, size: f32| canvas::Text {
         content: caption.text.clone(),
         position,
         color: caption.color,
-        size: caption.size.into(),
+        size: size.into(),
         font,
         align_x: iced::alignment::Horizontal::Center.into(),
         align_y: iced::alignment::Vertical::Center,
@@ -443,14 +499,29 @@ fn caption(frame: &mut canvas::Frame, caption: &Caption) {
     // Upright text is drawn as text; turned text is drawn as its outlines.
     let turn = caption.rotation.rem_euclid(std::f32::consts::TAU);
     if turn.min(std::f32::consts::TAU - turn) < 1e-4 {
-        frame.fill_text(text(caption.at));
+        frame.fill_text(text(caption.at, caption.size));
         return;
     }
-    frame.with_save(|frame| {
-        frame.translate(Vector::new(caption.at.x, caption.at.y));
-        frame.rotate(caption.rotation);
-        frame.fill_text(text(Point::ORIGIN));
+    let glyphs = OUTLINES.with(|outlines| {
+        let mut outlines = outlines.borrow_mut();
+        if outlines.len() >= MAX_OUTLINES {
+            outlines.clear();
+        }
+        outlines
+            .entry((caption.text.clone(), caption.bold))
+            .or_insert_with(|| {
+                let mut glyphs = Vec::new();
+                text(Point::ORIGIN, OUTLINE_PX).draw_with(|glyph, _| glyphs.push(glyph));
+                std::rc::Rc::new(glyphs)
+            })
+            .clone()
     });
+    use canvas::path::lyon_path::math::{vector, Angle, Transform};
+    let scale = caption.size / OUTLINE_PX;
+    let place = Transform::scale(scale, scale).then_rotate(Angle::radians(caption.rotation)).then_translate(vector(caption.at.x, caption.at.y));
+    for glyph in glyphs.iter() {
+        frame.fill(&glyph.transform(&place), caption.color);
+    }
 }
 
 /// A circle under this radius (pixels) is drawn as a 12-sided polygon,
@@ -802,18 +873,16 @@ pub(crate) mod tests {
                 }
                 _ => assert!(close(icon_at.x, at.x) && close(icon_at.y, at.y)),
             }
-            // Labels (at least 7 px) stay upright below or beside the symbol.
-            if let Some(label) = label {
-                assert!(close(label.size, web.label_size as f32 * k));
-            }
+            assert!(label.len() == 1 && close(label[0].size, web.label_size as f32 * k));
         }
         // The camera is not turned: its label is straight below it.
-        let Shape::Device { at, label: Some(label), .. } = devices_drawn(&drawn)[0] else { panic!("camera label") };
+        let Shape::Device { at, label, .. } = devices_drawn(&drawn)[0] else { panic!("camera label") };
+        let label = &label[0];
         assert!(close(label.at.x, at.x) && close(label.at.y - at.y, (370.0 + 95.0) * 0.15));
     }
 
     #[test]
-    fn tiny_symbols_become_dots_and_small_text_is_left_out() {
+    fn tiny_symbols_become_dots_and_labels_show_whenever_the_symbol_does() {
         let overlay = parse(&serde_json::to_vec(&payload(&[], vec![device(0, "equipment", 0.0, None)], Vec::new(), Vec::new())).unwrap()).unwrap();
         let mapping = Mapping { cad_origin: [0.0, 0.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
         let at_scale = |px_per_mm: f32| {
@@ -822,15 +891,23 @@ pub(crate) mod tests {
         };
         // 330 mm × 0.005 = 1.65 px: a dot.
         assert!(matches!(at_scale(0.005)[..], [Shape::Dot { .. }]));
-        // 0.02 px/mm: a 6.6 px circle, label 3.6 px and badge 2.3 px left out.
-        let Shape::Device { label, badge, .. } = &at_scale(0.02)[0] else { panic!("a symbol") };
-        assert!(label.is_none() && badge.is_none());
-        // 0.1 px/mm: an 18 px label and an 11.5 px badge.
-        let Shape::Device { label, badge, .. } = &at_scale(0.1)[0] else { panic!("a symbol") };
-        assert!(label.is_some() && badge.is_some());
-        // Off screen: nothing.
-        let project = |cad: [f64; 2]| Some(Point::new(cad[0] as f32 + 50000.0, -cad[1] as f32));
-        assert!(shapes(&overlay, &mapping, false, &project, SCREEN, Color::BLACK).is_empty());
+        // 0.02 px/mm (a plan fitted to the view): a 6.6 px circle keeps its
+        // 3.6 px label and 2.3 px badge, as the web canvas does.
+        for px_per_mm in [0.02, 0.1] {
+            let Shape::Device { label, badge, .. } = &at_scale(px_per_mm)[0] else { panic!("a symbol") };
+            assert!(label.len() == 1 && badge.is_some(), "{px_per_mm}");
+        }
+        // Off screen: nothing, unless the label reaches into the view.
+        let screen = Rectangle::new(Point::ORIGIN, iced::Size::new(1000.0, 1000.0));
+        let beside = |dy: f32| {
+            let project = move |cad: [f64; 2]| Some(Point::new(500.0 + cad[0] as f32 * 0.1, dy - cad[1] as f32 * 0.1));
+            shapes(&overlay, &mapping, false, &project, screen, Color::BLACK)
+        };
+        // Centre 50 px above the view: the 33 px circle is out, but the label
+        // (40 to 58 px below the centre) is in.
+        // (The device sits 100 px below `dy`.)
+        assert!(matches!(&beside(-150.0)[..], [Shape::Device { label, .. }] if label.len() == 1));
+        assert!(beside(-200.0).is_empty());
     }
 
     #[test]
@@ -896,7 +973,7 @@ pub(crate) mod tests {
         let captions: Vec<(Option<Caption>, Caption, Point)> = drawn
             .into_iter()
             .filter_map(|s| match s {
-                Shape::Device { badge, label, at, .. } => Some((badge, label.expect("a label"), at)),
+                Shape::Device { badge, mut label, at, .. } => Some((badge, label.remove(0), at)),
                 _ => None,
             })
             .collect();
@@ -915,13 +992,91 @@ pub(crate) mod tests {
         assert!(near(label.rotation, 0.0) && label.at.y > at.y && near(label.at.x, at.x), "the camera's label stays upright below it");
         // A quarter-turn alignment turns every caption with the plan.
         let turned = shapes(&overlay, &Mapping { quarter_turns: 1, ..mapping }, false, &project, SCREEN, Color::BLACK);
-        let Some(Shape::Device { label: Some(label), .. }) = turned.iter().find(|s| matches!(s, Shape::Device { kind: DeviceKind::Camera, .. })) else { panic!() };
+        let Some(Shape::Device { label, .. }) = turned.iter().find(|s| matches!(s, Shape::Device { kind: DeviceKind::Camera, .. })) else { panic!() };
+        let label = &label[0];
         assert!(near(label.rotation.abs(), quarter), "{}", label.rotation);
         // Turned text is drawn (as outlines) without trouble.
         use iced::advanced::renderer::Headless;
         let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("tiny-skia"))).expect("a software renderer");
         let mut frame = canvas::Frame::new(&renderer, iced::Size::new(400.0, 400.0));
         draw_shapes(&mut frame, &shapes(&overlay, &mapping, false, &project, SCREEN, Color::BLACK), &overlay.icons);
+    }
+
+    /// Long labels wrap as the web canvas wraps them (Konva's word wrap in
+    /// the label's box): 6 characters a line for a camera, 7 for equipment
+    /// and 8 for an asset in a monospace font.
+    #[test]
+    fn long_labels_wrap_like_the_web_canvas() {
+        let lines = |kind: DeviceKind, text: &str| {
+            let web = kind.web();
+            web_lines(text, web.label_width as f32, web.label_size as f32)
+        };
+        assert_eq!(lines(DeviceKind::Camera, "CAM-RED"), ["CAM-", "RED"]);
+        assert_eq!(lines(DeviceKind::Camera, "CAM-12"), ["CAM-12"], "fits");
+        assert_eq!(lines(DeviceKind::Equipment, "SW-LABEL"), ["SW-", "LABEL"]);
+        assert_eq!(lines(DeviceKind::Asset, "PLAIN-READER"), ["PLAIN-", "READER"]);
+        assert_eq!(lines(DeviceKind::Asset, "Front door reader"), ["Front", "door", "reader"]);
+        assert_eq!(lines(DeviceKind::Asset, "ABCDEFGHIJKLMNOPQRST"), ["ABCDEFGH", "IJKLMNOP", "QRST"], "no break: cut");
+        assert_eq!(lines(DeviceKind::Asset, "ABCDEFGH-IJ"), ["ABCDEFGH", "-IJ"], "a dash just past the box starts the next line");
+        assert_eq!(lines(DeviceKind::Asset, "AB\nCD"), ["AB", "CD"]);
+        // Drawn one line under the other, turned with the symbol.
+        let mut asset = device(0, "asset", 90.0, None);
+        asset["label"] = serde_json::json!("PLAIN-READER");
+        let overlay = parse(&serde_json::to_vec(&payload(&[], vec![asset], Vec::new(), Vec::new())).unwrap()).unwrap();
+        let (mapping, project) = view();
+        let Shape::Device { at, label, .. } = &shapes(&overlay, &mapping, false, &project, SCREEN, Color::BLACK)[0] else { panic!() };
+        let offsets: Vec<(String, f32, f32)> = label.iter().map(|c| (c.text.clone(), c.at.x - at.x, c.at.y - at.y)).collect();
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert_eq!(offsets.len(), 2);
+        // Turned 90° clockwise, "down" is screen left: 420 + 90 and 420 + 270 mm.
+        assert!(offsets[0].0 == "PLAIN-" && near(offsets[0].1, -51.0) && near(offsets[0].2, 0.0), "{offsets:?}");
+        assert!(offsets[1].0 == "READER" && near(offsets[1].1, -69.0) && near(offsets[1].2, 0.0), "{offsets:?}");
+    }
+
+    /// A turned asset's label is drawn at its turned place for every turn,
+    /// including past a half turn (upside down above the symbol at 180°, as
+    /// on the web canvas).
+    #[test]
+    fn turned_labels_are_drawn_at_their_turned_place() {
+        use iced::advanced::graphics::geometry::Renderer as _;
+        use iced::advanced::renderer::Headless;
+        let (mapping, _) = view();
+        // 1 px per mm, the device at the centre of a 1600 px square.
+        let project = |cad: [f64; 2]| Some(Point::new(800.0 + cad[0] as f32 - 1000.0, 800.0 - cad[1] as f32 - 1000.0));
+        let size = 1600u32;
+        let screen = Rectangle::new(Point::ORIGIN, iced::Size::new(size as f32, size as f32));
+        for degrees in [0.0f64, 90.0, 180.0, 200.0, 270.0] {
+            let mut asset = device(0, "asset", degrees, None);
+            asset["label"] = serde_json::json!("WWWW");
+            let overlay = parse(&serde_json::to_vec(&payload(&[], vec![asset], Vec::new(), Vec::new())).unwrap()).unwrap();
+            let drawn = shapes(&overlay, &mapping, false, &project, screen, Color::BLACK);
+            let Shape::Device { at, label, .. } = &drawn[0] else { panic!("{degrees}") };
+            let [label] = &label[..] else { panic!("{degrees}: one line") };
+            // 420 + 90 mm below the centre in the symbol's frame, world y down.
+            let turn = degrees.to_radians() as f32;
+            let expected = Point::new(at.x - 510.0 * turn.sin(), at.y + 510.0 * turn.cos());
+            assert!(label.at.distance(expected) < 0.01 && (label.rotation - turn).abs() < 1e-4, "{degrees}: {:?} {expected:?}", label.at);
+            // And it is painted there: ink near the label's place, none at
+            // the mirrored place.
+            let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("tiny-skia"))).expect("a software renderer");
+            let mut frame = canvas::Frame::new(&renderer, screen.size());
+            draw_shapes(&mut frame, &drawn, &overlay.icons);
+            renderer.draw_geometry(frame.into_geometry());
+            let pixels = renderer.screenshot(iced::Size::new(size, size), 1.0, Color::WHITE);
+            let inked = |c: Point| {
+                let mut dark = 0;
+                for y in (c.y as i32 - 60)..(c.y as i32 + 60) {
+                    for x in (c.x as i32 - 60)..(c.x as i32 + 60) {
+                        let i = (y as usize * size as usize + x as usize) * 4;
+                        dark += usize::from(pixels[i] < 128 && pixels[i + 1] < 128 && pixels[i + 2] < 128);
+                    }
+                }
+                dark
+            };
+            let mirrored = Point::new(2.0 * at.x - label.at.x, 2.0 * at.y - label.at.y);
+            assert!(inked(label.at) > 500, "{degrees}: label painted ({})", inked(label.at));
+            assert_eq!(inked(mirrored), 0, "{degrees}: nothing at the mirrored place");
+        }
     }
 
     #[test]
@@ -985,12 +1140,15 @@ pub(crate) mod tests {
         eprintln!("redraw_cost parse without icons ({} KiB): {:?}", bytes.len() / 1024, started.elapsed());
         let bytes = serde_json::to_vec(&payload(&[], devices, coverage, icons)).unwrap();
         let started = std::time::Instant::now();
-        let overlay = parse(&bytes).unwrap();
+        let mut overlay = parse(&bytes).unwrap();
         eprintln!("redraw_cost parse with {} icons decoded: {:?}", overlay.icons.len(), started.elapsed());
         let mapping = Mapping { cad_origin: [0.0, 0.0], anchor_mm: [0.0, 0.0], scale_mm_per_cad_unit: 1.0, quarter_turns: 0 };
         let size = iced::Size::new(1600.0, 1000.0);
         let viewport = Rectangle::new(Point::ORIGIN, size);
-        for (name, px_per_mm) in [("fit", 0.016f32), ("zoomed", 0.1f32)] {
+        // "fit, no labels" is what 0.2.2 drew fitted before labels showed at
+        // every symbol size.
+        for (name, px_per_mm, labels) in [("fit, no labels", 0.016f32, false), ("fit", 0.016, true), ("zoomed", 0.1, true)] {
+            overlay.display.show_labels = labels;
             let project = |cad: [f64; 2]| Some(Point::new(cad[0] as f32 * px_per_mm, 1000.0 + cad[1] as f32 * px_per_mm));
             let build = || {
                 let mut frame = canvas::Frame::new(&renderer, size);

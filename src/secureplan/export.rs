@@ -275,6 +275,23 @@ impl PlacedDevice {
     }
 }
 
+/// A SecurePlan icon block to make if the user chooses SecurePlan icons:
+/// its linework is generated only then, when the export is written.
+#[derive(Debug, Clone)]
+pub struct IconSource {
+    /// The block name without the prefix.
+    pub key: String,
+    pub kind: DeviceKind,
+    pub tree: Arc<resvg::usvg::Tree>,
+    pub badge: Option<String>,
+}
+
+impl PartialEq for IconSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
 /// What the export adds, for the summary and the tests.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Composition {
@@ -282,8 +299,10 @@ pub struct Composition {
     pub layers: Vec<(String, usize)>,
     /// The devices, placed when the export is written ([`place_devices`]).
     pub placed: Vec<PlacedDevice>,
-    /// The SecurePlan icon blocks (names without the prefix) and their content.
-    pub icon_blocks: Vec<(String, Vec<EntityType>)>,
+    /// The SecurePlan icon blocks, made only when SecurePlan icons are
+    /// chosen; each within [`symbols::MAX_ICON_VERTICES`] and all together
+    /// within [`symbols::MAX_EXPORT_ICON_VERTICES`] generated vertices.
+    pub icon_sources: Vec<IconSource>,
     /// `SECUREPLAN-`, or `SECUREPLAN-<n>-` when the plain names were taken.
     pub prefix: String,
     /// Layers named `SECUREPLAN…` the drawing already had.
@@ -297,6 +316,9 @@ pub struct Composition {
     pub unreadable_icons: usize,
     /// Devices the web sends without an icon: the standard symbol.
     pub without_icons: usize,
+    /// Devices whose SVG icon would need more linework than the budgets
+    /// allow: the standard symbol.
+    pub detailed_icons: usize,
     pub walls: usize,
     pub doors: usize,
     pub routes: usize,
@@ -354,6 +376,7 @@ impl Composition {
                     (self.raster_icons, "use an uploaded picture as their icon, which has no CAD linework"),
                     (self.unreadable_icons, "have an icon that could not be read"),
                     (self.without_icons, "have no SecurePlan icon"),
+                    (self.detailed_icons, "have an icon too detailed to convert to CAD linework"),
                 ];
                 for (count, why) in standard.into_iter().filter(|(count, _)| *count > 0) {
                     lines.push(format!("{count} device(s) {why}; the export draws the standard symbol of their kind ({}) instead.", shapes.join(", ")));
@@ -457,6 +480,9 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
     let mut composition = Composition::default();
     // Each icon decoded once: an SVG's tree, or why it has no linework.
     let decoded: Vec<Option<Decoded>> = payload.icons.iter().map(icons::decode).collect();
+    // Icon blocks over the linework budgets, and the vertices of those kept.
+    let mut detailed: Vec<String> = Vec::new();
+    let mut vertices = 0usize;
 
     for wall in &payload.walls {
         let key = format!("WALL-{}-{}", tag(&wall.material), tag(&wall.status));
@@ -512,10 +538,22 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
             Some((id, Some(Decoded::Svg(tree)))) => {
                 let badge = device.badge.as_deref().filter(|_| kind == DeviceKind::Equipment);
                 let key = format!("ICON-{}-{}{}", id.to_ascii_uppercase(), kind.tag(), badge.map(|b| format!("-{b}")).unwrap_or_default());
-                if !composition.icon_blocks.iter().any(|(k, _)| *k == key) {
-                    composition.icon_blocks.push((key.clone(), symbols::icon_block(kind, tree, badge)));
+                // Counted now, generated only if SecurePlan icons are chosen.
+                if !detailed.contains(&key) && !composition.icon_sources.iter().any(|source| source.key == key) {
+                    let needed = symbols::icon_vertices(kind, tree);
+                    if needed <= symbols::MAX_ICON_VERTICES && vertices + needed <= symbols::MAX_EXPORT_ICON_VERTICES {
+                        vertices += needed;
+                        composition.icon_sources.push(IconSource { key: key.clone(), kind, tree: Arc::clone(tree), badge: badge.map(str::to_string) });
+                    } else {
+                        detailed.push(key.clone());
+                    }
                 }
-                Some(key)
+                if detailed.contains(&key) {
+                    composition.detailed_icons += 1;
+                    None
+                } else {
+                    Some(key)
+                }
             }
         };
         let caption = [device.label.trim(), device.name.trim()].into_iter().find(|s| !s.is_empty()).unwrap_or(match kind {
@@ -646,7 +684,7 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
     plan.kinds.sort();
     // Every block either choice may add.
     let block_keys: Vec<String> =
-        plan.kinds.iter().map(|kind| format!("SYMBOL-{}", kind.tag())).chain(composition.icon_blocks.iter().map(|(key, _)| key.clone())).collect();
+        plan.kinds.iter().map(|kind| format!("SYMBOL-{}", kind.tag())).chain(composition.icon_sources.iter().map(|source| source.key.clone())).collect();
     composition.existing_secureplan_layers =
         document.layers.iter().filter(|layer| layer.name.to_ascii_uppercase().starts_with("SECUREPLAN")).count();
     // One prefix for every new name, the first under which none exists.
@@ -686,13 +724,19 @@ pub fn place_devices(document: &mut CadDocument, composition: &Composition, choi
     let mut defined: Vec<String> = Vec::new();
     for device in &composition.placed {
         let icon = composition
-            .icon_blocks
+            .icon_sources
             .iter()
-            .find(|(key, _)| choice == DeviceSymbols::Icons && device.icon_block.as_ref() == Some(key));
+            .find(|source| choice == DeviceSymbols::Icons && device.icon_block.as_ref() == Some(&source.key));
         let (key, content, scale, rotation, mut label) = match icon {
-            Some((key, content)) => {
+            Some(source) => {
                 let rotation = if device.kind.web().rotates { device.facing } else { device.upright };
-                (key.clone(), content.clone(), device.unit * device.symbol_scale, rotation, device.icon_label(rotation))
+                // The linework is generated once per block, here.
+                let content = if defined.contains(&format!("{prefix}{}", source.key)) {
+                    Vec::new()
+                } else {
+                    symbols::icon_block(source.kind, &source.tree, source.badge.as_deref())
+                };
+                (source.key.clone(), content, device.unit * device.symbol_scale, rotation, device.icon_label(rotation))
             }
             // As with 0.2.1, at the device's symbol scale.
             None => (
@@ -1174,7 +1218,7 @@ pub(crate) mod tests {
         assert!(second.summary(DeviceSymbols::Icons).iter().any(|line| line.contains("SECUREPLAN-2-")));
         // A drawing holding only an icon block of an earlier export still moves the prefix.
         let mut document = testutil::synthetic_document();
-        let icon = first.icon_blocks[0].0.clone();
+        let icon = first.icon_sources[0].key.clone();
         define_block(&mut document, &format!("SECUREPLAN-{icon}"), Vec::new());
         assert_eq!(compose(&mut document, &payload, &mapping()).prefix, "SECUREPLAN-2-");
     }
@@ -1360,6 +1404,69 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Adversarial icons cannot make the export allocate without bound: an
+    /// icon block's linework is counted before anything is generated, an
+    /// icon over the per-icon or the export's budget keeps the standard
+    /// symbol (and the summary says so), and nothing is generated at all
+    /// for Standard symbols.
+    #[test]
+    fn icon_linework_is_budgeted_and_made_only_for_secureplan_icons() {
+        use crate::app::secureplan::icons::tests::b64;
+        let icon = |i: usize, d: &str| {
+            let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><title>{i}</title><path d="{d}" fill="none" stroke="#fbfaf4"/></svg>"##);
+            serde_json::json!({ "id": format!("i{i}"), "mediaType": "image/svg+xml", "data": b64(svg.as_bytes()) })
+        };
+        let payload_with = |icons: Vec<serde_json::Value>| {
+            let mut value = sample_payload();
+            let devices: Vec<serde_json::Value> = (0..icons.len())
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("d{i}"), "kind": "asset", "name": "n", "iconKey": "generic", "customIcon": false, "color": "#336699",
+                        "label": format!("D{i}"), "status": "Proposed", "position": [1000, 1000], "rotationDeg": 0, "symbolScale": 1,
+                        "iconId": format!("i{i}"), "badge": null,
+                    })
+                })
+                .collect();
+            value["devices"] = serde_json::json!(devices);
+            value["icons"] = serde_json::json!(icons);
+            parse_payload(value.to_string().as_bytes()).unwrap()
+        };
+        // The review's case: 25 icons of 10,000 cubics with absurd control
+        // points, each over the per-icon budget.
+        let absurd = format!("M0 0{}", "C1e9 0 0 1e9 0 0".repeat(10_000));
+        let payload = payload_with((0..25).map(|i| icon(i, &absurd)).collect());
+        let started = std::time::Instant::now();
+        let mut document = testutil::synthetic_document();
+        let composition = compose(&mut document, &payload, &mapping());
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "counting took {:?}", started.elapsed());
+        assert_eq!(composition.detailed_icons, 25);
+        assert!(composition.icon_sources.is_empty() && composition.placed.iter().all(|d| d.icon_block.is_none()));
+        let summary = composition.summary(DeviceSymbols::Icons);
+        assert!(summary.iter().any(|l| l.starts_with("25 device(s) have an icon too detailed to convert")), "{summary:?}");
+        let blocks = place_devices(&mut document.clone(), &composition, DeviceSymbols::Icons);
+        assert_eq!(blocks, ["SECUREPLAN-SYMBOL-ASSET"], "the standard symbol instead");
+        // Icons within the per-icon budget but over the export's together:
+        // the first ones that fit are kept, in device order.
+        let line = format!("M0 0{}", "h1".repeat(20_000));
+        let payload = payload_with((0..60).map(|i| icon(i, &line)).collect());
+        let mut document = testutil::synthetic_document();
+        let composition = compose(&mut document, &payload, &mapping());
+        let each = 20_001;
+        let kept = symbols::MAX_EXPORT_ICON_VERTICES / each;
+        assert_eq!(composition.icon_sources.len(), kept);
+        assert_eq!(composition.detailed_icons, 60 - kept);
+        assert!(composition.placed[..kept].iter().all(|d| d.icon_block.is_some()) && composition.placed[kept..].iter().all(|d| d.icon_block.is_none()));
+        // Standard symbols generate no icon linework; SecurePlan icons
+        // generate exactly what was counted.
+        let mut standard = document.clone();
+        assert_eq!(place_devices(&mut standard, &composition, DeviceSymbols::Standard), ["SECUREPLAN-SYMBOL-ASSET"]);
+        assert!(!standard.entities().any(|e| matches!(e, EntityType::LwPolyline(p) if p.vertices.len() > 100)));
+        let mut icons = document.clone();
+        place_devices(&mut icons, &composition, DeviceSymbols::Icons);
+        let generated: usize = icons.entities().map(|e| if let EntityType::LwPolyline(p) = e { p.vertices.len() } else { 0 }).filter(|n| *n > 100).sum();
+        assert_eq!(generated, kept * each);
     }
 
     #[test]

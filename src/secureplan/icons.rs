@@ -7,9 +7,10 @@
 //!
 //! Decoding reads nothing but the icon's own bytes:
 //! - SVG is plain shapes only: before usvg sees it, the XML must be at most
-//!   [`MAX_SVG_NODES`] nodes, [`MAX_SVG_DEPTH`] deep and use only the
-//!   elements the web's catalog SVGs and lucide glyphs use (shapes, groups,
-//!   `defs`, `style`, gradients, titles). `use`, `filter`, `mask`,
+//!   [`MAX_SVG_NODES`] nodes, [`MAX_SVG_DEPTH`] deep and every element, in
+//!   the SVG namespace or in none (usvg reads both), must be one the web's
+//!   catalog SVGs and lucide glyphs use (shapes, groups, `defs`, `style`,
+//!   gradients, titles); an element in any other namespace is refused. `use`, `filter`, `mask`,
 //!   `clipPath`, `pattern`, `marker`, `symbol`, `image`, `text`, nested
 //!   `svg` and every other element are refused, so nothing is expanded or
 //!   allocated beyond the icon's own shapes. The parsed tree is checked
@@ -52,8 +53,8 @@ pub const MAX_SVG_DASHES: f64 = 20_000.0;
 /// 5 × 5 times the rendered size.
 pub const MAX_SVG_LAYERS: usize = 4;
 /// The SVG elements an icon may use: what the catalog SVGs and the lucide
-/// glyphs use, plus gradients. Elements outside the SVG namespace are
-/// ignored by usvg and allowed.
+/// glyphs use, plus gradients. Every element must be one of them, in the SVG
+/// namespace or in none.
 const SVG_ELEMENTS: &[&str] = &[
     "svg", "g", "defs", "title", "desc", "metadata", "style", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
     "linearGradient", "radialGradient", "stop",
@@ -153,8 +154,9 @@ pub fn parse_svg(bytes: &[u8]) -> Option<usvg::Tree> {
     (size.width() > 0.0 && size.height() > 0.0 && within_budget(&tree)).then_some(tree)
 }
 
-/// Whether the XML uses only [`SVG_ELEMENTS`], one root `svg` and at most
-/// [`MAX_SVG_DEPTH`] levels.
+/// Whether every element of the XML, whatever its namespace, is one of
+/// [`SVG_ELEMENTS`] in the SVG namespace or in none, with one root `svg`
+/// and at most [`MAX_SVG_DEPTH`] levels.
 fn plain_elements(xml: &usvg::roxmltree::Document) -> bool {
     // Document order visits a parent before its children.
     let mut depth = vec![0usize; xml.descendants().map(|n| n.id().get_usize() + 1).max().unwrap_or(0)];
@@ -164,11 +166,13 @@ fn plain_elements(xml: &usvg::roxmltree::Document) -> bool {
         if level > MAX_SVG_DEPTH {
             return false;
         }
-        if node.tag_name().namespace() == Some(SVG_NS) {
-            let name = node.tag_name().name();
-            if !SVG_ELEMENTS.contains(&name) || (name == "svg" && node.parent_element().is_some()) {
-                return false;
-            }
+        // usvg reads elements in the SVG namespace and in none (a missing
+        // `xmlns`, or `xmlns=""` on a subtree) alike, so both are checked;
+        // an element in any other namespace is refused too.
+        let name = node.tag_name().name();
+        let namespace = node.tag_name().namespace();
+        if !matches!(namespace, None | Some(SVG_NS)) || !SVG_ELEMENTS.contains(&name) || (name == "svg" && node.parent_element().is_some()) {
+            return false;
         }
     }
     true
@@ -386,10 +390,19 @@ pub(crate) mod tests {
     /// exponentially, and the other features icons do not need.
     #[test]
     fn unsafe_svg_features_and_budgets_are_refused_before_rendering() {
+        // Each case in the SVG namespace, with no namespace at all, and in
+        // a subtree whose namespace is reset (usvg reads all three as SVG).
         let refused = |what: &str, body: &str| {
-            let started = std::time::Instant::now();
-            assert!(parse_svg(svg(body).as_bytes()).is_none(), "{what} was accepted");
-            assert!(started.elapsed() < std::time::Duration::from_secs(2), "{what} took {:?}", started.elapsed());
+            let variants = [
+                svg(body),
+                format!(r#"<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="24" height="24" viewBox="0 0 24 24">{body}</svg>"#),
+                format!(r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="24" height="24"><g xmlns="">{body}</g></svg>"#),
+            ];
+            for (variant, document) in ["svg", "no namespace", "reset namespace"].iter().zip(variants) {
+                let started = std::time::Instant::now();
+                assert!(parse_svg(document.as_bytes()).is_none(), "{what} ({variant}) was accepted");
+                assert!(started.elapsed() < std::time::Duration::from_secs(2), "{what} ({variant}) took {:?}", started.elapsed());
+            }
         };
         refused(
             "an oversized filter region",
@@ -407,6 +420,23 @@ pub(crate) mod tests {
         }
         graph.push_str(r##"</defs><use xlink:href="#l8"/>"##);
         refused("an expanding use graph", &graph);
+        // The review's case: a 20,000-command path through four levels of
+        // ten uses (200 million segments if expanded).
+        let mut graph = format!(r#"<defs><path id="u0" d="M0 0{}"/>"#, "h1".repeat(20_000));
+        for level in 1..=4 {
+            graph.push_str(&format!(r#"<g id="u{level}">"#));
+            for _ in 0..10 {
+                graph.push_str(&format!(r##"<use href="#u{}"/>"##, level - 1));
+            }
+            graph.push_str("</g>");
+        }
+        graph.push_str(r##"</defs><use href="#u4"/>"##);
+        refused("a use graph of long paths", &graph);
+        // An element in another namespace is refused too.
+        assert!(parse_svg(svg(r#"<x:a xmlns:x="urn:x"><rect width="4" height="4"/></x:a>"#).as_bytes()).is_none());
+        // Plain shapes without a namespace still draw, as usvg reads them.
+        let plain = r##"<svg width="24" height="24" viewBox="0 0 24 24"><rect width="12" height="12" fill="#000"/></svg>"##;
+        assert!(parse_svg(plain.as_bytes()).is_none_or(|tree| !tree.root().children().is_empty()));
         refused("a mask", r##"<mask id="m"><rect width="24" height="24" fill="#fff"/></mask><rect width="24" height="24" mask="url(#m)"/>"##);
         refused("a clip path", r##"<clipPath id="c"><rect width="4" height="4"/></clipPath><rect width="24" height="24" clip-path="url(#c)"/>"##);
         refused("a pattern", r##"<pattern id="p" width="0.001" height="0.001" patternUnits="userSpaceOnUse"><rect width="1" height="1"/></pattern><rect width="24" height="24" fill="url(#p)"/>"##);
