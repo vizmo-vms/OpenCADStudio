@@ -145,6 +145,10 @@ pub struct State {
     pub sessions: super::session::Sessions,
     /// The SecurePlan dialog showing, if any (below the trust prompt).
     pub dialog: Option<Dialog>,
+    /// The Apply progress dialog (PUB-03), kept apart from `dialog`: it shows
+    /// whenever no other dialog does, so a question asked during an Apply
+    /// (a reconnect, a close) covers it only until it is answered.
+    pub apply_progress: Option<Box<super::ui::apply_progress::ApplyProgress>>,
     /// The alignment dialog, hidden while a length is measured in the drawing.
     pub measuring: Option<super::ui::align_dialog::Measuring>,
     pub recovery: super::recovery::Store,
@@ -207,6 +211,7 @@ impl Default for State {
             pairing_started: false,
             sessions: Default::default(),
             dialog: None,
+            apply_progress: None,
             measuring: None,
             recovery: Default::default(),
             overlay_visible: true,
@@ -486,7 +491,11 @@ impl OpenCADStudio {
                 DialogKey::Char(_) | DialogKey::Backspace => Task::none(),
             },
             Msg::DialogKey(key) => {
-                let action = self.secureplan.dialog.as_mut().and_then(|dialog| dialog.form_mut().key(key));
+                let form = match (self.secureplan.dialog.as_mut(), self.secureplan.apply_progress.as_mut()) {
+                    (Some(dialog), _) => Some(dialog.form_mut()),
+                    (None, progress) => progress.map(|progress| &mut progress.form),
+                };
+                let action = form.and_then(|form| form.key(key));
                 self.secureplan_refresh_dialog();
                 match action {
                     Some(action) => self.secureplan_action(action),
@@ -830,7 +839,7 @@ impl OpenCADStudio {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::SecurePlan(Msg::Tick)));
         }
         // The Apply progress dialog's stage and bytes sent, redrawn often.
-        if matches!(&self.secureplan.dialog, Some(Dialog::ApplyProgress(d)) if !d.finished()) {
+        if self.secureplan.apply_progress.as_ref().is_some_and(|d| !d.finished()) {
             subscriptions.push(iced::time::every(Duration::from_millis(150)).map(|_| Message::Noop));
         }
         Subscription::batch(subscriptions)
@@ -838,7 +847,7 @@ impl OpenCADStudio {
 
     /// Whether a SecurePlan dialog owns the keyboard.
     pub(crate) fn secureplan_dialog_open(&self) -> bool {
-        self.secureplan.trust.prompt().is_some() || self.secureplan.dialog.is_some()
+        self.secureplan.trust.prompt().is_some() || self.secureplan.dialog.is_some() || self.secureplan.apply_progress.is_some()
     }
 
     /// Non-entity layer drawn over the drawing viewport, below the viewport's
@@ -853,6 +862,9 @@ impl OpenCADStudio {
         match (self.secureplan.trust.prompt(), &self.secureplan.dialog) {
             (Some(prompt), _) => trust_dialog::view(base, prompt),
             (None, Some(dialog)) => super::ui::view(base, dialog),
+            (None, None) if self.secureplan.apply_progress.is_some() => {
+                super::ui::progress_view(base, self.secureplan.apply_progress.as_deref().expect("checked"))
+            }
             // An empty survey offers Open drawing over its empty document.
             (None, None) => match self.secureplan_empty_session_card() {
                 Some(card) => iced::widget::stack![base, card].into(),
@@ -934,6 +946,7 @@ impl OpenCADStudio {
                     | Action::ApplyConfirm
                     | Action::ApplyReset
                     | Action::ApplyProgressCancel
+                    | Action::ApplyProgressClose
                     | Action::ExportSave
                     | Action::ExportCancel
             );
@@ -1020,7 +1033,12 @@ impl OpenCADStudio {
                 self.secureplan_apply_progress_cancel();
                 Task::none()
             }
-            Action::ApplyProgressClose => Task::none(),
+            Action::ApplyProgressClose => {
+                if self.secureplan.dialog.is_none() {
+                    self.secureplan.apply_progress = None;
+                }
+                Task::none()
+            }
             Action::Convert(tab_id, kind) => self.secureplan_convert(tab_id, kind),
             Action::ExportSave => self.secureplan_export_save(),
             Action::ExportCancel => {

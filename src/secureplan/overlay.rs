@@ -14,7 +14,10 @@
 //! symbol scale and the web's icon scale. Coverage is filled in the camera's
 //! colour at the document's coverage opacity, with a stroke of the same
 //! colour. Labels are `#17233b` (the web's) on a light viewport background
-//! and `#fbfaf4` on a dark one, and stay upright so they can be read.
+//! and `#fbfaf4` on a dark one. As on the web canvas, equipment's badge and
+//! the labels of equipment and assets turn with their symbol; a camera's
+//! label stays upright on the plan (both turn with the plan when the drawing
+//! is aligned turned).
 //!
 //! Cost: each icon is decoded once per overlay (see [`super::icons`]) and
 //! rendered once per icon and pixel-size bucket. The geometry is built into
@@ -260,7 +263,7 @@ enum Inside {
     Nothing,
 }
 
-/// Text centred at `at`.
+/// Text centred at `at`, turned `rotation` radians clockwise about it.
 #[derive(Debug, Clone, PartialEq)]
 struct Caption {
     text: String,
@@ -268,6 +271,7 @@ struct Caption {
     size: f32,
     bold: bool,
     color: Color,
+    rotation: f32,
 }
 
 /// Something to draw, in canvas pixels.
@@ -397,6 +401,7 @@ fn shapes(overlay: &Overlay, mapping: &Mapping, before: bool, project: &dyn Fn([
             size: badge_size,
             bold: true,
             color: rgb(WEB_LIGHT),
+            rotation: angle,
         });
         let label = show_label.then(|| Caption {
             text: device.label.chars().take(80).collect(),
@@ -404,6 +409,7 @@ fn shapes(overlay: &Overlay, mapping: &Mapping, before: bool, project: &dyn Fn([
             size: label_size,
             bold: web.label_bold,
             color: ink,
+            rotation: angle,
         });
         out.push(Shape::Device { at, kind: device.kind, color: device.color, radius, ring, inside, badge, label });
     }
@@ -424,15 +430,26 @@ fn polygon(points: &[Point], closed: bool) -> canvas::Path {
 
 fn caption(frame: &mut canvas::Frame, caption: &Caption) {
     let font = if caption.bold { iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::MONOSPACE } } else { iced::Font::MONOSPACE };
-    frame.fill_text(canvas::Text {
+    let text = |position: Point| canvas::Text {
         content: caption.text.clone(),
-        position: caption.at,
+        position,
         color: caption.color,
         size: caption.size.into(),
         font,
         align_x: iced::alignment::Horizontal::Center.into(),
         align_y: iced::alignment::Vertical::Center,
         ..Default::default()
+    };
+    // Upright text is drawn as text; turned text is drawn as its outlines.
+    let turn = caption.rotation.rem_euclid(std::f32::consts::TAU);
+    if turn.min(std::f32::consts::TAU - turn) < 1e-4 {
+        frame.fill_text(text(caption.at));
+        return;
+    }
+    frame.with_save(|frame| {
+        frame.translate(Vector::new(caption.at.x, caption.at.y));
+        frame.rotate(caption.rotation);
+        frame.fill_text(text(Point::ORIGIN));
     });
 }
 
@@ -866,6 +883,45 @@ pub(crate) mod tests {
         let turned = Mapping { quarter_turns: 1, ..mapping };
         let drawn = facings(&turned);
         assert!(close(drawn[0].1, 0.0, 1.0) || close(drawn[0].1, 0.0, -1.0), "{:?}", drawn[0].1);
+    }
+
+    /// As on the web canvas, equipment's badge and label and an asset's
+    /// label turn with the symbol; a camera's label stays upright.
+    #[test]
+    fn badges_and_labels_turn_with_their_symbol() {
+        let devices = vec![device(0, "equipment", 90.0, None), device(1, "asset", 45.0, None), device(2, "camera", 90.0, None)];
+        let overlay = parse(&serde_json::to_vec(&payload(&[], devices, Vec::new(), Vec::new())).unwrap()).unwrap();
+        let (mapping, project) = view();
+        let drawn = shapes(&overlay, &mapping, false, &project, SCREEN, Color::BLACK);
+        let captions: Vec<(Option<Caption>, Caption, Point)> = drawn
+            .into_iter()
+            .filter_map(|s| match s {
+                Shape::Device { badge, label, at, .. } => Some((badge, label.expect("a label"), at)),
+                _ => None,
+            })
+            .collect();
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        // The switch, turned 90° clockwise: "SW" and its label read downwards,
+        // left of the symbol's centre (below it before the turn).
+        let (badge, label, at) = &captions[0];
+        let badge = badge.as_ref().expect("a badge");
+        assert_eq!(badge.text, "SW");
+        assert!(near(badge.rotation, quarter) && near(label.rotation, quarter), "{} {}", badge.rotation, label.rotation);
+        assert!(badge.at.x < at.x && near(badge.at.y, at.y), "{:?} {:?}", badge.at, at);
+        assert!(label.at.x < badge.at.x && near(label.at.y, at.y));
+        assert!(near(captions[1].1.rotation, quarter / 2.0), "the asset's label turns with it");
+        let (_, label, at) = &captions[2];
+        assert!(near(label.rotation, 0.0) && label.at.y > at.y && near(label.at.x, at.x), "the camera's label stays upright below it");
+        // A quarter-turn alignment turns every caption with the plan.
+        let turned = shapes(&overlay, &Mapping { quarter_turns: 1, ..mapping }, false, &project, SCREEN, Color::BLACK);
+        let Some(Shape::Device { label: Some(label), .. }) = turned.iter().find(|s| matches!(s, Shape::Device { kind: DeviceKind::Camera, .. })) else { panic!() };
+        assert!(near(label.rotation.abs(), quarter), "{}", label.rotation);
+        // Turned text is drawn (as outlines) without trouble.
+        use iced::advanced::renderer::Headless;
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("tiny-skia"))).expect("a software renderer");
+        let mut frame = canvas::Frame::new(&renderer, iced::Size::new(400.0, 400.0));
+        draw_shapes(&mut frame, &shapes(&overlay, &mapping, false, &project, SCREEN, Color::BLACK), &overlay.icons);
     }
 
     #[test]
