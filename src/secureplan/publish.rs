@@ -344,7 +344,8 @@ fn needs_flattening(entity: &acadrust::EntityType) -> bool {
     use acadrust::EntityType;
     match entity {
         EntityType::Circle(_) | EntityType::Arc(_) | EntityType::Ellipse(_) | EntityType::Spline(_) | EntityType::Polyline2D(_) => true,
-        EntityType::LwPolyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.bulge.abs() > 1e-12),
+        // Any bulge but exactly zero: the kernel reads a tiny one as a full circle.
+        EntityType::LwPolyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.bulge != 0.0),
         EntityType::Hatch(hatch) => hatch.paths.iter().flat_map(|path| &path.edges).any(curved_edge),
         _ => false,
     }
@@ -356,7 +357,7 @@ fn curved_edge(edge: &acadrust::entities::BoundaryEdge) -> bool {
     use acadrust::entities::BoundaryEdge;
     match edge {
         BoundaryEdge::Line(_) => false,
-        BoundaryEdge::Polyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.z.abs() > 1e-12),
+        BoundaryEdge::Polyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.z != 0.0),
         _ => true,
     }
 }
@@ -372,14 +373,45 @@ fn flatten_hatch(hatch: &acadrust::entities::Hatch, tolerance: f64) -> Result<ac
         if !curved_edge(edge) {
             continue;
         }
-        let Some(curve) = crate::entities::hatch::edge_curve(edge) else { continue };
-        let points = bounded_points(&curve, tolerance, MAX_CURVE_SEGMENTS)?;
+        let Some(points) = edge_points(edge, tolerance) else { continue };
+        let points = points?;
         if points.len() < 2 {
             return Err(TOO_LARGE.into());
+        }
+        if !points.iter().flatten().all(|v| v.is_finite()) {
+            return Err(NOT_FINITE.into());
         }
         *edge = BoundaryEdge::Polyline(PolylineEdge::new(points.into_iter().map(|[x, y]| Vector2::new(x, y)).collect(), false));
     }
     Ok(flat)
+}
+
+/// A hatch boundary arc as the fill draws it ([`crate::entities::hatch::edge_curve`]
+/// mirrors a clockwise one), as its start angle and sweep, taken from the
+/// stored angles directly: the kernel normalises each angle before
+/// subtracting, which turns a sweep below the rounding of 2π into a full
+/// turn.
+fn edge_arc(arc: &acadrust::entities::CircularArcEdge) -> (f64, f64) {
+    let sweep = arc_sweep(arc.start_angle, arc.end_angle);
+    (if arc.counter_clockwise { arc.start_angle } else { -arc.end_angle }, sweep)
+}
+
+/// The counter-clockwise sweep from `start` to `end` in (0, 2π], from their
+/// difference: equal angles (or a whole number of turns apart) are a full turn.
+fn arc_sweep(start: f64, end: f64) -> f64 {
+    let sweep = (end - start).rem_euclid(std::f64::consts::TAU);
+    if sweep == 0.0 { std::f64::consts::TAU } else { sweep }
+}
+
+/// A hatch boundary edge cut within `tolerance` ([`bounded_points`]), or
+/// `None` for an edge the fill does not draw.
+fn edge_points(edge: &acadrust::entities::BoundaryEdge, tolerance: f64) -> Option<Result<Vec<[f64; 2]>, String>> {
+    if let acadrust::entities::BoundaryEdge::CircularArc(arc) = edge {
+        let (start, sweep) = edge_arc(arc);
+        let points = arc_points((arc.center.x, arc.center.y), arc.radius, start, sweep, tolerance, MAX_CURVE_SEGMENTS);
+        return Some(points.map(|points| points.into_iter().map(|(x, y)| [x, y]).collect()));
+    }
+    crate::entities::hatch::edge_curve(edge).map(|curve| bounded_points(&curve, tolerance, MAX_CURVE_SEGMENTS))
 }
 
 /// Give each fill the exact f64 positions of its boundary vertices
@@ -434,9 +466,14 @@ fn exact_fill_boundaries(fills: &mut [crate::scene::model::hatch_model::HatchMod
 ///   tolerance of the chord between its ends. A piece lies in the convex hull
 ///   of its control points (positive weights), so its distance from that
 ///   chord is at most theirs;
-/// - lines, circles, circular arcs and polylines of those: the kernel's own
-///   cut, checked at each chord's middle, where a circular arc departs from
-///   its chord the most.
+/// - circles, circular arcs and polylines of lines and bulges (hatch
+///   boundary edges): cut analytically by [`arc_points`] and
+///   [`tessellate_chain`], with no cap short of [`MAX_CURVE_SEGMENTS`]. The
+///   kernel's own cut stops at 16,384 chords, runs a clockwise bulge
+///   backwards between its vertices and reads a bulge sweeping under 1e-9 rad
+///   as a full circle;
+/// - anything else (straight): the kernel's cut, checked at each chord's
+///   middle.
 ///
 /// A curve that needs more than [`MAX_CURVE_SEGMENTS`] chords is refused.
 pub(crate) fn bounded_points(curve: &cadkernel::geom2d::Curve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
@@ -448,6 +485,11 @@ pub(crate) fn bounded_points(curve: &cadkernel::geom2d::Curve, tolerance: f64, l
         Curve::Ellipse(arc) => {
             let a = arc.ellipse.major_radius.abs().max(arc.ellipse.minor_radius.abs());
             let sweep = arc.sweep();
+            let [cx, cy] = arc.ellipse.centre;
+            if ![cx, cy, a, arc.start_parameter, sweep].iter().all(|v| v.is_finite()) {
+                return Err(NOT_FINITE.into());
+            }
+            let tolerance = within_placement(tolerance, cx.abs().max(cy.abs()) + a * (1.0 + arc.start_parameter.abs() + sweep))?;
             let count = if a <= 0.0 { 1.0 } else { (sweep / (8.0 * tolerance / a).sqrt()).ceil().max(1.0) };
             if !count.is_finite() || count > MAX_CURVE_SEGMENTS as f64 {
                 return Err(TOO_LARGE.into());
@@ -456,9 +498,29 @@ pub(crate) fn bounded_points(curve: &cadkernel::geom2d::Curve, tolerance: f64, l
                 return Err(OVER_LIMIT.into());
             }
             let count = count as usize;
-            Ok((0..=count).map(|i| arc.ellipse.point_at(arc.start_parameter + sweep * i as f64 / count as f64)).collect())
+            let points: Vec<[f64; 2]> = (0..=count).map(|i| arc.ellipse.point_at(arc.start_parameter + sweep * i as f64 / count as f64)).collect();
+            if !points.iter().flatten().all(|v| v.is_finite()) {
+                return Err(NOT_FINITE.into());
+            }
+            Ok(points)
         }
         Curve::Nurbs(nurbs) => nurbs_points(nurbs, tolerance, limit),
+        Curve::Circle(circle) => Ok(arc_points((circle.centre[0], circle.centre[1]), circle.radius, 0.0, std::f64::consts::TAU, tolerance, limit)?
+            .into_iter()
+            .map(|(x, y)| [x, y])
+            .collect()),
+        Curve::Arc(arc) => Ok(arc_points((arc.centre[0], arc.centre[1]), arc.radius, arc.start_angle, arc_sweep(arc.start_angle, arc.end_angle), tolerance, limit)?
+            .into_iter()
+            .map(|(x, y)| [x, y])
+            .collect()),
+        Curve::Polyline(polyline) => {
+            let chain: Vec<WideVertex> = polyline
+                .vertices
+                .iter()
+                .map(|v| WideVertex { at: (v.position[0], v.position[1]), bulge: v.bulge, start_width: 0.0, end_width: 0.0 })
+                .collect();
+            Ok(tessellate_chain(&chain, polyline.closed, tolerance, limit)?.into_iter().map(|v| [v.location.x, v.location.y]).collect())
+        }
         _ => {
             let points = curve.tessellate_within(tolerance);
             if points.len() > limit {
@@ -573,31 +635,202 @@ fn segment_distance(point: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 /// plan (a circle thousands of kilometres across at 0.1 mm): refuse it.
 const MAX_CURVE_SEGMENTS: usize = 2_000_000;
 
-/// An arc of radius `radius` about `center` from `start` through `sweep`
-/// radians, cut so no chord departs from it by more than `tolerance`, with
-/// no upper limit short of [`MAX_CURVE_SEGMENTS`] (unlike the kernel).
-fn arc_points(center: (f64, f64), radius: f64, start: f64, sweep: f64, tolerance: f64, limit: usize) -> Result<Vec<(f64, f64)>, String> {
-    let step = if tolerance >= radius { std::f64::consts::FRAC_PI_2 } else { (2.0 * (1.0 - tolerance / radius).acos()).min(std::f64::consts::FRAC_PI_2) };
-    let count = (sweep.abs() / step).ceil().max(1.0);
+/// How many equal chords a sweep of `sweep` radians on a circle of `radius`
+/// needs so none departs from it by more than `tolerance`.
+///
+/// A chord of sweep `Δ` sags by `r·(1 − cos(Δ/2)) = 2r·sin²(Δ/4)`, so the
+/// step is `4·asin(√(tol / 2r))`: the same as `2·acos(1 − tol/r)`, but it
+/// does not collapse to 0 when `tol/r` is below the rounding of 1. An arc
+/// whose whole sagitta is within the tolerance (and at most a half turn)
+/// is therefore one chord. At most a quarter turn per chord.
+fn arc_count(radius: f64, sweep: f64, tolerance: f64, limit: usize) -> Result<usize, String> {
+    use std::f64::consts::FRAC_PI_2;
+    let step = if tolerance >= radius { FRAC_PI_2 } else { (4.0 * (tolerance / (2.0 * radius)).sqrt().asin()).min(FRAC_PI_2) };
+    let count = if step > 0.0 { (sweep.abs() / step).ceil().max(1.0) } else { f64::INFINITY };
     if !count.is_finite() || count > MAX_CURVE_SEGMENTS as f64 {
         return Err(TOO_LARGE.into());
     }
     if count >= limit as f64 {
         return Err(OVER_LIMIT.into());
     }
-    let count = count as usize;
-    Ok((0..=count)
-        .map(|i| {
-            let angle = start + sweep * i as f64 / count as f64;
-            (center.0 + radius * angle.cos(), center.1 + radius * angle.sin())
-        })
-        .collect())
+    Ok(count as usize)
+}
+
+/// An arc of radius `radius` about `center` from `start` through `sweep`
+/// radians, cut so no chord departs from it by more than `tolerance`, with
+/// no upper limit short of [`MAX_CURVE_SEGMENTS`] (unlike the kernel).
+///
+/// Each point is placed from the start point by its chord,
+/// `2r·sin(φ/2)` along `s + φ/2 + π/2`, so the cut keeps its shape to the
+/// rounding of the chord however large the radius. Where the points land is
+/// only as good as their rounding, which grows with the radius: see
+/// [`within_placement`]. The chords are cut by `|r|`; a negative radius keeps
+/// its signed geometry (the same circle, starting opposite).
+fn arc_points(center: (f64, f64), radius: f64, start: f64, sweep: f64, tolerance: f64, limit: usize) -> Result<Vec<(f64, f64)>, String> {
+    if ![center.0, center.1, radius, start, sweep].iter().all(|v| v.is_finite()) {
+        return Err(NOT_FINITE.into());
+    }
+    let tolerance = within_placement(tolerance, center.0.abs().max(center.1.abs()) + radius.abs() * (1.0 + start.abs() + sweep.abs()))?;
+    let count = arc_count(radius.abs(), sweep, tolerance, limit)?;
+    let (sin, cos) = start.sin_cos();
+    let from = (center.0 + radius * cos, center.1 + radius * sin);
+    finite_points(
+        (0..=count)
+            .map(|i| {
+                let phi = sweep * i as f64 / count as f64;
+                let chord = 2.0 * radius * (phi / 2.0).sin();
+                let (sin, cos) = (start + phi / 2.0).sin_cos();
+                (from.0 - chord * sin, from.1 + chord * cos)
+            })
+            .collect(),
+    )
+}
+
+/// What is left of `tolerance` for the chords of a curve evaluated about a
+/// centre, once the rounding of where its points land is counted.
+///
+/// A point `c + r·(cos α, sin α)` (or its chord from the start point) is
+/// off by a few roundings of `|c| + |r|·(1 + |α|)`: cos and sin within an
+/// ulp, the products, the sums and the angles themselves. `scale` is that
+/// sum over the curve, and `32ε·scale` bounds the error generously. A curve
+/// whose points cannot be placed within half the tolerance (a radius around
+/// 1e13 or more at 0.05) is refused: its position, not only its chords,
+/// would be out of tolerance.
+fn within_placement(tolerance: f64, scale: f64) -> Result<f64, String> {
+    let placement = 32.0 * f64::EPSILON * scale;
+    if placement.is_finite() && placement <= tolerance / 2.0 {
+        Ok(tolerance - placement)
+    } else {
+        Err(TOO_LARGE.into())
+    }
+}
+
+/// `points`, or a refusal if any is not finite.
+fn finite_points(points: Vec<(f64, f64)>) -> Result<Vec<(f64, f64)>, String> {
+    if points.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
+        Ok(points)
+    } else {
+        Err(NOT_FINITE.into())
+    }
+}
+
+/// The arc of the segment from `a` to `b` with `bulge` (tan of a quarter of
+/// its signed sweep θ), cut so no chord departs from it by more than
+/// `tolerance`, like [`arc_points`].
+///
+/// Everything comes from the bulge `b` and the chord `c`, never from the
+/// centre or from θ: a nearly straight segment has a radius up to ~1e16 and
+/// a nearly full turn a sweep indistinguishable from 2π in f64.
+/// - Its whole sagitta is `c·|b|/2`: a minor arc (`|b| ≤ 1`) within the
+///   tolerance is its chord alone.
+/// - Its radius is `c·(|b| + 1/|b|)/4` (= `c·(1 + b²)/(4|b|)`), finite for
+///   any finite bulge that is not so large the curve is refused anyway.
+/// - The point at sweep `φ` is `a + k·rot(b − a, (φ − θ)/2)` with
+///   `k = sin(φ/2)/sin(θ/2) = |sin(φ/2)|·(|b| + 1/|b|)/2`: the chord from `a`
+///   through `φ` is `2r·|sin(φ/2)|` long and leaves the tangent at `a`,
+///   turned `θ/2` from `b − a`, by `φ/2`. Its error is the rounding of the
+///   chord whatever the radius, and the ends are the stored vertices.
+fn bulge_points(a: (f64, f64), b: (f64, f64), bulge: f64, tolerance: f64, limit: usize) -> Result<Vec<(f64, f64)>, String> {
+    if ![a.0, a.1, b.0, b.1, bulge].iter().all(|v| v.is_finite()) {
+        return Err(NOT_FINITE.into());
+    }
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let chord = dx.hypot(dy);
+    let t = bulge.abs();
+    if chord == 0.0 || bulge == 0.0 || (t <= 1.0 && chord * t / 2.0 <= tolerance) {
+        return Ok(vec![a, b]);
+    }
+    let theta = 4.0 * bulge.atan();
+    let stretch = (t + 1.0 / t) / 2.0;
+    let count = arc_count(chord * stretch / 2.0, theta, tolerance, limit)?;
+    finite_points(
+        (0..=count)
+            .map(|i| {
+                if i == count {
+                    return b;
+                }
+                let phi = theta * i as f64 / count as f64;
+                let (sin, cos) = ((phi - theta) / 2.0).sin_cos();
+                let k = (phi / 2.0).sin().abs() * stretch;
+                (a.0 + k * (dx * cos - dy * sin), a.1 + k * (dx * sin + dy * cos))
+            })
+            .collect(),
+    )
 }
 
 /// A curve needs more points than the caller's budget allows.
 pub(crate) const OVER_LIMIT: &str = "The curve needs more points than this operation allows.";
 const UNSUPPORTED_SPLINE: &str = "A spline in the published view has a knot structure SecurePlan CAD cannot cut within the publication's precision.";
-const TOO_LARGE: &str = "A curve in the published view is too large to draw within the publication's precision. Shrink the published window or reduce the scale.";
+/// A curve that would need more than [`MAX_CURVE_SEGMENTS`] chords. The user
+/// sees [`located`] instead, which names the curve and where it is.
+const TOO_LARGE: &str = "A curve is too large to draw within the publication's precision.";
+/// A curve with a non-finite coordinate, radius, angle or bulge. The user
+/// sees [`located`] instead.
+const NOT_FINITE: &str = "A curve has a value that is not a finite number.";
+
+/// The refusal the user sees for `error` (from cutting `entity` within
+/// `tolerance` for publication, whose budget is [`MAX_CURVE_SEGMENTS`]): the curve's kind and a point on it in drawing units, through
+/// `transform` (its instance), shown only in the local Apply dialog. Every
+/// curve in the drawing is cut, inside the published window or not, so it
+/// has to be corrected or erased in the drawing.
+fn located(entity: &acadrust::EntityType, tolerance: f64, transform: &acadrust::types::Transform, error: String) -> String {
+    use acadrust::EntityType;
+    let problem = match error.as_str() {
+        // Publication's budget is the most any curve may need.
+        TOO_LARGE | OVER_LIMIT => "is too large to draw within the publication's precision",
+        NOT_FINITE => "has a coordinate, radius, angle or bulge that is not a finite number",
+        _ => return error,
+    };
+    let kind = match entity {
+        EntityType::Circle(_) => "A circle",
+        EntityType::Arc(_) => "An arc",
+        EntityType::Ellipse(_) => "An ellipse",
+        EntityType::Spline(_) => "A spline",
+        EntityType::Hatch(_) => "A hatch boundary",
+        _ => "A polyline",
+    };
+    let at = transform.apply(curve_point(entity, tolerance));
+    format!("{kind} near ({:.2}, {:.2}) {problem}. Find it in the drawing, then correct or erase it.", at.x, at.y)
+}
+
+/// A point on `entity`'s curve in its block's coordinates, where it starts:
+/// for a hatch, on the first boundary edge that cannot be cut within
+/// `tolerance` (else its first edge), as the fill draws it.
+fn curve_point(entity: &acadrust::EntityType, tolerance: f64) -> acadrust::types::Vector3 {
+    use acadrust::types::Vector3;
+    use acadrust::EntityType;
+    let ocs = |normal: Vector3, (x, y): (f64, f64), elevation: f64| {
+        let [x, y, z] = ocs_to_wcs(normal, (x, y), elevation);
+        Vector3::new(x, y, z)
+    };
+    match entity {
+        EntityType::Circle(c) => ocs(c.normal, (c.center.x + c.radius, c.center.y), c.center.z),
+        EntityType::Arc(a) => ocs(a.normal, (a.center.x + a.radius * a.start_angle.cos(), a.center.y + a.radius * a.start_angle.sin()), a.center.z),
+        EntityType::LwPolyline(p) => p.vertices.first().map_or(Vector3::ZERO, |v| ocs(p.normal, (v.location.x, v.location.y), p.elevation)),
+        EntityType::Polyline2D(p) => p.vertices.first().map_or(Vector3::ZERO, |v| ocs(p.normal, (v.location.x, v.location.y), p.elevation)),
+        EntityType::Ellipse(_) | EntityType::Spline(_) => match crate::entities::curve::entity_curve(entity) {
+            Some(curve) => {
+                let [x, y, z] = curve.plane.point_at(curve.curve.point_at(0.0));
+                Vector3::new(x, y, z)
+            }
+            None => Vector3::ZERO,
+        },
+        EntityType::Hatch(h) => {
+            use acadrust::entities::BoundaryEdge;
+            let edges: Vec<&BoundaryEdge> = h.paths.iter().flat_map(|path| &path.edges).collect();
+            let refused = edges.iter().find(|edge| matches!(edge_points(edge, tolerance), Some(Err(_)))).or(edges.first());
+            let start = refused.and_then(|edge| match edge {
+                BoundaryEdge::CircularArc(arc) => {
+                    let (start, _) = edge_arc(arc);
+                    Some([arc.center.x + arc.radius * start.cos(), arc.center.y + arc.radius * start.sin()])
+                }
+                edge => crate::entities::hatch::edge_curve(edge).map(|curve| curve.point_at(0.0)),
+            });
+            start.map_or(Vector3::ZERO, |[x, y]| ocs(h.normal, (x, y), h.elevation))
+        }
+        _ => Vector3::ZERO,
+    }
+}
 
 /// One polyline vertex in its OCS with the widths at the start and end of
 /// its outgoing segment.
@@ -627,21 +860,9 @@ fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64, limit
     for i in 0..count {
         let (from, to) = (&vertices[i], &vertices[(i + 1) % vertices.len()]);
         let (a, b) = (from.at, to.at);
-        let chord = (b.0 - a.0).hypot(b.1 - a.1);
         let width_at = |t: f64| from.start_width + (from.end_width - from.start_width) * t;
-        if from.bulge.abs() < 1e-12 || chord == 0.0 {
-            push(&mut out, a.0, a.1, from.start_width, from.end_width);
-            continue;
-        }
-        // bulge = tan(θ/4): radius and centre from the chord.
-        let theta = 4.0 * from.bulge.atan();
-        let radius = chord / (2.0 * (theta / 2.0).sin().abs());
-        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
-        let offset = radius * (theta / 2.0).cos() * theta.signum();
-        let normal = (-(b.1 - a.1) / chord, (b.0 - a.0) / chord);
-        let center = (mid.0 + normal.0 * offset, mid.1 + normal.1 * offset);
-        let start = (a.1 - center.1).atan2(a.0 - center.0);
-        let points = arc_points(center, radius, start, theta, tolerance, limit.saturating_sub(out.len()))?;
+        // A bulge is dropped only once its sagitta is shown within the tolerance.
+        let points = bulge_points(a, b, from.bulge, tolerance, limit.saturating_sub(out.len()))?;
         let pieces = points.len() - 1;
         for (k, point) in points[..pieces].iter().enumerate() {
             push(&mut out, point.0, point.1, width_at(k as f64 / pieces as f64), width_at((k + 1) as f64 / pieces as f64));
@@ -774,19 +995,22 @@ pub(crate) fn flatten_within(entity: &acadrust::EntityType, tolerance: f64, limi
 
 /// Record, for every curve `block` draws, the finest local tolerance any of
 /// its instances needs: `tolerance` (in the block's space units) divided by
-/// the instance's largest stretch to the plan.
+/// the instance's largest stretch to the plan, and that instance's
+/// transform (to say where a refused curve is).
 fn curve_tolerances(
     scene: &crate::scene::Scene,
     block: acadrust::types::Handle,
     view: Option<&ViewContext>,
     tolerance: f64,
-    out: &mut rustc_hash::FxHashMap<u64, f64>,
+    out: &mut rustc_hash::FxHashMap<u64, (f64, acadrust::types::Transform)>,
 ) {
     walk_block(scene, block, view, false, |entity, context| {
         if needs_flattening(entity) {
             let local = tolerance / plan_scale(&context.transform);
-            let slot = out.entry(entity.common().handle.value()).or_insert(local);
-            *slot = slot.min(local);
+            let slot = out.entry(entity.common().handle.value()).or_insert((local, context.transform));
+            if local < slot.0 {
+                *slot = (local, context.transform);
+            }
         }
     });
 }
@@ -795,21 +1019,22 @@ fn curve_tolerances(
 /// polyline within its tolerance, and the replaced curves' snap end points.
 type FlatDocument = (acadrust::CadDocument, rustc_hash::FxHashMap<u64, Vec<[f64; 3]>>);
 
-fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMap<u64, f64>) -> Result<FlatDocument, String> {
+fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMap<u64, (f64, acadrust::types::Transform)>) -> Result<FlatDocument, String> {
     use acadrust::EntityType;
     let mut document = source.document.clone();
     let mut key_points = rustc_hash::FxHashMap::default();
-    let mut handles: Vec<(u64, f64)> = tolerances.into_iter().collect();
+    let mut handles: Vec<(u64, (f64, acadrust::types::Transform))> = tolerances.into_iter().collect();
     handles.sort_by_key(|(handle, _)| *handle);
-    for (handle, tolerance) in handles {
+    for (handle, (tolerance, transform)) in handles {
         let handle = acadrust::types::Handle::new(handle);
         let Some(entity) = document.get_entity(handle) else { continue };
+        let located = |error: String| located(entity, tolerance, &transform, error);
         if let EntityType::Hatch(hatch) = entity {
-            let flat = flatten_hatch(hatch, tolerance)?;
+            let flat = flatten_hatch(hatch, tolerance).map_err(located)?;
             document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::Hatch(flat)));
             continue;
         }
-        let Some((polyline, keys)) = flatten(entity, tolerance)? else { continue };
+        let Some((polyline, keys)) = flatten(entity, tolerance).map_err(located)? else { continue };
         key_points.insert(handle.value(), keys);
         document.replace_entity_arc(handle, std::sync::Arc::new(EntityType::LwPolyline(polyline)));
     }
@@ -2107,5 +2332,465 @@ pub(crate) mod tests {
         doc.add_entity(EntityType::Ellipse(ellipse)).unwrap();
         let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
         assert!(refused.contains("too large"), "{refused}");
+    }
+
+    /// A 60 × 40 m window far from the origin at 1 mm per drawing unit, as
+    /// for a site drawn in map coordinates, at the scale Apply chooses.
+    fn far_transform() -> PageTransform {
+        let window = [500_000.0, -200_000.0, 560_000.0, -160_000.0];
+        let mapping = super::super::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
+        PageTransform { mapping, placement: place_page(window, &mapping, choose_mm_per_pt(window, &mapping).unwrap()).unwrap() }
+    }
+
+    /// The exact arc of the segment from `a` to `b` with `bulge`, by its
+    /// parameter in 0..=1, about its centre: radius `c(1 + b²)/4|b|` and the
+    /// centre `r·cos(θ/2) = r(1 − b²)/(1 + b²)` from the chord's middle (exact
+    /// far below the tolerance for the bulges it is used with, up to nearly
+    /// full turns).
+    fn bulge_arc(a: [f64; 2], b: [f64; 2], bulge: f64) -> impl Fn(f64) -> [f64; 2] {
+        let theta = 4.0 * bulge.atan();
+        let chord = (b[0] - a[0]).hypot(b[1] - a[1]);
+        let (t, u) = (bulge.abs(), 1.0 / bulge.abs());
+        let radius = chord * (t + u) / 4.0;
+        let cos_half = if t <= 1.0 { (1.0 - t * t) / (1.0 + t * t) } else { (u * u - 1.0) / (u * u + 1.0) };
+        let offset = radius * cos_half * bulge.signum();
+        let centre = [(a[0] + b[0]) / 2.0 - (b[1] - a[1]) / chord * offset, (a[1] + b[1]) / 2.0 + (b[0] - a[0]) / chord * offset];
+        let start = (a[1] - centre[1]).atan2(a[0] - centre[0]);
+        move |t| [centre[0] + radius * (start + theta * t).cos(), centre[1] + radius * (start + theta * t).sin()]
+    }
+
+    /// Each side of a cut chain of `corners` (x, y, bulge) starts at its
+    /// stored vertex exactly and stays within `tolerance` of its exact arc; a
+    /// near-straight side, whose whole sagitta |bulge|·chord/2 is within the
+    /// tolerance, is its chord alone.
+    fn assert_sides_within(points: &[[f64; 2]], corners: &[[f64; 3]], closed: bool, tolerance: f64) {
+        let sides = if closed { corners.len() } else { corners.len() - 1 };
+        let mut from = 0;
+        for (i, [ax, ay, bulge]) in corners[..sides].iter().copied().enumerate() {
+            let [bx, by, _] = corners[(i + 1) % corners.len()];
+            assert_eq!(points[from], [ax, ay], "side {i} does not start at its vertex");
+            let to = from + 1 + points[from + 1..].iter().position(|p| *p == [bx, by]).unwrap_or_else(|| panic!("side {i} does not end at its vertex"));
+            let side = &points[from..=to];
+            let chord = (bx - ax).hypot(by - ay);
+            if bulge.abs() * chord / 2.0 <= tolerance / 2.0 {
+                assert_eq!(side.len(), 2, "side {i} (bulge {bulge}) is not its chord");
+            } else {
+                let departure = polyline_departure(side, bulge_arc([ax, ay], [bx, by], bulge));
+                assert!(departure <= tolerance * (1.0 + 1e-6), "side {i} leaves its arc by {departure} mm");
+            }
+            from = to;
+        }
+        assert_eq!(from, points.len() - 1, "points past the last side");
+    }
+
+    /// The kernel cuts a clockwise bulge of a hatch boundary with its ends
+    /// swapped, so its points ran backwards between the pinned vertices, the
+    /// chord check failed and Apply refused the hatch as too large: any hatch
+    /// bounded by a clockwise arc (a rounded corner, a door swing). Each arc
+    /// is cut in order, within the tolerance.
+    #[test]
+    fn hatch_boundaries_with_clockwise_bulges_are_published() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        let transform = far_transform();
+        let tolerance = transform.placement.chord_tolerance_mm;
+        let (x, y) = (540_000.0, -175_000.0);
+        let corners = [[x, y, 0.0], [x + 2000.0, y, -1.0], [x + 2000.0, y + 1000.0, 0.0], [x, y + 1000.0, -0.414]];
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge { vertices: corners.iter().map(|[x, y, b]| Vector3::new(*x, *y, *b)).collect(), is_closed: true }));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        let flat = flatten_hatch(&hatch, tolerance).expect("the hatch is published");
+        let BoundaryEdge::Polyline(edge) = &flat.paths[0].edges[0] else { panic!("the boundary was not cut") };
+        let points: Vec<[f64; 2]> = edge.vertices.iter().map(|v| [v.x, v.y]).collect();
+        assert_sides_within(&points, &corners, true, tolerance);
+        let mut doc = CadDocument::new();
+        doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+        prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).expect("Apply publishes the hatch");
+    }
+
+    /// A hatch boundary segment whose bulge is rounding noise (a sweep below
+    /// 1e-9 rad) was read by the kernel as a full circle thousands of
+    /// kilometres across, cut at its 16,384-chord cap, and the hatch was
+    /// refused as too large. It is its chord; a real bulge on the same
+    /// boundary is still cut within the tolerance.
+    #[test]
+    fn hatch_boundaries_with_near_straight_bulges_are_published() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        let transform = far_transform();
+        let tolerance = transform.placement.chord_tolerance_mm;
+        let (x, y) = (520_000.0, -185_000.0);
+        let corners = [[x, y, 1e-10], [x + 20_000.0, y, -3e-12], [x + 20_000.0, y + 10_000.0, 0.4], [x, y + 10_000.0, 0.0]];
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge { vertices: corners.iter().map(|[x, y, b]| Vector3::new(*x, *y, *b)).collect(), is_closed: true }));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        let flat = flatten_hatch(&hatch, tolerance).expect("the hatch is published");
+        let BoundaryEdge::Polyline(edge) = &flat.paths[0].edges[0] else { panic!("the boundary was not cut") };
+        let points: Vec<[f64; 2]> = edge.vertices.iter().map(|v| [v.x, v.y]).collect();
+        assert_sides_within(&points, &corners, true, tolerance);
+        let mut doc = CadDocument::new();
+        doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+        prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).expect("Apply publishes the hatch");
+    }
+
+    /// A 20 m polyline segment with a bulge of 1.5e-12 has a radius near
+    /// 3e15 mm: `1 − tol/r` rounded to 1, the step to 0, and the polyline was
+    /// refused as too large. Near-straight segments are their chords, and
+    /// every side starts at its stored vertex exactly (not a rounding of a
+    /// far-away centre).
+    #[test]
+    fn polyline_segments_with_near_straight_bulges_are_published() {
+        use acadrust::entities::LwVertex;
+        let transform = far_transform();
+        let tolerance = transform.placement.chord_tolerance_mm;
+        let (x, y) = (530_000.0, -170_000.0);
+        let corners = [[x, y, 1.5e-12], [x + 20_000.0, y, 2e-9], [x + 20_000.0, y + 15_000.0, -0.25], [x, y + 15_000.0, 0.0]];
+        let mut polyline = LwPolyline::new();
+        polyline.vertices = corners
+            .iter()
+            .map(|[x, y, bulge]| {
+                let mut vertex = LwVertex::new(Vector2::new(*x, *y));
+                vertex.bulge = *bulge;
+                vertex
+            })
+            .collect();
+        let (flat, _) = flatten(&EntityType::LwPolyline(polyline.clone()), tolerance).expect("the polyline is published").expect("replaced");
+        let points: Vec<[f64; 2]> = flat.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+        assert_sides_within(&points, &corners, false, tolerance);
+        let mut doc = CadDocument::new();
+        doc.add_entity(EntityType::LwPolyline(polyline)).unwrap();
+        prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).expect("Apply publishes the polyline");
+    }
+
+    /// Hatch arc edges are cut analytically, like arcs, with no kernel cap:
+    /// a 100 km circular edge needs far more than 16,384 chords.
+    #[test]
+    fn hatch_arc_edges_beyond_the_kernel_cap_meet_the_tolerance() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        let transform = far_transform();
+        let tolerance = transform.placement.chord_tolerance_mm;
+        let (cx, cy, radius) = (530_000.0, -180_000.0 - 1.0e8, 1.0e8);
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+            center: Vector2::new(cx, cy),
+            radius,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::TAU,
+            counter_clockwise: true,
+        }));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        let flat = flatten_hatch(&hatch, tolerance).expect("the hatch is published");
+        let BoundaryEdge::Polyline(edge) = &flat.paths[0].edges[0] else { panic!("the boundary was not cut") };
+        assert!(edge.vertices.len() > 16_385, "{} vertices", edge.vertices.len());
+        let worst = edge
+            .vertices
+            .windows(2)
+            .map(|pair| radius - ((pair[0].x + pair[1].x) / 2.0 - cx).hypot((pair[0].y + pair[1].y) / 2.0 - cy))
+            .fold(0.0, f64::max);
+        assert!(worst <= tolerance * (1.0 + 1e-6), "chord error {worst} mm > {tolerance} mm");
+    }
+
+    /// A curve that is refused is named, with a point on it in drawing units
+    /// (through its block reference), so the user can find it.
+    #[test]
+    fn a_refused_curve_is_named_with_its_drawing_position() {
+        use acadrust::entities::Insert;
+        let transform = far_transform();
+        // A 1 rad arc of a radius of 1e13 mm needs millions of chords.
+        let mut arc = Arc::new();
+        arc.center = Vector3::new(0.0, -1.0e13, 0.0);
+        arc.radius = 1.0e13;
+        arc.start_angle = std::f64::consts::FRAC_PI_2;
+        arc.end_angle = std::f64::consts::FRAC_PI_2 + 1.0;
+        let mut doc = CadDocument::new();
+        crate::app::secureplan::snap::tests::block(&mut doc, "HUGE", vec![EntityType::Arc(arc)]);
+        doc.add_entity(EntityType::Insert(Insert::new("HUGE", Vector3::new(525_000.0, -180_000.0, 0.0)))).unwrap();
+        let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
+        assert!(refused.starts_with("An arc near (525000.00, -180000.00) is too large"), "{refused}");
+        assert!(!refused.contains("scale"), "{refused}");
+    }
+
+    /// Major arcs and huge bulges of both signs are cut from the bulge
+    /// itself: through `4·atan(b)`, a bulge of 1e16 on a 1e-12 chord had a
+    /// radius of ~4,083 instead of 2,500, and one of 1e20 on a 1e-8 chord
+    /// (millions of chords at 0.05) was taken for ~63,500 chords and drawn.
+    #[test]
+    fn major_arcs_and_huge_bulges_are_cut_from_the_bulge() {
+        let tolerance = 0.05;
+        for sign in [1.0, -1.0] {
+            for (a, b, bulge) in [
+                ((520_000.0, -185_000.0), (521_000.0, -185_000.0), 2.0),
+                ((520_000.0, -185_000.0), (520_000.0, -184_999.0), 1e3),
+                ((0.0, 0.0), (1e-12, 0.0), 1e16),
+            ] {
+                let points = bulge_points(a, b, sign * bulge, tolerance, MAX_CURVE_SEGMENTS).expect("cut");
+                assert_eq!((points[0], points[points.len() - 1]), (a, b), "bulge {}", sign * bulge);
+                let points: Vec<[f64; 2]> = points.into_iter().map(|(x, y)| [x, y]).collect();
+                let departure = polyline_departure(&points, bulge_arc([a.0, a.1], [b.0, b.1], sign * bulge));
+                assert!(departure <= tolerance * (1.0 + 1e-6), "bulge {}: the arc leaves a chord by {departure}", sign * bulge);
+            }
+            let refused = bulge_points((0.0, 0.0), (1e-8, 0.0), sign * 1e20, tolerance, MAX_CURVE_SEGMENTS);
+            assert_eq!(refused, Err(TOO_LARGE.to_string()), "a bulge of {} on a 1e-8 chord", sign * 1e20);
+        }
+    }
+
+    /// A bulge of exactly 1e-12 is curved to the kernel (a full circle of a
+    /// radius near 5e15 on a 20 m chord) but was left unflattened by a
+    /// `> 1e-12` filter, for the fill renderer's kernel cut. Every nonzero
+    /// bulge is flattened; one whose sagitta is within the tolerance becomes
+    /// its chord.
+    #[test]
+    fn a_bulge_at_the_old_threshold_is_flattened() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LwVertex, PolylineEdge};
+        let transform = far_transform();
+        let (x, y) = (520_000.0, -185_000.0);
+        let corners = [[x, y, 1e-12], [x + 20_000.0, y, 0.0], [x + 20_000.0, y + 10_000.0, 0.0], [x, y + 10_000.0, 0.0]];
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge { vertices: corners.iter().map(|[x, y, b]| Vector3::new(*x, *y, *b)).collect(), is_closed: true }));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        let mut polyline = LwPolyline::new();
+        polyline.vertices = corners
+            .iter()
+            .map(|[x, y, bulge]| {
+                let mut vertex = LwVertex::new(Vector2::new(*x, *y + 20_000.0));
+                vertex.bulge = *bulge;
+                vertex
+            })
+            .collect();
+        let mut doc = CadDocument::new();
+        let hatch = doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+        let polyline = doc.add_entity(EntityType::LwPolyline(polyline)).unwrap();
+        let publication = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).expect("Apply publishes both");
+        let Some(EntityType::Hatch(hatch)) = publication.scene.document.get_entity(hatch) else { panic!("the hatch is gone") };
+        let bulges: Vec<f64> = hatch.paths.iter().flat_map(|path| &path.edges).flat_map(|edge| match edge {
+            BoundaryEdge::Polyline(edge) => edge.vertices.iter().map(|v| v.z).collect(),
+            _ => vec![f64::NAN],
+        }).collect();
+        assert!(bulges.iter().all(|b| *b == 0.0), "the published hatch keeps bulges {bulges:?}");
+        let published = replaced(&publication, polyline);
+        assert!(published.vertices.iter().all(|v| v.bulge == 0.0), "the published polyline keeps a bulge");
+        assert_eq!(published.vertices.len(), 4, "a bulge within the tolerance is its chord");
+    }
+
+    /// A non-finite bulge, coordinate or radius is refused, not drawn: an
+    /// infinite bulge was a half-turn arc and a NaN one gave NaN vertices.
+    #[test]
+    fn curves_with_non_finite_values_are_refused() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LwVertex, PolylineEdge};
+        let tolerance = far_transform().placement.chord_tolerance_mm;
+        let (x, y) = (520_000.0, -185_000.0);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // A malformed segment after an ordinary curved one.
+            let corners = [[x, y, 0.5], [x + 1000.0, y, bad], [x + 1000.0, y + 1000.0, 0.0]];
+            let mut polyline = LwPolyline::new();
+            polyline.vertices = corners
+                .iter()
+                .map(|[x, y, bulge]| {
+                    let mut vertex = LwVertex::new(Vector2::new(*x, *y));
+                    vertex.bulge = *bulge;
+                    vertex
+                })
+                .collect();
+            let refused = flatten(&EntityType::LwPolyline(polyline.clone()), tolerance).err();
+            assert_eq!(refused.as_deref(), Some(NOT_FINITE), "a polyline with a bulge of {bad}");
+            let mut path = BoundaryPath::new();
+            path.add_edge(BoundaryEdge::Polyline(PolylineEdge { vertices: corners.iter().map(|[x, y, b]| Vector3::new(*x, *y, *b)).collect(), is_closed: true }));
+            let mut hatch = Hatch::new();
+            hatch.paths.push(path);
+            assert_eq!(flatten_hatch(&hatch, tolerance).err().as_deref(), Some(NOT_FINITE), "a hatch with a bulge of {bad}");
+            let mut doc = CadDocument::new();
+            doc.add_entity(EntityType::LwPolyline(polyline)).unwrap();
+            let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), far_transform()).err().expect("refused");
+            assert!(refused.starts_with("A polyline near (520000.00, -185000.00) has a coordinate"), "{refused}");
+            let mut circle = Circle::new();
+            circle.center = Vector3::new(x, y, 0.0);
+            circle.radius = bad;
+            assert_eq!(flatten(&EntityType::Circle(circle), tolerance).err().as_deref(), Some(NOT_FINITE), "a circle of radius {bad}");
+        }
+    }
+
+    /// A short arc of a large radius is one chord, where the arc is: its
+    /// points are placed from its start, which is as exact as f64 allows
+    /// (checked against a fused multiply-add). One whose start cannot be
+    /// placed within half the tolerance (radius 1e16: `c + r·cos(1)` loses
+    /// ~0.4 units to cancellation) is refused; `2·acos(1 − tol/r)` had cut
+    /// neither.
+    #[test]
+    fn short_arcs_of_large_radius_are_placed_or_refused() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        let tolerance = far_transform().placement.chord_tolerance_mm;
+        let hatch_arc = |center: (f64, f64), radius: f64, start: f64, end: f64, counter_clockwise: bool| {
+            let mut path = BoundaryPath::new();
+            path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+                center: Vector2::new(center.0, center.1),
+                radius,
+                start_angle: start,
+                end_angle: end,
+                counter_clockwise,
+            }));
+            let mut hatch = Hatch::new();
+            hatch.paths.push(path);
+            flatten_hatch(&hatch, tolerance).map(|flat| match &flat.paths[0].edges[0] {
+                BoundaryEdge::Polyline(edge) => edge.vertices.iter().map(|v| [v.x, v.y]).collect::<Vec<_>>(),
+                other => panic!("not cut: {other:?}"),
+            })
+        };
+        // Radius 1e12 at a non-cardinal start, landing near (520000, -185000).
+        let (radius, start, sweep) = (1e12, 1.0_f64, 2f64.powi(-30));
+        let center = (520_000.0 - radius * start.cos(), -185_000.0 - radius * start.sin());
+        let exact = |angle: f64| [radius.mul_add(angle.cos(), center.0), radius.mul_add(angle.sin(), center.1)];
+        let points = hatch_arc(center, radius, start, start + sweep, true).expect("published");
+        assert_eq!(points.len(), 2, "one chord");
+        for (point, expected) in [(points[0], exact(start)), (points[1], exact(start + sweep))] {
+            let off = (point[0] - expected[0]).hypot(point[1] - expected[1]);
+            assert!(off <= tolerance / 2.0, "an end is {off} from the arc");
+        }
+        let mut arc = Arc::new();
+        arc.center = Vector3::new(center.0, center.1, 0.0);
+        arc.radius = radius;
+        arc.start_angle = start;
+        arc.end_angle = start + sweep;
+        let (polyline, _) = flatten(&EntityType::Arc(arc), tolerance).expect("the arc is published").expect("replaced");
+        let off = (polyline.vertices[0].location.x - exact(start)[0]).hypot(polyline.vertices[0].location.y - exact(start)[1]);
+        assert!(polyline.vertices.len() == 2 && off <= tolerance / 2.0, "{} vertices, start {off} from the arc", polyline.vertices.len());
+        // Radius 1e16: refused rather than drawn up to ~0.4 away.
+        let refused = hatch_arc((-5403023058681398.0, -8414709848078965.0), 1e16, 1.0, 1.0 + 2f64.powi(-40), true);
+        assert_eq!(refused, Err(TOO_LARGE.to_string()));
+    }
+
+    /// A hatch arc sweeping 2^-52 rad was a full circle: the kernel
+    /// normalises each angle before subtracting, so 0 and 2^-52 both became
+    /// 0, and a 1e12 radius circle was refused. The sweep comes from the
+    /// stored angles, either way round; equal angles are still a full turn.
+    #[test]
+    fn tiny_hatch_arcs_are_not_full_circles() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        let tolerance = far_transform().placement.chord_tolerance_mm;
+        let radius = 1e12;
+        for counter_clockwise in [true, false] {
+            let mut path = BoundaryPath::new();
+            path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+                center: Vector2::new(520_000.0 - radius, -185_000.0),
+                radius,
+                start_angle: 0.0,
+                end_angle: 2f64.powi(-52),
+                counter_clockwise,
+            }));
+            let mut hatch = Hatch::new();
+            hatch.paths.push(path);
+            let flat = flatten_hatch(&hatch, tolerance).expect("the hatch is published");
+            let BoundaryEdge::Polyline(edge) = &flat.paths[0].edges[0] else { panic!("the boundary was not cut") };
+            assert_eq!(edge.vertices.len(), 2, "counter-clockwise {counter_clockwise}: one chord");
+            let length = (edge.vertices[1].x - edge.vertices[0].x).hypot(edge.vertices[1].y - edge.vertices[0].y);
+            assert!(length < 1e-3, "a chord of {length}");
+        }
+        assert_eq!(arc_sweep(1.0, 1.0), std::f64::consts::TAU);
+        assert_eq!(arc_sweep(0.0, std::f64::consts::TAU), std::f64::consts::TAU);
+    }
+
+    /// A negative radius is cut by its size: it was always within the
+    /// tolerance of `tolerance >= radius`, so a -1000 circle was four chords
+    /// sagging 293 units. It keeps its signed geometry (the same circle).
+    #[test]
+    fn negative_radii_are_cut_within_the_tolerance() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        let tolerance = far_transform().placement.chord_tolerance_mm;
+        let center = (520_000.0, -185_000.0);
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+            center: Vector2::new(center.0, center.1),
+            radius: -1000.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::TAU,
+            counter_clockwise: true,
+        }));
+        let mut hatch = Hatch::new();
+        hatch.paths.push(path);
+        let flat = flatten_hatch(&hatch, tolerance).expect("the hatch is published");
+        let BoundaryEdge::Polyline(edge) = &flat.paths[0].edges[0] else { panic!("the boundary was not cut") };
+        let hatch_points: Vec<[f64; 2]> = edge.vertices.iter().map(|v| [v.x, v.y]).collect();
+        let mut circle = Circle::new();
+        circle.center = Vector3::new(center.0, center.1, 0.0);
+        circle.radius = -1000.0;
+        let (polyline, _) = flatten(&EntityType::Circle(circle), tolerance).expect("the circle is published").expect("replaced");
+        let circle_points: Vec<[f64; 2]> = polyline.vertices.iter().map(|v| [v.location.x, v.location.y]).collect();
+        for points in [hatch_points, circle_points] {
+            let on_circle = |t: f64| {
+                let angle = t * std::f64::consts::TAU;
+                [center.0 + 1000.0 * angle.cos(), center.1 + 1000.0 * angle.sin()]
+            };
+            let departure = polyline_departure(&points, on_circle);
+            let sag = points
+                .windows(2)
+                .map(|w| 1000.0 - ((w[0][0] + w[1][0]) / 2.0 - center.0).hypot((w[0][1] + w[1][1]) / 2.0 - center.1))
+                .fold(0.0, f64::max);
+            assert!(departure <= tolerance * (1.0 + 1e-6) && sag <= tolerance * (1.0 + 1e-6), "{} chords: sag {sag}, departure {departure}", points.len() - 1);
+        }
+    }
+
+    /// Sides that together need more chords than a curve may have are
+    /// refused like one oversized curve, located, not with the bare budget
+    /// message.
+    #[test]
+    fn a_polyline_over_the_budget_is_located() {
+        use acadrust::entities::LwVertex;
+        let transform = far_transform();
+        // Two semicircles of radius 1e11: each fits, together they do not.
+        let (x, y) = (520_000.0, -185_000.0);
+        let mut polyline = LwPolyline::new();
+        polyline.vertices = [(x, y, 1.0), (x + 2e11, y, 1.0), (x, y, 0.0)]
+            .iter()
+            .map(|(x, y, bulge)| {
+                let mut vertex = LwVertex::new(Vector2::new(*x, *y));
+                vertex.bulge = *bulge;
+                vertex
+            })
+            .collect();
+        let mut doc = CadDocument::new();
+        doc.add_entity(EntityType::LwPolyline(polyline)).unwrap();
+        let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
+        assert!(refused.starts_with("A polyline near (520000.00, -185000.00) is too large"), "{refused}");
+    }
+
+    /// A refused hatch or ellipse is located on the curve as drawn: a
+    /// clockwise hatch arc is mirrored (edge angles run the other way) and an
+    /// elliptic arc starts at its start parameter, not at its major axis.
+    #[test]
+    fn refused_hatch_arcs_and_ellipses_are_located_on_the_curve() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Ellipse, Hatch};
+        let transform = far_transform();
+        // A clockwise quarter of radius 1e13 stored from π/2 to π is drawn
+        // from π to 3π/2: it starts at the centre's left.
+        let mut path = BoundaryPath::new();
+        path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
+            center: Vector2::new(525_000.0 + 1e13, -180_000.0),
+            radius: 1e13,
+            start_angle: std::f64::consts::FRAC_PI_2,
+            end_angle: std::f64::consts::PI,
+            counter_clockwise: false,
+        }));
+        let mut hatch = Hatch::new();
+        hatch.paths.push(path);
+        let mut doc = CadDocument::new();
+        doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+        let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
+        assert!(refused.starts_with("A hatch boundary near (525000.00, -180000.00) is too large"), "{refused}");
+        // An elliptic quarter from parameter π/2 starts on its minor axis.
+        let mut ellipse = Ellipse::new();
+        ellipse.center = Vector3::new(525_000.0, -180_000.0 - 5e12, 0.0);
+        ellipse.major_axis = Vector3::new(1e13, 0.0, 0.0);
+        ellipse.minor_axis_ratio = 0.5;
+        ellipse.start_parameter = std::f64::consts::FRAC_PI_2;
+        ellipse.end_parameter = std::f64::consts::PI;
+        let mut doc = CadDocument::new();
+        doc.add_entity(EntityType::Ellipse(ellipse)).unwrap();
+        let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
+        assert!(refused.starts_with("An ellipse near (525000.00, -180000.00) is too large"), "{refused}");
     }
 }
