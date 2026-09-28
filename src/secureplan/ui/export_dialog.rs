@@ -323,10 +323,10 @@ impl OpenCADStudio {
         // A finished Apply's progress dialog gives way to a waiting export;
         // its outcome is also on the command line.
         let waiting = self.secureplan.sessions.bound.iter().any(|b| b.export.as_ref().is_some_and(|job| job.waiting.is_some()));
-        if waiting && matches!(&self.secureplan.dialog, Some(Dialog::ApplyProgress(d)) if d.finished()) {
-            self.secureplan.dialog = None;
+        if waiting && self.secureplan.apply_progress.as_ref().is_some_and(|d| d.finished()) {
+            self.secureplan.apply_progress = None;
         }
-        if self.secureplan.dialog.is_some() || self.secureplan.trust.prompt().is_some() {
+        if self.secureplan.dialog.is_some() || self.secureplan.apply_progress.is_some() || self.secureplan.trust.prompt().is_some() {
             return;
         }
         let waiting = self.secureplan.sessions.bound.iter_mut().find_map(|b| {

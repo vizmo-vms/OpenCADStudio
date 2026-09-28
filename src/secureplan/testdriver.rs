@@ -401,7 +401,7 @@ mod tests {
         h.app.secureplan.dialog = None;
         let _ = h.app.secureplan_driver(parse("apply").unwrap());
         // Only the progress dialog, which needs no answer.
-        assert!(matches!(&h.app.secureplan.dialog, Some(crate::app::secureplan::ui::Dialog::ApplyProgress(d)) if !d.finished()), "no dialog to answer");
+        assert!(h.app.secureplan.dialog.is_none() && h.app.secureplan.apply_progress.as_ref().is_some_and(|d| !d.finished()), "no dialog to answer");
         let (request, transfers) = h.receive("applyRequest");
         assert_eq!(transfers.len(), 4, "drawing, original, PDF and snap file");
         assert_eq!(request["view"]["kind"], "model");
@@ -422,7 +422,7 @@ mod tests {
         h.app.secureplan.dialog = None;
         let _ = h.app.secureplan_driver(parse("apply view=layout:Sheet A1").unwrap());
         // Only the progress dialog, which needs no answer.
-        assert!(matches!(&h.app.secureplan.dialog, Some(crate::app::secureplan::ui::Dialog::ApplyProgress(d)) if !d.finished()), "no dialog to answer");
+        assert!(h.app.secureplan.dialog.is_none() && h.app.secureplan.apply_progress.as_ref().is_some_and(|d| !d.finished()), "no dialog to answer");
         let (request, transfers) = h.receive("applyRequest");
         assert_eq!(request["view"]["kind"], "layout");
         assert_eq!(request["view"]["layoutName"], "Sheet A1");

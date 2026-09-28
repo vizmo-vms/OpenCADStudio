@@ -133,7 +133,7 @@ impl DeviceKind {
 /// and the polyline that replaces it in an icon block (0.5 % of a 400 mm icon).
 pub const ICON_TOLERANCE_MM: f64 = 2.0;
 /// CAD text height (cap height) per unit of the canvas's font size.
-const CAP_HEIGHT: f64 = 0.7;
+pub(crate) const CAP_HEIGHT: f64 = 0.7;
 
 fn light() -> Color {
     let [r, g, b] = WEB_LIGHT;

@@ -30,10 +30,13 @@
 //! The export dialog's **Device symbols** choice (EXP-02) decides the device
 //! blocks when the export is written: *SecurePlan icons* (the default) draws
 //! each device as the SecurePlan canvas does ([`symbols::icon_block`]), in its
-//! colour and at its symbol scale; *Standard symbols* draws the standard block
-//! of its kind, as SecurePlan CAD 0.2.1 did. A device whose icon is an
-//! uploaded picture, cannot be read, or is none keeps the standard symbol with
-//! either choice, and the summary says so. Everything else in the export is
+//! colour and at its symbol scale, with its label centred below the symbol
+//! at the canvas's per-kind offset and size, turned with the symbol;
+//! *Standard symbols* draws the standard block of its kind with the label
+//! beside it, as SecurePlan CAD 0.2.1 did, both scaled by the device's symbol
+//! scale. A device whose icon is an uploaded picture, cannot be read, or is
+//! none keeps the standard symbol and label with either choice, and the
+//! summary says so. Everything else in the export is
 //! the same for both choices, so the drawing is read and the design composed
 //! once; the chosen device blocks are added to a copy when it is written.
 //!
@@ -242,8 +245,34 @@ pub struct PlacedDevice {
     pub symbol_scale: f64,
     /// Its SecurePlan icon block (the name without the prefix), if it has one.
     pub icon_block: Option<String>,
-    /// The label text, as with 0.2.1.
-    pub label: EntityType,
+    /// The label text: the element's label, else its name, else its kind.
+    pub caption: String,
+}
+
+impl PlacedDevice {
+    /// The label with its SecurePlan icon: centred under the symbol where
+    /// the canvas puts it (per kind, times the symbol scale), turned with
+    /// the symbol by `rotation` (CAD radians).
+    pub fn icon_label(&self, rotation: f64) -> EntityType {
+        let web = self.kind.web();
+        let k = self.unit * self.symbol_scale;
+        let down = (web.label_top + web.label_size / 2.0) * k;
+        // Below the centre in the symbol's frame (y up in CAD).
+        let at = Vector3::new(self.at.x + down * rotation.sin(), self.at.y - down * rotation.cos(), 0.0);
+        let mut text = Text::with_value(&self.caption, at).with_height(web.label_size * symbols::CAP_HEIGHT * k).with_rotation(rotation);
+        text.horizontal_alignment = acadrust::entities::TextHorizontalAlignment::Center;
+        text.vertical_alignment = acadrust::entities::TextVerticalAlignment::Middle;
+        text.alignment_point = Some(at);
+        EntityType::Text(text)
+    }
+
+    /// The label beside the standard symbol, placed as 0.2.1 placed it and
+    /// scaled with the symbol.
+    pub fn standard_label(&self) -> EntityType {
+        let k = self.unit * self.symbol_scale;
+        let height = TEXT_HEIGHT_MM * k;
+        text(&self.caption, Vector3::new(self.at.x + 2.2 * symbols::SYMBOL_RADIUS_MM * k, self.at.y - height / 2.0, 0.0), height)
+    }
 }
 
 /// What the export adds, for the summary and the tests.
@@ -494,7 +523,6 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
             DeviceKind::Equipment => "Equipment",
             DeviceKind::Asset => "Asset",
         });
-        let beside = Vector3::new(at.x + 2.2 * symbols::SYMBOL_RADIUS_MM * unit, at.y - height / 2.0, 0.0);
         // The symbol and the label take their places when written.
         plan.items.extend([(kind.tag().to_string(), None), (kind.tag().to_string(), None)]);
         composition.placed.push(PlacedDevice {
@@ -506,7 +534,7 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
             unit,
             symbol_scale: device.symbol_scale,
             icon_block,
-            label: text(caption, beside, height),
+            caption: caption.to_string(),
         });
     }
     for target in &payload.targets {
@@ -661,13 +689,19 @@ pub fn place_devices(document: &mut CadDocument, composition: &Composition, choi
             .icon_blocks
             .iter()
             .find(|(key, _)| choice == DeviceSymbols::Icons && device.icon_block.as_ref() == Some(key));
-        let (key, content, scale, rotation) = match icon {
+        let (key, content, scale, rotation, mut label) = match icon {
             Some((key, content)) => {
                 let rotation = if device.kind.web().rotates { device.facing } else { device.upright };
-                (key.clone(), content.clone(), device.unit * device.symbol_scale, rotation)
+                (key.clone(), content.clone(), device.unit * device.symbol_scale, rotation, device.icon_label(rotation))
             }
-            // As with 0.2.1.
-            None => (format!("SYMBOL-{}", device.kind.tag()), symbols::symbol(device.kind), symbols::SYMBOL_RADIUS_MM * device.unit, device.facing),
+            // As with 0.2.1, at the device's symbol scale.
+            None => (
+                format!("SYMBOL-{}", device.kind.tag()),
+                symbols::symbol(device.kind),
+                symbols::SYMBOL_RADIUS_MM * device.unit * device.symbol_scale,
+                device.facing,
+                device.standard_label(),
+            ),
         };
         let name = format!("{prefix}{key}");
         if !defined.contains(&name) {
@@ -679,7 +713,6 @@ pub fn place_devices(document: &mut CadDocument, composition: &Composition, choi
         insert.common.color = device.color;
         insert.common.layer = layer.clone();
         let _ = document.add_entity(EntityType::Insert(insert));
-        let mut label = device.label.clone();
         label.common_mut().layer = layer;
         let _ = document.add_entity(label);
     }
@@ -1233,7 +1266,10 @@ pub(crate) mod tests {
         assert!(inserts[0].rotation.abs() < 1e-12 && inserts[2].rotation.abs() < 1e-12, "cameras upright");
         assert!((inserts[3].rotation - 270f64.to_radians()).abs() < 1e-12 && (inserts[3].x_scale() - 2.0).abs() < 1e-12);
         assert_eq!(inserts[3].common.color, Color::Rgb { r: 0x33, g: 0x66, b: 0x99 });
-        assert_eq!(inserts[1].x_scale(), symbols::SYMBOL_RADIUS_MM, "without an icon: the standard symbol, as with 0.2.1");
+        assert!(
+            (inserts[1].x_scale() - symbols::SYMBOL_RADIUS_MM * composition.placed[1].symbol_scale).abs() < 1e-9,
+            "without an icon: the standard symbol, as with 0.2.1, at its symbol scale"
+        );
         let record = document.block_records.get(&icon("c2", "EQUIPMENT-SW")).unwrap();
         let content: Vec<&EntityType> = record.entity_handles.iter().filter_map(|h| document.get_entity(*h)).collect();
         assert!(matches!(content[0], EntityType::Hatch(h) if h.is_solid) && content[0].common().color == Color::ByBlock);
@@ -1247,11 +1283,81 @@ pub(crate) mod tests {
         assert_eq!(blocks, ["SECUREPLAN-SYMBOL-CAMERA", "SECUREPLAN-SYMBOL-EQUIPMENT", "SECUREPLAN-SYMBOL-ASSET"]);
         let record = standard.block_records.get("SECUREPLAN-SYMBOL-CAMERA").unwrap();
         assert_eq!(record.entity_handles.len(), symbols::symbol(DeviceKind::Camera).len());
-        assert!(standard.entities().all(|e| !matches!(e, EntityType::Insert(i) if i.common.layer.starts_with("SECUREPLAN") && i.x_scale() != symbols::SYMBOL_RADIUS_MM)));
+        let standard_inserts = standard.entities().filter_map(|e| match e {
+            EntityType::Insert(insert) if insert.common.layer.starts_with("SECUREPLAN") => Some(insert),
+            _ => None,
+        });
+        for (insert, placed) in standard_inserts.zip(&composition.placed) {
+            assert!((insert.x_scale() - symbols::SYMBOL_RADIUS_MM * placed.symbol_scale).abs() < 1e-9, "{}: at its symbol scale", placed.caption);
+        }
         // Both choices place every device and its label.
         for document in [&document, &standard] {
             for (layer, count) in &composition.layers {
                 assert_eq!(on_layer(document, layer).count(), *count, "{layer}");
+            }
+        }
+    }
+
+    /// The symbol and its label follow the chosen layout and the device's
+    /// symbol scale: with its SecurePlan icon, the label is centred below
+    /// the symbol at the canvas's per-kind offset and size and turns with it;
+    /// with a standard symbol (chosen, or the fallback), the label sits
+    /// beside it as in 0.2.1, scaled with it. Drawing units of 10 mm, so the
+    /// mapping's scale shows too.
+    #[test]
+    fn labels_and_symbols_follow_the_layout_and_the_symbol_scale() {
+        use crate::app::secureplan::icons::tests::{b64, CIRCLE_SVG};
+        let mut value = sample_payload();
+        value["devices"] = serde_json::json!([]);
+        value["icons"] = serde_json::json!([{ "id": "c2", "mediaType": "image/svg+xml", "data": b64(CIRCLE_SVG.as_bytes()) }]);
+        let cases = [("camera", 0.5, 90.0, true), ("camera", 4.0, 0.0, true), ("equipment", 2.0, 90.0, true), ("asset", 1.0, 0.0, true), ("asset", 3.0, 0.0, false)];
+        for (i, (kind, scale, rotation, icon)) in cases.iter().enumerate() {
+            value["devices"].as_array_mut().unwrap().push(serde_json::json!({
+                "id": format!("d{i}"), "kind": kind, "name": "n", "iconKey": "generic", "customIcon": false, "color": "#336699",
+                "label": format!("D{i}"), "status": "Proposed", "position": [1000, 1000], "rotationDeg": rotation, "symbolScale": scale,
+                "iconId": if *icon { serde_json::json!("c2") } else { serde_json::Value::Null },
+                "badge": if *kind == "equipment" { serde_json::json!("SW") } else { serde_json::Value::Null },
+            }));
+        }
+        let payload = parse_payload(value.to_string().as_bytes()).unwrap();
+        let mapping = Mapping { scale_mm_per_cad_unit: 10.0, ..mapping() };
+        let mut base = testutil::synthetic_document();
+        let composition = compose(&mut base, &payload, &mapping);
+        let centre = world_to_cad(&mapping, [1000.0, 1000.0]);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        for choice in [DeviceSymbols::Icons, DeviceSymbols::Standard] {
+            let mut document = base.clone();
+            place_devices(&mut document, &composition, choice);
+            let on_secureplan = |e: &&EntityType| e.common().layer.starts_with("SECUREPLAN");
+            let inserts: Vec<&Insert> = document.entities().filter(on_secureplan).filter_map(|e| if let EntityType::Insert(i) = e { Some(i) } else { None }).collect();
+            for (i, (kind, scale, rotation, icon)) in cases.iter().enumerate() {
+                let label = document
+                    .entities()
+                    .filter(on_secureplan)
+                    .find_map(|e| match e {
+                        EntityType::Text(t) if t.value == format!("D{i}") => Some(t),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("D{i} has a label"));
+                let k = scale / 10.0; // drawing units per canvas mm
+                if choice == DeviceSymbols::Icons && *icon {
+                    let web = DeviceKind::parse(kind).unwrap().web();
+                    // Cameras stay upright; the others turn (90° in the world is 270° in CAD).
+                    let turn = if web.rotates && *rotation == 90.0 { 270f64.to_radians() } else { 0.0 };
+                    assert!(near(inserts[i].x_scale(), k) && near(inserts[i].rotation, turn), "D{i}: symbol");
+                    let down = (web.label_top + web.label_size / 2.0) * k;
+                    let expected = [centre[0] + down * turn.sin(), centre[1] - down * turn.cos()];
+                    assert_eq!(label.alignment_point, Some(label.insertion_point));
+                    assert!(near(label.insertion_point.x, expected[0]) && near(label.insertion_point.y, expected[1]), "D{i}: {:?} {expected:?}", label.insertion_point);
+                    assert!(near(label.height, web.label_size * 0.7 * k) && near(label.rotation, turn), "D{i}: label size and turn");
+                    // Below the circle and its ring, whatever the scale.
+                    assert!(down - web.label_size * 0.35 * k > (web.radius + web.ring_width / 2.0) * k);
+                } else {
+                    assert!(near(inserts[i].x_scale(), symbols::SYMBOL_RADIUS_MM * k), "D{i}: standard symbol at its scale");
+                    let height = TEXT_HEIGHT_MM * k;
+                    assert!(near(label.height, height) && near(label.rotation, 0.0));
+                    assert!(near(label.insertion_point.x, centre[0] + 2.2 * symbols::SYMBOL_RADIUS_MM * k) && near(label.insertion_point.y, centre[1] - height / 2.0), "D{i}: beside it");
+                }
             }
         }
     }
