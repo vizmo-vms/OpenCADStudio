@@ -632,6 +632,12 @@ impl OpenCADStudio {
     pub(crate) fn secureplan_session_closed(&mut self, session: SessionId) {
         self.secureplan.sessions.drop_session(session);
         if let Some(bound) = self.secureplan.sessions.by_session_mut(session) {
+            let applying = bound.apply.is_some() || bound.busy.is_some_and(|b| b.operation == "apply");
+            let tab_id = bound.tab_id;
+            if applying {
+                self.secureplan_apply_lost(tab_id);
+            }
+            let bound = self.secureplan.sessions.by_session_mut(session).expect("found above");
             bound.session = None;
             bound.busy = None;
             bound.apply = None;
@@ -1122,6 +1128,8 @@ pub struct ApplyBuilt {
     pub plan: super::publish::ApplyPlan,
     pub alignment: Alignment,
     pub realigned: bool,
+    /// The build's stage, cancel and send progress, shared with its dialog.
+    pub control: Arc<super::publish::BuildControl>,
     pub result: super::Carry<Result<super::publish::ApplyOutputs, super::publish::ApplyError>>,
 }
 
@@ -1209,13 +1217,14 @@ impl OpenCADStudio {
             }
         }
         self.secureplan_release_held(tab_id);
-        self.secureplan.dialog = Some(super::ui::Dialog::notice(
+        self.secureplan_apply_stopped(
+            tab_id,
             "Apply stopped",
             vec![
                 "The survey changed in SecurePlan (its plan, the connection or the editing mode) while this Apply was being prepared.".into(),
                 "Nothing was sent. Check the drawing, then Apply again.".into(),
             ],
-        ));
+        );
         super::testdriver_event("apply-failed", "STALE");
         self.secureplan_report_states();
         Task::none()
@@ -1254,6 +1263,9 @@ impl OpenCADStudio {
         let snapshot = dialog.snapshot;
         let snapshot_revision = dialog.snapshot_revision;
         let origin = dialog.origin;
+        let control = Arc::new(super::publish::BuildControl::default());
+        // The progress dialog stays until the Apply ends.
+        self.secureplan.dialog = Some(super::ui::Dialog::ApplyProgress(Box::new(super::ui::apply_progress::ApplyProgress::new(tab_id, Arc::clone(&control)))));
         self.secureplan_report_states();
         self.command_line.push_info("SecurePlan: preparing the drawing, PDF and snap file…");
         let failed = super::Msg::ApplyBuilt(ApplyBuilt {
@@ -1263,12 +1275,13 @@ impl OpenCADStudio {
             plan: plan.clone(),
             alignment,
             realigned,
+            control: Arc::clone(&control),
             result: super::Carry::new(Err(super::publish::ApplyError::new(ErrorCode::Internal, "Preparing the outputs stopped unexpectedly."))),
         });
         self.secureplan_run_job(
             move || {
-                let result = super::publish::build_outputs(&snapshot, &plan);
-                super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, result: super::Carry::new(result) })
+                let result = super::publish::build_outputs_with(&snapshot, &plan, &control);
+                super::Msg::ApplyBuilt(ApplyBuilt { tab_id, origin, snapshot_revision, plan, alignment, realigned, control, result: super::Carry::new(result) })
             },
             failed,
         )
@@ -1277,6 +1290,10 @@ impl OpenCADStudio {
     /// The outputs are ready: send them and `applyRequest`, or report why not.
     pub(crate) fn secureplan_apply_built(&mut self, built: ApplyBuilt) -> Task<Message> {
         let Some(result) = built.result.take() else { return Task::none() };
+        // Cancelled from its progress dialog: already ended there.
+        if built.control.is_cancelled() {
+            return Task::none();
+        }
         // Built from a snapshot of an earlier plan, session or document: stale.
         if !self.secureplan_apply_current(built.tab_id, &built.origin) {
             return self.secureplan_apply_stale(built.tab_id);
@@ -1287,7 +1304,7 @@ impl OpenCADStudio {
                 bound.error = code;
             }
             app.secureplan_release_held(built.tab_id);
-            app.secureplan.dialog = Some(super::ui::Dialog::notice("Apply stopped", vec![message, "Nothing was sent. Your edits are kept.".into()]));
+            app.secureplan_apply_stopped(built.tab_id, "Apply stopped", vec![message, "Nothing was sent. Your edits are kept.".into()]);
             super::testdriver_event("apply-failed", code.map_or("", ErrorCode::as_str));
             app.secureplan_report_states();
             Task::none()
@@ -1301,7 +1318,17 @@ impl OpenCADStudio {
             return fail(self, None, "SecurePlan is no longer connected. Open the survey from SecurePlan again, then Apply.".into());
         };
         let stem = outputs.drawing.stem();
-        let send = |name: &str, media_type: &str, bytes: Arc<Vec<u8>>| bridge.send_transfer(session, name, media_type, bytes);
+        let total = [Some(outputs.drawing.bytes.len()), outputs.original.as_ref().map(|o| o.bytes.len()), Some(outputs.pdf.len()), Some(outputs.snap.len())]
+            .into_iter()
+            .flatten()
+            .sum::<usize>() as u64;
+        if let Some(dialog) = self.secureplan_apply_progress_dialog(built.tab_id) {
+            dialog.set_phase(super::ui::apply_progress::Phase::Sending { total });
+        }
+        let sent = &built.control;
+        let send = |name: &str, media_type: &str, bytes: Arc<Vec<u8>>| {
+            bridge.send_transfer_counted(session, name, media_type, bytes, Some(Arc::clone(&sent.sent)))
+        };
         let drawing_id = send(outputs.drawing.name.expose(), outputs.drawing.format.media_type(), Arc::clone(&outputs.drawing.bytes));
         let original_id = outputs
             .original
@@ -1360,19 +1387,96 @@ impl OpenCADStudio {
     }
 
     fn secureplan_apply_progress(&mut self, session: SessionId, request_id: &str, body: &Value) {
+        use super::ui::apply_progress::Phase;
         let Some(bound) = self.secureplan.sessions.by_session_mut(session) else { return };
         if bound.apply.as_ref().is_none_or(|apply| apply.request_id != request_id) {
             return;
         }
         let progress = body["progress"].as_f64();
         bound.busy = Some(Busy { operation: "apply", progress });
-        let step = match body["step"].as_str().unwrap_or_default() {
-            "savingDraft" => "saving the design",
-            "creatingRevision" => "creating a revision",
-            "uploading" => "uploading",
-            _ => "committing",
+        let tab_id = bound.tab_id;
+        let raw = body["step"].as_str().unwrap_or_default();
+        let (step, phase) = match raw {
+            "awaitingConfirmation" => ("confirm the Apply in SecurePlan", Phase::Confirming),
+            "savingDraft" => ("saving the design", Phase::Saving { step: raw.into(), progress }),
+            "creatingRevision" => ("creating a revision", Phase::Saving { step: raw.into(), progress }),
+            "uploading" => ("uploading", Phase::Saving { step: raw.into(), progress }),
+            _ => ("committing", Phase::Saving { step: "committing".into(), progress }),
         };
+        if let Some(dialog) = self.secureplan_apply_progress_dialog(tab_id) {
+            dialog.set_phase(phase);
+        }
         self.command_line.push_info(&format!("SecurePlan: {step}…"));
+    }
+
+    /// Tab `tab_id`'s Apply progress dialog, while it shows and the Apply
+    /// has not ended.
+    fn secureplan_apply_progress_dialog(&mut self, tab_id: u64) -> Option<&mut super::ui::apply_progress::ApplyProgress> {
+        match self.secureplan.dialog.as_mut() {
+            Some(super::ui::Dialog::ApplyProgress(dialog)) if dialog.tab_id == tab_id && !dialog.finished() => Some(dialog),
+            _ => None,
+        }
+    }
+
+    /// Say why tab `tab_id`'s Apply stopped: in its progress dialog, or as a
+    /// notice when another dialog has replaced it.
+    fn secureplan_apply_stopped(&mut self, tab_id: u64, title: &str, lines: Vec<String>) {
+        match self.secureplan_apply_progress_dialog(tab_id) {
+            Some(dialog) => dialog.stop(title, lines),
+            None => self.secureplan.dialog = Some(super::ui::Dialog::notice(title, lines)),
+        }
+    }
+
+    /// The session of tab `tab_id` ended during its Apply (closed, timed out
+    /// or superseded): the edits stay unapplied.
+    fn secureplan_apply_lost(&mut self, tab_id: u64) {
+        let showing = self.secureplan_apply_progress_dialog(tab_id).is_some();
+        if showing {
+            self.secureplan_apply_stopped(
+                tab_id,
+                "Apply stopped",
+                vec![
+                    "SecurePlan is no longer connected. Open the survey from SecurePlan again, then Apply.".into(),
+                    "Your edits are kept; you can Apply again.".into(),
+                ],
+            );
+        }
+    }
+
+    /// The progress dialog's Cancel, while the outputs are built: stop the
+    /// build; nothing is sent and the drawing stays as it was.
+    pub(crate) fn secureplan_apply_progress_cancel(&mut self) {
+        use super::ui::apply_progress::Phase;
+        let Some(super::ui::Dialog::ApplyProgress(dialog)) = &self.secureplan.dialog else { return };
+        if dialog.phase != Phase::Generating {
+            return;
+        }
+        dialog.control.cancel();
+        let tab_id = dialog.tab_id;
+        self.secureplan.dialog = None;
+        if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
+            if bound.busy.is_some_and(|b| b.operation == "apply") {
+                bound.busy = None;
+            }
+        }
+        self.secureplan_release_held(tab_id);
+        self.command_line.push_info("SecurePlan: Apply cancelled. Nothing was sent.");
+        super::testdriver_event("apply-failed", "CANCELLED");
+        self.secureplan_report_states();
+    }
+
+    /// A progress dialog whose Apply ended without a word (its tab closed or
+    /// its session gave way to another): it offers Close.
+    pub(crate) fn secureplan_check_apply_progress(&mut self) {
+        let Some(super::ui::Dialog::ApplyProgress(dialog)) = &self.secureplan.dialog else { return };
+        if dialog.finished() {
+            return;
+        }
+        let tab_id = dialog.tab_id;
+        let alive = self.secureplan.sessions.by_tab(tab_id).is_some_and(|b| b.apply.is_some() || b.busy.is_some_and(|b| b.operation == "apply"));
+        if !alive {
+            self.secureplan_apply_stopped(tab_id, "Apply stopped", vec!["The Apply ended without an answer from SecurePlan.".into(), "Your edits are kept; you can Apply again.".into()]);
+        }
     }
 
     fn secureplan_apply_result(&mut self, session: SessionId, request_id: &str, body: &Value) -> Task<Message> {
@@ -1412,6 +1516,9 @@ impl OpenCADStudio {
                     self.secureplan.recovery.delete(&origin, &survey);
                 }
             }
+            if let Some(dialog) = self.secureplan_apply_progress_dialog(tab_id) {
+                dialog.set_phase(super::ui::apply_progress::Phase::Applied { version });
+            }
             let version = version.map_or(String::new(), |v| format!(" as plan version {v}"));
             self.command_line.push_info(&format!("SecurePlan: applied{version}."));
             super::testdriver_event("applied", body["planVersion"].as_u64().map(|v| v.to_string()).as_deref().unwrap_or(""));
@@ -1432,7 +1539,7 @@ impl OpenCADStudio {
                 lines.push(detail.chars().take(500).collect());
             }
             lines.push("Your edits are kept; you can Apply again.".into());
-            self.secureplan.dialog = Some(super::ui::Dialog::notice("Not applied", lines));
+            self.secureplan_apply_stopped(tab_id, "Not applied", lines);
             super::testdriver_event("apply-failed", &code);
         }
         Task::none()
@@ -1831,10 +1938,21 @@ pub(crate) mod tests {
             self.app.tabs[self.app.active_tab].scene.document.entities().count()
         }
 
+        /// The title of the notice showing, or of the Apply progress dialog.
         pub(crate) fn dialog_title(&self) -> Option<String> {
             match &self.app.secureplan.dialog {
                 Some(Dialog::Choice { title, .. }) => Some(title.clone()),
+                Some(Dialog::ApplyProgress(dialog)) => Some(dialog.title().to_string()),
                 _ => None,
+            }
+        }
+
+        /// The text of the notice showing, or of the Apply progress dialog.
+        pub(crate) fn dialog_lines(&self) -> Vec<String> {
+            match &self.app.secureplan.dialog {
+                Some(Dialog::Choice { lines, .. }) => lines.clone(),
+                Some(Dialog::ApplyProgress(dialog)) => dialog.lines(),
+                _ => Vec::new(),
             }
         }
 
@@ -2287,8 +2405,8 @@ pub(crate) mod tests {
         assert_eq!(h.entity_count(), before, "the line was undone");
         align_mm_and_open_apply(&mut h);
         h.key(DialogKey::Activate);
-        let Some(Dialog::Choice { title, lines, .. }) = &h.app.secureplan.dialog else { panic!("Apply was not stopped") };
-        assert_eq!(title, "Apply stopped");
+        assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"), "in the progress dialog");
+        let lines = h.dialog_lines();
         let message = &lines[0];
         assert!(message.contains("DWG R13 (AC1012)") && message.contains("even after undoing"), "{message}");
         assert!(message.contains("Discard edits") && message.contains("open the survey from SecurePlan again"), "{message}");
@@ -2322,7 +2440,7 @@ pub(crate) mod tests {
         h.app.secureplan.test_panic_next_job = true;
         h.key(DialogKey::Activate);
         assert!(h.bound().busy.is_none(), "Apply is not busy for good");
-        assert!(matches!(&h.app.secureplan.dialog, Some(Dialog::Choice { title, .. }) if title == "Apply stopped"));
+        assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"));
         assert_eq!(h.app.secureplan.workers, 0, "the worker is counted as done");
         let _ = h.receive("sessionState");
         h.app.secureplan.dialog = None;
@@ -3278,5 +3396,105 @@ pub(crate) mod tests {
         let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::CloseKeep(a))));
         assert!(h.app.secureplan_tab_index(a).is_none());
         assert!(h.app.tabs.iter().any(|t| t.id == other), "the abandoned Close All closed another tab");
+    }
+
+    // ── Apply progress (0.2.2) ──────────────────────────────────────────────
+
+    fn progress(h: &Harness) -> &crate::app::secureplan::ui::apply_progress::ApplyProgress {
+        match &h.app.secureplan.dialog {
+            Some(Dialog::ApplyProgress(dialog)) => dialog,
+            other => panic!("no progress dialog: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_shows_its_progress_until_secureplan_answers() {
+        use crate::app::secureplan::ui::apply_progress::Phase;
+        let mut h = Harness::new("apply_progress");
+        h.open_dxf();
+        h.edit((100.0, 100.0), (900.0, 100.0));
+        align_and_open_apply(&mut h);
+        h.key(DialogKey::Activate);
+        let (request, transfers) = h.receive("applyRequest");
+        let total: u64 = transfers.values().map(|(_, bytes)| bytes.len() as u64).sum();
+        assert_eq!(progress(&h).phase, Phase::Sending { total }, "every output's bytes");
+        assert_eq!(progress(&h).control.sent(), total, "all sent before the request");
+        assert!(progress(&h).lines()[3].contains("Sending to SecurePlan"));
+        // Nothing closes the dialog while SecurePlan has the outputs.
+        h.key(DialogKey::Cancel);
+        h.key(DialogKey::Activate);
+        assert!(matches!(progress(&h).phase, Phase::Sending { .. }));
+        let id = request["requestId"].clone();
+        h.send(json!({ "type": "applyProgress", "requestId": id, "step": "awaitingConfirmation", "progress": null }));
+        assert_eq!(progress(&h).phase, Phase::Confirming);
+        h.send(json!({ "type": "applyProgress", "requestId": id, "step": "uploading", "progress": 0.5 }));
+        assert_eq!(progress(&h).phase, Phase::Saving { step: "uploading".into(), progress: Some(0.5) });
+        h.send(json!({ "type": "applyResult", "requestId": id, "status": "committed", "planVersion": 4, "baseIdentity": BASE }));
+        assert_eq!(progress(&h).phase, Phase::Applied { version: Some(4) });
+        assert!(h.dialog_lines().iter().any(|line| line == "Applied as version 4."));
+        // A tick leaves the finished dialog for the user to close.
+        let _ = h.app.update(Message::SecurePlan(Msg::Tick));
+        h.key(DialogKey::Activate);
+        assert!(h.app.secureplan.dialog.is_none(), "Close");
+    }
+
+    #[test]
+    fn an_apply_cancelled_while_generating_sends_nothing_and_keeps_the_drawing() {
+        let mut h = Harness::new("apply_progress_cancel");
+        h.open_dxf();
+        h.edit((100.0, 100.0), (900.0, 100.0));
+        let index = h.app.active_tab;
+        align_and_open_apply(&mut h);
+        h.hold_jobs();
+        h.key(DialogKey::Activate);
+        assert_eq!(progress(&h).form.buttons.len(), 1, "Cancel");
+        assert!(!h.app.tabs[index].dirty, "the snapshot's changes are held");
+        let control = Arc::clone(&progress(&h).control);
+        h.key(DialogKey::Cancel);
+        assert!(control.is_cancelled());
+        assert!(h.app.secureplan.dialog.is_none());
+        assert!(h.bound().busy.is_none());
+        assert!(h.app.tabs[index].dirty && h.app.secureplan_has_unapplied(index), "the drawing stays unapplied");
+        // The build stops at its next check; its result is dropped.
+        h.release(0);
+        assert!(h.bound().apply.is_none(), "nothing sent");
+        assert!(h.app.secureplan.dialog.is_none());
+        let state = h.state_where(|state| state["busy"].is_null());
+        assert!(state["error"].is_null());
+    }
+
+    #[test]
+    fn a_refused_or_lost_apply_ends_in_its_progress_dialog() {
+        use crate::app::secureplan::ui::apply_progress::Phase;
+        let mut h = Harness::new("apply_progress_refused");
+        h.open_dxf();
+        h.edit((100.0, 100.0), (900.0, 100.0));
+        let index = h.app.active_tab;
+        align_and_open_apply(&mut h);
+        h.key(DialogKey::Activate);
+        let (request, _) = h.receive("applyRequest");
+        h.send(json!({ "type": "applyResult", "requestId": request["requestId"], "status": "error", "code": "CANCELLED", "detail": null }));
+        assert_eq!(h.dialog_title().as_deref(), Some("Not applied"));
+        assert!(h.dialog_lines().iter().any(|line| line.contains("cancelled in SecurePlan")));
+        assert!(h.app.secureplan_has_unapplied(index), "the desktop stays dirty");
+        h.key(DialogKey::Cancel);
+        assert!(h.app.secureplan.dialog.is_none(), "Escape closes it once it ended");
+
+        // The session ends while SecurePlan has the outputs.
+        align_and_open_apply_again(&mut h);
+        h.key(DialogKey::Activate);
+        let _ = h.receive("applyRequest");
+        assert!(matches!(progress(&h).phase, Phase::Sending { .. }));
+        let session = h.session;
+        let _ = h.app.update(Message::SecurePlan(Msg::Bridge(BridgeEvent::Closed { session, reason: "transferFailed".into() })));
+        assert_eq!(h.dialog_title().as_deref(), Some("Apply stopped"));
+        assert!(h.dialog_lines()[0].contains("no longer connected"));
+        assert!(h.app.secureplan_has_unapplied(index));
+    }
+
+    /// Open the Apply dialog when the drawing is already aligned.
+    fn align_and_open_apply_again(h: &mut Harness) {
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "the Apply dialog");
     }
 }

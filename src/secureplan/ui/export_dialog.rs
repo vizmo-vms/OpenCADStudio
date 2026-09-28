@@ -2,7 +2,8 @@
 //!
 //! It opens when an `exportRequest`'s drawing has been read and the design
 //! added (EXP-02). The user picks the format and version (the applied
-//! drawing's own by default), sees what the export adds, and confirms with
+//! drawing's own by default) and the device symbols (SecurePlan icons by
+//! default, or standard symbols), sees what the export adds, and confirms with
 //! **Export…**, which writes the file in memory, checks it and opens the
 //! native Save dialog, the only place SecurePlan CAD writes it. When the
 //! chosen format cannot hold some objects, or the reader dropped damaged
@@ -23,7 +24,8 @@ use crate::app::secureplan::{Carry, Msg};
 use crate::app::{Message, OpenCADStudio};
 
 const FORMAT: usize = 0;
-const ACKNOWLEDGE: usize = 1;
+const SYMBOLS: usize = 1;
+const ACKNOWLEDGE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct ExportDialog {
@@ -32,9 +34,10 @@ pub struct ExportDialog {
     pub key: JobKey,
     pub request_id: String,
     pub form: Form,
-    /// The applied drawing with the design added.
+    /// The applied drawing with the design added, but for the devices, which
+    /// are added with the chosen symbols when it is written.
     pub document: Arc<acadrust::CadDocument>,
-    pub summary: Vec<String>,
+    pub composition: Arc<export::Composition>,
     /// Damaged items the reader dropped from the applied drawing.
     pub lost_entities: usize,
     /// The applied drawing's name without its extension.
@@ -64,14 +67,15 @@ impl ExportDialog {
         let formats = export::choices().iter().map(|choice| choice.to_string()).collect();
         let mut acknowledge = Field::choice("Export without the objects listed", vec!["No".into(), "Yes".into()], 0);
         acknowledge.enabled = false;
-        let fields = vec![Field::choice("Format and version", formats, default), acknowledge];
+        let symbols = Field::choice("Device symbols", export::DeviceSymbols::LABELS.iter().map(|s| s.to_string()).collect(), 0);
+        let fields = vec![Field::choice("Format and version", formats, default), symbols, acknowledge];
         let buttons = vec![("Export…".to_string(), Action::ExportSave), ("Cancel".to_string(), Action::ExportCancel)];
         let mut dialog = Self {
             tab_id,
             key,
             request_id,
             form: Form::new(fields, buttons, Action::ExportCancel),
-            summary: composed.composition.summary(),
+            composition: Arc::new(composed.composition),
             document: Arc::new(composed.document),
             lost_entities: composed.lost_entities,
             stem: composed.stem,
@@ -86,6 +90,18 @@ impl ExportDialog {
     /// The chosen format and version.
     pub fn choice(&self) -> (Format, acadrust::DxfVersion) {
         export::choice(self.form.selected(FORMAT))
+    }
+
+    /// The chosen device symbols.
+    pub fn symbols(&self) -> export::DeviceSymbols {
+        export::DeviceSymbols::from_index(self.form.selected(SYMBOLS))
+    }
+
+    /// Choose the device symbols (the driver's flag).
+    pub fn select_symbols(&mut self, symbols: export::DeviceSymbols) {
+        if let Some(Field { kind: FieldKind::Choice { selected, .. }, .. }) = self.form.fields.get_mut(SYMBOLS) {
+            *selected = usize::from(symbols == export::DeviceSymbols::Standard);
+        }
     }
 
     /// Choose `format` (and `version`, else the newest); `false` if the
@@ -138,7 +154,7 @@ impl ExportDialog {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = self.summary.clone();
+        let mut lines = self.composition.summary(self.symbols());
         lines.extend(self.version_note.clone());
         if self.loss.1 > 0 {
             let (format, version) = self.choice();
@@ -304,6 +320,12 @@ impl OpenCADStudio {
                 }
             }
         }
+        // A finished Apply's progress dialog gives way to a waiting export;
+        // its outcome is also on the command line.
+        let waiting = self.secureplan.sessions.bound.iter().any(|b| b.export.as_ref().is_some_and(|job| job.waiting.is_some()));
+        if waiting && matches!(&self.secureplan.dialog, Some(Dialog::ApplyProgress(d)) if d.finished()) {
+            self.secureplan.dialog = None;
+        }
         if self.secureplan.dialog.is_some() || self.secureplan.trust.prompt().is_some() {
             return;
         }
@@ -333,13 +355,14 @@ impl OpenCADStudio {
             }
         };
         dialog.writing = true;
-        let (tab_id, key, document) = (dialog.tab_id, dialog.key, Arc::clone(&dialog.document));
+        let (tab_id, key, document, composition, symbols) =
+            (dialog.tab_id, dialog.key, Arc::clone(&dialog.document), Arc::clone(&dialog.composition), dialog.symbols());
         let Some(job) = self.secureplan_export_job(tab_id, key) else { return Task::none() };
         job.stage = Stage::Writing;
         let failed = Msg::ExportWritten(WriteDone { tab_id, key, format, version, result: Carry::new(Err(WriteError::Writer)) });
         self.secureplan_run_job(
             move || {
-                let result = export::write(&document, format, version);
+                let result = export::write_export(&document, &composition, symbols, format, version);
                 Msg::ExportWritten(WriteDone { tab_id, key, format, version, result: Carry::new(result) })
             },
             failed,
@@ -536,6 +559,7 @@ mod tests {
         let Some(Dialog::Export(dialog)) = &h.app.secureplan.dialog else { panic!("no export dialog") };
         assert_eq!(dialog.choice(), (Format::Dxf, acadrust::DxfVersion::AC1032), "the applied drawing's format by default");
         assert!(dialog.lines().iter().any(|line| line.contains("may overlap")));
+        assert!(dialog.lines().iter().any(|line| line.starts_with("Devices are drawn as in SecurePlan")));
         let state = h.state_where(|s| s["busy"]["operation"] == "export");
         assert_eq!(state["busy"]["operation"], "export");
         // Keyboard: Left moves to the previous choice (DWG R14), Right back to DXF 2018.
@@ -548,6 +572,7 @@ mod tests {
         assert_eq!(result, json!({ "type": "exportResult", "requestId": "x1", "status": "written", "fileName": "exported.dxf", "format": "dxf", "formatVersion": "AC1032" }));
         let reread = crate::io::load_bytes("exported.dxf", std::fs::read(&file).unwrap()).unwrap();
         assert!(reread.layers.contains("SECUREPLAN-CAMERA") && reread.layers.contains("SECUREPLAN-ROUTE"));
+        assert!(reread.block_records.iter().any(|b| b.name.starts_with("SECUREPLAN-ICON-")), "SecurePlan icons by default");
         assert!(h.bound().export.is_none());
         assert!(h.app.secureplan.dialog.is_none());
         let _ = h.state_where(|s| s["busy"].is_null());
@@ -670,10 +695,12 @@ mod tests {
         let dialog = ExportDialog::new(1, key, "x1".into(), composed("AC1032"));
         assert!(dialog.form.fields[ACKNOWLEDGE].enabled, "a lost object needs the acknowledgement");
         let mut app = crate::app::OpenCADStudio::new_for_test();
+        assert_eq!(dialog.symbols(), export::DeviceSymbols::Icons, "SecurePlan icons by default");
         let format = pick_rendered(view(&dialog), "Format and version", 1);
+        let symbols = pick_rendered(view(&dialog), "Device symbols", 1);
         let acknowledge = pick_rendered(view(&dialog), "Export without the objects listed", 1);
         app.secureplan.dialog = Some(Dialog::Export(Box::new(dialog)));
-        for (messages, field) in [(format, FORMAT), (acknowledge, ACKNOWLEDGE)] {
+        for (messages, field) in [(format, FORMAT), (symbols, SYMBOLS), (acknowledge, ACKNOWLEDGE)] {
             let [Message::SecurePlan(chosen @ Msg::FormSelect(index, 1))] = messages.as_slice() else { panic!("{messages:?}") };
             assert_eq!(*index, field);
             let _ = app.update(Message::SecurePlan(chosen.clone()));
@@ -683,6 +710,7 @@ mod tests {
         }
         let Some(Dialog::Export(dialog)) = &app.secureplan.dialog else { panic!("the dialog closed") };
         assert_eq!(dialog.choice(), export::choice(1));
+        assert_eq!(dialog.symbols(), export::DeviceSymbols::Standard);
         // Nothing lost: the acknowledgement is fixed.
         let dialog = ExportDialog::new(1, key, "x2".into(), export::Composed { lost_entities: 0, ..composed("AC1032") });
         assert!(!dialog.form.fields[ACKNOWLEDGE].enabled);
@@ -730,14 +758,8 @@ mod tests {
         request_with(&mut h, "x1", &testutil::synthetic_dxf(), &sample_payload(), snapshot.clone());
         let Some(Dialog::Export(dialog)) = &h.app.secureplan.dialog else { panic!("no export dialog") };
         let mapping = crate::app::secureplan::align::mapping_from_json(&snapshot).unwrap();
-        let camera = dialog
-            .document
-            .entities()
-            .find_map(|e| match e {
-                acadrust::EntityType::Insert(i) if i.common.layer == "SECUREPLAN-CAMERA" => Some(i.insert_point),
-                _ => None,
-            })
-            .expect("the camera");
+        // The camera is placed with the chosen symbols when written.
+        let camera = dialog.composition.placed.iter().find(|d| d.kind == crate::app::secureplan::symbols::DeviceKind::Camera).expect("the camera").at;
         let expected = crate::app::secureplan::align::world_to_cad(&mapping, [6000.0, 3000.0]);
         assert!((camera.x - expected[0]).abs() < 1e-9 && (camera.y - expected[1]).abs() < 1e-9, "{camera:?} {expected:?}");
         assert_ne!(h.bound().plan_alignment.map(|a| a.mapping), Some(mapping), "the stored mapping differs");

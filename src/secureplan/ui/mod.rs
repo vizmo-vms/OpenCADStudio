@@ -12,6 +12,7 @@
 
 pub mod align_dialog;
 pub mod apply_dialog;
+pub mod apply_progress;
 pub mod convert_menu;
 pub mod export_dialog;
 pub mod import_dialog;
@@ -52,6 +53,9 @@ pub enum Action {
     AlignMeasure,
     ApplyConfirm,
     ApplyReset,
+    /// The Apply progress dialog's Cancel (while the outputs are built) and Close.
+    ApplyProgressCancel,
+    ApplyProgressClose,
     /// Convert tab `.0`'s selection (CNV-01).
     Convert(u64, crate::app::secureplan::convert::Kind),
     /// The export dialog's **Export…** and Cancel (EXP-03).
@@ -229,6 +233,7 @@ pub enum Dialog {
     Progress { tab_id: u64, title: String, text: String, started: std::time::Instant, form: Form },
     Align(Box<align_dialog::AlignDialog>),
     Apply(Box<apply_dialog::ApplyDialog>),
+    ApplyProgress(Box<apply_progress::ApplyProgress>),
     Export(Box<export_dialog::ExportDialog>),
     Update(Box<update_dialog::UpdateDialog>),
 }
@@ -258,6 +263,7 @@ impl Dialog {
             Dialog::Choice { form, .. } | Dialog::Progress { form, .. } => form,
             Dialog::Align(dialog) => &mut dialog.form,
             Dialog::Apply(dialog) => &mut dialog.form,
+            Dialog::ApplyProgress(dialog) => &mut dialog.form,
             Dialog::Export(dialog) => &mut dialog.form,
             Dialog::Update(dialog) => &mut dialog.form,
         }
@@ -268,6 +274,7 @@ impl Dialog {
             Dialog::Choice { form, .. } | Dialog::Progress { form, .. } => form,
             Dialog::Align(dialog) => &dialog.form,
             Dialog::Apply(dialog) => &dialog.form,
+            Dialog::ApplyProgress(dialog) => &dialog.form,
             Dialog::Export(dialog) => &dialog.form,
             Dialog::Update(dialog) => &dialog.form,
         }
@@ -415,6 +422,7 @@ pub fn view<'a>(base: Element<'a, Message>, dialog: &'a Dialog) -> Element<'a, M
         }
         Dialog::Align(dialog) => ("Align the drawing to the survey", align_dialog::view(dialog)),
         Dialog::Apply(dialog) => ("Apply to SecurePlan", apply_dialog::view(dialog)),
+        Dialog::ApplyProgress(dialog) => (dialog.title(), apply_progress::view(dialog)),
         Dialog::Export(dialog) => ("Export CAD with the SecurePlan design", export_dialog::view(dialog)),
         Dialog::Update(dialog) => ("Update available", update_dialog::view(dialog)),
     };

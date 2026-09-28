@@ -17,7 +17,7 @@ members = [
 default = []
 # SecurePlan CAD: the SecurePlan companion build (hardening, loopback bridge,
 # SecurePlan-bound documents). Everything lives in src/secureplan/.
-secureplan = ["dep:aes-gcm", "dep:hkdf", "dep:hmac", "dep:lopdf", "dep:regex", "dep:sha2_011", "dep:tungstenite"]
+secureplan = ["dep:aes-gcm", "dep:hkdf", "dep:hmac", "dep:lopdf", "dep:regex", "dep:sha2_011", "dep:tungstenite", "image/webp"]
 # Test-only hooks for the SecurePlan build (stdin pairing driver). Never
 # enabled by a release workflow; secureplan-ci.yml checks that.
 secureplan-test = ["secureplan"]

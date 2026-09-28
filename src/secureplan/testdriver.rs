@@ -15,7 +15,8 @@
 //!   `units`) is a calibration. On an empty survey the page goes to the
 //!   origin and `origin`/`anchor` are ignored.
 //! - `apply [window=<x0>,<y0>,<x1>,<y1>] [damaged=publish] [view=model |
-//!   view=layout:<name>]`: Apply without the dialog. Model space (the
+//!   view=layout:<name>]`: Apply without the Apply dialog (its progress
+//!   dialog shows, and needs no answer). Model space (the
 //!   default, or `view=model`) publishes the default window (the visible
 //!   extents plus 2%) or the given one; `view=layout:<name>` publishes that
 //!   paper layout's whole sheet through its reference viewport. It must come
@@ -399,7 +400,8 @@ mod tests {
         assert!(h.bound().alignment.is_some());
         h.app.secureplan.dialog = None;
         let _ = h.app.secureplan_driver(parse("apply").unwrap());
-        assert!(h.app.secureplan.dialog.is_none(), "no dialog");
+        // Only the progress dialog, which needs no answer.
+        assert!(matches!(&h.app.secureplan.dialog, Some(crate::app::secureplan::ui::Dialog::ApplyProgress(d)) if !d.finished()), "no dialog to answer");
         let (request, transfers) = h.receive("applyRequest");
         assert_eq!(transfers.len(), 4, "drawing, original, PDF and snap file");
         assert_eq!(request["view"]["kind"], "model");
@@ -419,7 +421,8 @@ mod tests {
         let _ = h.app.secureplan_driver(parse("align units=mm").unwrap());
         h.app.secureplan.dialog = None;
         let _ = h.app.secureplan_driver(parse("apply view=layout:Sheet A1").unwrap());
-        assert!(h.app.secureplan.dialog.is_none(), "no dialog");
+        // Only the progress dialog, which needs no answer.
+        assert!(matches!(&h.app.secureplan.dialog, Some(crate::app::secureplan::ui::Dialog::ApplyProgress(d)) if !d.finished()), "no dialog to answer");
         let (request, transfers) = h.receive("applyRequest");
         assert_eq!(request["view"]["kind"], "layout");
         assert_eq!(request["view"]["layoutName"], "Sheet A1");

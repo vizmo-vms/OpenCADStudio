@@ -456,6 +456,16 @@
       }
     },
     {
+      "name": "applyProgress-awaitingConfirmation",
+      "direction": "webToDesktop",
+      "message": {
+        "type": "applyProgress",
+        "requestId": "apply-1",
+        "step": "awaitingConfirmation",
+        "progress": null
+      }
+    },
+    {
       "name": "applyResult-committed",
       "direction": "webToDesktop",
       "message": {

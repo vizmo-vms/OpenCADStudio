@@ -517,6 +517,7 @@ impl OpenCADStudio {
                     self.command_line.push_info(&notice);
                 }
                 self.secureplan_expire_waiting();
+                self.secureplan_check_apply_progress();
                 self.secureplan_show_waiting_export();
                 self.secureplan_report_states();
                 Task::none()
@@ -828,6 +829,10 @@ impl OpenCADStudio {
         if !self.secureplan.sessions.bound.is_empty() || self.secureplan.notice.is_some() || !self.secureplan.sessions.deferred.is_empty() {
             subscriptions.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::SecurePlan(Msg::Tick)));
         }
+        // The Apply progress dialog's stage and bytes sent, redrawn often.
+        if matches!(&self.secureplan.dialog, Some(Dialog::ApplyProgress(d)) if !d.finished()) {
+            subscriptions.push(iced::time::every(Duration::from_millis(150)).map(|_| Message::Noop));
+        }
         Subscription::batch(subscriptions)
     }
 
@@ -922,7 +927,16 @@ impl OpenCADStudio {
     pub(crate) fn secureplan_action(&mut self, action: Action) -> Task<Message> {
         // The dialog that asked closes, unless the action keeps it.
         let keeps_dialog =
-            matches!(action, Action::AlignConfirm | Action::AlignMeasure | Action::ApplyConfirm | Action::ApplyReset | Action::ExportSave | Action::ExportCancel);
+            matches!(
+                action,
+                Action::AlignConfirm
+                    | Action::AlignMeasure
+                    | Action::ApplyConfirm
+                    | Action::ApplyReset
+                    | Action::ApplyProgressCancel
+                    | Action::ExportSave
+                    | Action::ExportCancel
+            );
         if !keeps_dialog {
             self.secureplan.dialog = None;
         }
@@ -1002,6 +1016,11 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
+            Action::ApplyProgressCancel => {
+                self.secureplan_apply_progress_cancel();
+                Task::none()
+            }
+            Action::ApplyProgressClose => Task::none(),
             Action::Convert(tab_id, kind) => self.secureplan_convert(tab_id, kind),
             Action::ExportSave => self.secureplan_export_save(),
             Action::ExportCancel => {

@@ -5,8 +5,8 @@
   "files": [
     {
       "path": "README.md",
-      "bytes": 6597,
-      "sha256": "71774dd65be5f6bc0ff72c14f3e3359d0f92581b03b8d9b79fdcc89a48d302b6"
+      "bytes": 7744,
+      "sha256": "2d9954a481a87ef098614921c677185ecf4824caee2ffb9d1ec80ceb7050211b"
     },
     {
       "path": "base-identity.json",
@@ -25,23 +25,23 @@
     },
     {
       "path": "messages/invalid.json",
-      "bytes": 34584,
-      "sha256": "04a330595270165272e253e231d093e44d2590216c3d5c37977c83691e4bd8eb"
+      "bytes": 35131,
+      "sha256": "290b9fda0231a48b1aee20f24622cd7fccbc0175b4051621602d207bac45406d"
     },
     {
       "path": "messages/valid.json",
-      "bytes": 17321,
-      "sha256": "0bedd7a879617db9746b795fd98d5f3cc0990f783408a274d977c1117be156e9"
+      "bytes": 17578,
+      "sha256": "b2f5b25e0b4f504a3ba94714fd976b6e62e60ea89d62d671f56796cfd98c5a5c"
     },
     {
       "path": "payloads/invalid.json",
-      "bytes": 16017,
-      "sha256": "89c370082ce3d413078d460e615c068be742987f54dfba7ef1dad2350708baf3"
+      "bytes": 892328,
+      "sha256": "2ed47fa867980ca7f0beaa9e81c68ca0fe27346c040dd7eaf894b45e7ee7d786"
     },
     {
       "path": "payloads/valid.json",
-      "bytes": 5813,
-      "sha256": "607189f857303c77be1c10b356e76ab44293428149aa2ad919b07c59736d8669"
+      "bytes": 370613,
+      "sha256": "d290d9516cf7d9f8114d74f4a1fda22173142ea02b3cf24f876484fd1b69e48e"
     },
     {
       "path": "placement.json",
@@ -50,8 +50,8 @@
     },
     {
       "path": "schemas/common.schema.json",
-      "bytes": 6656,
-      "sha256": "16aa28b112465139ebf1023bb9ae2fb2aacea1f3c24653a6a13d51677fba0a90"
+      "bytes": 8157,
+      "sha256": "b28ce3d605c4d4561d0d1fcd5a6100053ca1b1a7d3d4bc7a9ec44ec955d7db87"
     },
     {
       "path": "schemas/convert-candidates.schema.json",
@@ -60,18 +60,18 @@
     },
     {
       "path": "schemas/export-payload.schema.json",
-      "bytes": 6577,
-      "sha256": "239f765da7c27813b3f7fa6d10f9fc67cd36a18029ee6c1fa430f147f2cdbced"
+      "bytes": 7261,
+      "sha256": "db5c671ad3eeda86171e38b469ac570b17e83dc5557b962bac9b029739de582c"
     },
     {
       "path": "schemas/messages.schema.json",
-      "bytes": 19164,
-      "sha256": "e631e00f2e861f150d60528a06469e0812a04366ebffc27e2ddac06e50983bf3"
+      "bytes": 19829,
+      "sha256": "0a90b61ef6d548ba4f94ffcae54bdba9e7bb7f8cbdc93ba504898763812a1ae3"
     },
     {
       "path": "schemas/overlay.schema.json",
-      "bytes": 3267,
-      "sha256": "f0ce7739790bf0dfb50eb61d0b85eaf57be7b07ad98c24d0f3d16ba3df3e8d5c"
+      "bytes": 5485,
+      "sha256": "37637e2dd59fca862620bdac1f02f1912793bace7d1690658ac59dab41740d28"
     },
     {
       "path": "sealed-frames.json",

@@ -2,12 +2,24 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "overlay.schema.json",
   "title": "SecurePlan CAD bridge protocol v1: read-only design overlay payload (OVL-01)",
-  "description": "Transferred as application/vnd.secureplan.overlay+json (UTF-8, at most 8388608 bytes). World millimetres, built from the web draft. coverage is empty unless coverage was chosen.",
+  "description": "Transferred as application/vnd.secureplan.overlay+json (UTF-8, at most 8388608 bytes). World millimetres, built from the web draft. coverage is empty unless coverage was chosen. Schema version 2 (SecurePlan CAD 0.2.2) carries the web canvas's device drawing: icons, display settings, labels, symbol scales, badges and coverage colours; a version 1 reader rejects it, and a version 2 reader rejects version 1. The icon rules in common.schema.json#/$defs/icons apply.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "walls", "doors", "routes", "devices", "coverage"],
+  "required": ["schemaVersion", "icons", "display", "walls", "doors", "routes", "devices", "coverage"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
+    "icons": { "$ref": "common.schema.json#/$defs/icons" },
+    "display": {
+      "description": "iconScale and showLabels are the web's current view settings; coverageOpacity is the survey's display preference, or 0.16 by default. Coverage is filled with its colour at coverageOpacity and stroked in the same colour.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["iconScale", "coverageOpacity", "showLabels"],
+      "properties": {
+        "iconScale": { "type": "number", "minimum": 0.5, "maximum": 2 },
+        "coverageOpacity": { "type": "number", "minimum": 0.05, "maximum": 0.5 },
+        "showLabels": { "type": "boolean" }
+      }
+    },
     "walls": {
       "type": "array",
       "maxItems": 10000,
@@ -56,22 +68,40 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "kind", "symbolKey", "name", "color", "position", "rotationDeg"],
+        "required": ["id", "kind", "symbolKey", "name", "label", "color", "position", "rotationDeg", "symbolScale", "iconId", "badge"],
         "properties": {
           "id": { "$ref": "common.schema.json#/$defs/elementId" },
           "kind": { "enum": ["camera", "equipment", "asset"] },
           "symbolKey": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
-          "name": { "$ref": "common.schema.json#/$defs/label" },
+          "name": { "description": "The catalog display name.", "$ref": "common.schema.json#/$defs/label" },
+          "label": { "description": "The element label, the text the web canvas shows under the symbol.", "$ref": "common.schema.json#/$defs/label" },
           "color": { "$ref": "common.schema.json#/$defs/color" },
           "position": { "$ref": "common.schema.json#/$defs/pointMm" },
-          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" }
+          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" },
+          "symbolScale": { "$ref": "common.schema.json#/$defs/symbolScale" },
+          "iconId": { "description": "The icon the web canvas draws, or null for the desktop's built-in standard symbol for symbolKey.", "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/iconId" }] },
+          "badge": { "$ref": "common.schema.json#/$defs/badge" }
         }
       }
     },
-    "coverage": { "$ref": "#/$defs/coverage" }
+    "coverage": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["elementId", "polygon", "color"],
+        "properties": {
+          "elementId": { "$ref": "common.schema.json#/$defs/elementId" },
+          "polygon": { "type": "array", "minItems": 3, "maxItems": 4096, "items": { "$ref": "common.schema.json#/$defs/pointMm" } },
+          "color": { "description": "The camera's effective colour on the web canvas.", "$ref": "common.schema.json#/$defs/color" }
+        }
+      }
+    }
   },
   "$defs": {
     "coverage": {
+      "description": "Coverage without colour, as the export payload carries it.",
       "type": "array",
       "maxItems": 10000,
       "items": {

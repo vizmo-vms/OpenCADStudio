@@ -218,16 +218,31 @@
       }
     },
     "applyProgress": {
-      "description": "web -> desktop. requestId is the applyRequest's.",
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type", "requestId", "step", "progress"],
-      "properties": {
-        "type": { "const": "applyProgress" },
-        "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
-        "step": { "enum": ["savingDraft", "creatingRevision", "uploading", "committing"] },
-        "progress": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": 0, "maximum": 1 }] }
-      }
+      "description": "web -> desktop. requestId is the applyRequest's. awaitingConfirmation (progress null, SecurePlan CAD 0.2.2) is sent when the web shows its Apply confirmation dialog; the saving steps follow once the user confirms.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "step", "progress"],
+          "properties": {
+            "type": { "const": "applyProgress" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "step": { "enum": ["savingDraft", "creatingRevision", "uploading", "committing"] },
+            "progress": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": 0, "maximum": 1 }] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "requestId", "step", "progress"],
+          "properties": {
+            "type": { "const": "applyProgress" },
+            "requestId": { "$ref": "common.schema.json#/$defs/requestId" },
+            "step": { "const": "awaitingConfirmation" },
+            "progress": { "type": "null" }
+          }
+        }
+      ]
     },
     "applyResult": {
       "description": "web -> desktop. requestId is the applyRequest's. The desktop stays dirty on error.",
