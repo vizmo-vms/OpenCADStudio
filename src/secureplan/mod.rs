@@ -10,7 +10,7 @@
 
 pub mod guards;
 mod hooks;
-pub use hooks::{begin_awaiting_launch, begin_cold_start, cold_start, deliver_focus, deliver_launch, ColdStart, Msg, State, COLD_START_WAIT};
+pub use hooks::{begin_awaiting_launch, begin_cold_start, cold_start, deliver_launch, hand_off, ColdStart, Msg, Receipt, State, COLD_START_WAIT};
 
 // Modules for the planned SecurePlan tasks. Each is a stub until its task
 // lands, so later tasks never edit a shared `mod.rs`.

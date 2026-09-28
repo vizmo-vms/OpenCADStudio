@@ -2,12 +2,14 @@
 //!
 //! The app bundle uses this helper as its `CFBundleExecutable`. It forwards
 //! Finder URLs to a running editor or starts the sibling GUI binary, then
-//! stays alive so later opens keep reaching the same AppKit delegate.
+//! stays alive so later opens keep reaching the same AppKit delegate: until
+//! every GUI it started has ended and no link is still being handed over.
 
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
@@ -45,9 +47,38 @@ const NO_DOCUMENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 #[cfg(target_os = "macos")]
 static DOCS_HANDLED: AtomicBool = AtomicBool::new(false);
 
-/// The first spawned GUI owns the launcher lifetime.
+/// The GUIs this launcher started and the links it is handing over.
 #[cfg(target_os = "macos")]
-static GUI_STARTED: AtomicBool = AtomicBool::new(false);
+static LIFETIME: Lifetime = Lifetime::new();
+
+/// Counts what keeps the launcher alive: running GUIs and links still being
+/// handed over. Once a GUI has run, the launcher leaves when none is left.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Lifetime(Mutex<(usize, bool)>);
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Lifetime {
+    const fn new() -> Self {
+        Self(Mutex::new((0, false)))
+    }
+
+    /// A GUI started (`gui`) or a hand-over began.
+    fn begin(&self, gui: bool) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 += 1;
+        state.1 |= gui;
+    }
+
+    /// One ended; `leave` runs, with nothing else able to begin meanwhile,
+    /// when that was the last and a GUI has run.
+    fn end(&self, leave: impl FnOnce()) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 -= 1;
+        if state.0 == 0 && state.1 {
+            leave();
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn real_binary_path() -> PathBuf {
@@ -67,44 +98,55 @@ fn deliver_or_launch(files: &[String]) {
             return;
         }
     }
-    match std::process::Command::new(real_binary_path())
-        .args(files)
-        .spawn()
-    {
-        Ok(mut child) if !GUI_STARTED.swap(true, Ordering::SeqCst) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-                std::process::exit(0);
-            });
-        }
-        Ok(_) => {}
-        Err(err) => {
-            eprintln!("OpenCADStudio launcher: failed to launch the GUI: {err}");
-        }
-    }
+    start_gui(files);
     reassert_accessory_policy();
 }
 
+/// Start the bundled GUI; the flag stays set while it runs.
+#[cfg(target_os = "macos")]
+fn start_gui(args: &[String]) -> Option<std::sync::Arc<AtomicBool>> {
+    match std::process::Command::new(real_binary_path()).args(args).spawn() {
+        Ok(mut child) => {
+            LIFETIME.begin(true);
+            let running = std::sync::Arc::new(AtomicBool::new(true));
+            let flag = running.clone();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                flag.store(false, Ordering::SeqCst);
+                LIFETIME.end(|| std::process::exit(0));
+            });
+            Some(running)
+        }
+        Err(err) => {
+            eprintln!("OpenCADStudio launcher: failed to launch the GUI: {err}");
+            None
+        }
+    }
+}
+
 /// SecurePlan CAD: hand `secureplan-cad:` launch URLs to the running editor
-/// over the per-user channel, never as a process argument (DSK-04). With no
-/// editor running, start one that waits windowless for them (BRG-02) and
-/// hand the URLs over once it is listening.
+/// over the per-user channel, never as a process argument (DSK-04). While no
+/// editor takes them (none running, one starting or one exiting), a standby
+/// GUI that waits windowless for them (BRG-02) is kept running, and the
+/// launcher stays alive until they are delivered or the wait runs out.
 #[cfg(all(target_os = "macos", feature = "secureplan"))]
 fn deliver_launches(urls: Vec<String>) {
     use OpenCADStudio::app::secureplan::handoff;
+    LIFETIME.begin(false);
     std::thread::spawn(move || {
-        let Some(path) = handoff::descriptor_path() else { return };
-        let mut pending = urls;
-        pending.retain(|url| handoff::send_launch(&path, url).is_err());
-        if pending.is_empty() {
-            return;
+        let delivered = handoff::descriptor_path().is_some_and(|path| {
+            handoff::deliver_with_standby(
+                &path,
+                urls,
+                handoff::LAUNCHER_WAIT,
+                || start_gui(&[handoff::AWAITING_LAUNCH_ARG.to_string()]),
+                |running| running.load(Ordering::SeqCst),
+            )
+        });
+        if !delivered {
+            eprintln!("SecurePlan CAD launcher: a SecurePlan CAD link could not be handed to the editor.");
         }
-        deliver_or_launch(&[handoff::AWAITING_LAUNCH_ARG.to_string()]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !pending.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            pending.retain(|url| handoff::send_launch(&path, url).is_err());
-        }
+        LIFETIME.end(|| std::process::exit(0));
     });
 }
 
@@ -209,3 +251,32 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {}
+
+#[cfg(test)]
+mod tests {
+    use super::Lifetime;
+    use std::cell::Cell;
+
+    /// The launcher outlives its first GUI while a link is still being
+    /// handed over, and while a standby GUI it started runs; it leaves when
+    /// the last of them ends.
+    #[test]
+    fn the_launcher_leaves_only_when_nothing_it_started_is_left() {
+        let lifetime = Lifetime::new();
+        let left = Cell::new(0);
+        let leave = || left.set(left.get() + 1);
+        // Forwarding alone (no GUI started) never ends the relay.
+        lifetime.begin(false);
+        lifetime.end(leave);
+        assert_eq!(left.get(), 0);
+        lifetime.begin(true); // the first GUI
+        lifetime.begin(false); // a link arrives while it is exiting
+        lifetime.end(leave); // the first GUI ends
+        assert_eq!(left.get(), 0, "left with a link still on its way");
+        lifetime.begin(true); // the standby GUI
+        lifetime.end(leave); // the link is delivered
+        assert_eq!(left.get(), 0, "left while the standby GUI runs");
+        lifetime.end(leave); // the standby GUI ends
+        assert_eq!(left.get(), 1);
+    }
+}

@@ -10,6 +10,10 @@ use OpenCADStudio::{cli, io, mcp};
 #[cfg(target_arch = "wasm32")]
 use OpenCADStudio::sys;
 
+/// SecurePlan CAD cannot hold its one-window lock or serve other launches.
+#[cfg(feature = "secureplan")]
+const UNAVAILABLE: &str = "SecurePlan CAD cannot use its settings folder, so it cannot make sure only one copy is open. Check that your user account can write to its application settings folder, then start SecurePlan CAD again.";
+
 fn main() -> iced::Result {
     // Web (wasm) uses the single-window entry; native uses the multi-window
     // daemon. Trunk calls `main` from its generated JS bootstrap. The web build
@@ -207,9 +211,18 @@ fn main() -> iced::Result {
             match handoff::claim_window(&requests) {
                 Claim::Primary(lock) => lock,
                 Claim::Forwarded => return Ok(()),
+                // The launcher that started this awaiting copy keeps handing
+                // its link over, and starts another copy if it must.
+                Claim::Unanswered if awaiting_launch => return Ok(()),
                 Claim::Unanswered => {
-                    eprintln!("SecurePlan CAD is already running but did not answer; try again.");
-                    return Ok(());
+                    handoff::report_start_problem(
+                        "SecurePlan CAD is already open but is not responding. Wait a moment and try again. If it stays unresponsive, quit SecurePlan CAD and start it again.",
+                    );
+                    std::process::exit(1);
+                }
+                Claim::Unavailable => {
+                    handoff::report_start_problem(UNAVAILABLE);
+                    std::process::exit(1);
                 }
             }
         };
@@ -231,7 +244,10 @@ fn main() -> iced::Result {
 
         // This instance receives later launches, and uses its own once.
         #[cfg(feature = "secureplan")]
-        OpenCADStudio::app::secureplan::handoff::start_primary(primary_lock, launch_urls);
+        if OpenCADStudio::app::secureplan::handoff::start_primary(primary_lock, launch_urls).is_err() {
+            OpenCADStudio::app::secureplan::handoff::report_start_problem(UNAVAILABLE);
+            std::process::exit(1);
+        }
 
         // GUI: stash the startup config for `app::boot` to pick up.
         let script_lines = args

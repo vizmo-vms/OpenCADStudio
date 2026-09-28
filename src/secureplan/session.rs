@@ -1150,6 +1150,9 @@ impl OpenCADStudio {
             return cancelled;
         };
         self.secureplan.dialog = Some(super::ui::Dialog::Apply(Box::new(dialog)));
+        // Apply supersedes a length being measured for Align: its hidden form
+        // does not come back.
+        self.secureplan.measuring = None;
         cancelled
     }
 

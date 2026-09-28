@@ -294,6 +294,9 @@ impl OpenCADStudio {
             return;
         }
         self.active_tab = index;
+        // Measure starts as any command does: no previous point for Ortho or
+        // Polar, and no snap or dynamic input left from an earlier pick.
+        self.reset_command_start_state(index);
         let length = Arc::new(Mutex::new(None));
         let command = MeasureCommand { first: None, length: length.clone() };
         self.command_line.push_info(&command.prompt());
@@ -318,6 +321,12 @@ impl OpenCADStudio {
         // describes a drawing that is gone.
         if !self.secureplan_align_current(&dialog) {
             self.command_line.push_info("SecurePlan: the drawing changed while measuring. Open Align again.");
+            return;
+        }
+        // Nor does it come back while the survey cannot be edited (busy,
+        // disconnected or view-only).
+        if let Err(reason) = self.secureplan_can_edit_tab(dialog.tab_id) {
+            self.command_line.push_error(&format!("{reason} Then open Align again."));
             return;
         }
         let length = length.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -372,6 +381,10 @@ impl OpenCADStudio {
         if !self.secureplan_align_current(dialog) {
             self.secureplan.dialog = None;
             self.command_line.push_error("SecurePlan: the drawing changed. Open Align again.");
+            return iced::Task::none();
+        }
+        if let Err(reason) = self.secureplan_can_edit_tab(tab_id) {
+            self.command_line.push_error(&reason);
             return iced::Task::none();
         }
         let proposed = match dialog.proposed() {
@@ -571,6 +584,89 @@ mod tests {
         typed_point(&mut h, "130,240");
         let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog else { panic!("no alignment dialog") };
         assert_eq!(dialog.form.number(CAD_LENGTH), Some(50.0));
+    }
+
+    /// Pointer picks start afresh on every Measure: with Ortho on, the first
+    /// click after a cancelled or a completed measure is not bent toward the
+    /// earlier measure's point.
+    #[test]
+    fn a_new_measure_does_not_constrain_its_first_click_to_the_last_one() {
+        use crate::app::secureplan::session::tests::Harness;
+        let mut h = Harness::new("measure_pointer");
+        h.open_dxf();
+        let index = h.app.active_tab;
+        h.app.tabs[index].scene.selection.borrow_mut().vp_size = (1600.0, 900.0);
+        h.app.tabs[index].scene.sync_tiles_from_panes(1600.0, 900.0);
+        h.app.snapper.snap_enabled = false;
+        h.app.snapper.enabled.clear();
+        h.app.polar_mode = false;
+        h.app.ortho_mode = false;
+        let click = |h: &mut Harness, x: f32, y: f32| {
+            let _ = h.app.update(Message::ViewportMove(iced::Point::new(x, y)));
+            let _ = h.app.update(Message::ViewportLeftPress);
+            let _ = h.app.update(Message::ViewportLeftRelease);
+        };
+        let measured = |h: &Harness| match &h.app.secureplan.dialog {
+            Some(Dialog::Align(dialog)) => dialog.form.number(CAD_LENGTH),
+            _ => panic!("no alignment dialog"),
+        };
+        // The length between two points one above the other, Ortho off.
+        start_measuring(&mut h);
+        click(&mut h, 300.0, 200.0);
+        click(&mut h, 300.0, 400.0);
+        let expected = measured(&h).expect("a length");
+        h.key(DialogKey::Cancel);
+        h.app.ortho_mode = true;
+        for ending in ["cancelled", "completed"] {
+            start_measuring(&mut h);
+            click(&mut h, 100.0, 100.0);
+            if ending == "cancelled" {
+                let _ = h.app.update(Message::CommandEscape);
+            } else {
+                click(&mut h, 100.0, 150.0);
+            }
+            assert!(!measuring(&h), "{ending}: still measuring");
+            // Measure again from the dialog that came back.
+            let _ = h.app.update(Message::SecurePlan(crate::app::secureplan::ui::Msg::Action(Action::AlignMeasure)));
+            assert!(measuring(&h), "{ending}: measuring again");
+            click(&mut h, 300.0, 200.0);
+            click(&mut h, 300.0, 400.0);
+            assert_eq!(measured(&h), Some(expected), "after a {ending} measure");
+            h.key(DialogKey::Cancel);
+        }
+    }
+
+    /// PUB-02/PUB-04: Apply chosen while a length is measured supersedes the
+    /// hidden Align form. It does not come back while Apply runs, and an
+    /// alignment form cannot be confirmed while the survey is busy.
+    #[test]
+    fn apply_during_a_measure_discards_the_hidden_alignment_form() {
+        use crate::app::secureplan::session::tests::Harness;
+        let mut h = Harness::new("measure_apply");
+        h.open_dxf();
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        h.key(DialogKey::Activate);
+        let aligned = h.bound().alignment.expect("aligned with the drawing's units");
+        start_measuring(&mut h);
+        assert!(measuring(&h));
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "the Apply dialog");
+        h.key(DialogKey::Activate);
+        assert!(h.bound().apply.is_some(), "Apply is running");
+        assert!(h.app.secureplan.measuring.is_none(), "the measurement was kept");
+        assert!(!matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "the Align form came back during Apply");
+        // A form left from before cannot change the alignment while Apply runs.
+        let tab_id = h.tab_id();
+        let bound = h.bound();
+        let mut dialog = AlignDialog::new(tab_id, Some(Units::Mm), Some(aligned), false, [0.0, 0.0, 100.0, 50.0], false);
+        dialog.opened_for = (bound.session, bound.generation);
+        dialog.form.focus = ROTATION;
+        dialog.form.key(DialogKey::Right);
+        dialog.refresh();
+        h.app.secureplan.dialog = Some(Dialog::Align(Box::new(dialog)));
+        let _ = h.app.update(Message::SecurePlan(crate::app::secureplan::ui::Msg::Action(Action::AlignConfirm)));
+        assert!(h.app.command_line.last_error.clone().unwrap_or_default().contains("busy"));
+        assert_eq!(h.bound().alignment, Some(aligned), "the alignment changed during Apply");
     }
 
     /// PUB-02: a drawing replaced or reconnected while its length is picked
