@@ -71,15 +71,11 @@ fn main() -> iced::Result {
         // Launch URLs reach a running copy over the authenticated per-user
         // channel only; when none answers, this instance serves them. (The
         // unauthenticated single-instance hand-off is off in SecurePlan CAD.)
+        // One SecurePlan CAD window: a copy that handed its URLs over exits.
         #[cfg(feature = "secureplan")]
-        let launch_urls = if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
-            if args.files.is_empty() {
-                return Ok(());
-            }
-            Vec::new()
-        } else {
-            launch_urls
-        };
+        if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
+            return Ok(());
+        }
         // Started by links alone: a link no website may use opens nothing;
         // otherwise the editor stays hidden until a session opens (DSK-04).
         #[cfg(feature = "secureplan")]
@@ -182,6 +178,15 @@ fn main() -> iced::Result {
         // has already returned above — the plugin runner, which is this same
         // binary re-spawning itself, most of all. A flag list here would rot
         // the first time a mode is added; a position cannot.
+        //
+        // SecurePlan CAD keeps one window: a launch without a URL asks the
+        // running copy, over the authenticated per-user channel, to show its
+        // window, and exits. With none running (or only a stale descriptor)
+        // this launch is the primary.
+        #[cfg(feature = "secureplan")]
+        if launch_urls.is_empty() && OpenCADStudio::app::secureplan::handoff::forward_focus() {
+            return Ok(());
+        }
         if !args.new_instance {
             if let io::single_instance::Claim::Existing(stream) = io::single_instance::claim() {
                 // Only bare files forward. `--read-only` / `--script` / `--new`

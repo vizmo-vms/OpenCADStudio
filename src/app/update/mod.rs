@@ -404,6 +404,9 @@ impl OpenCADStudio {
         }
         self.control_settle();
         self.sync_spacemouse();
+        // A finished or cancelled "Measure in drawing" reopens the alignment dialog.
+        #[cfg(feature = "secureplan")]
+        self.secureplan_settle_measure();
         task
     }
 

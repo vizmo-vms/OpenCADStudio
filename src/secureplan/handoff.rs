@@ -1,4 +1,7 @@
-//! Per-user hand-off of launch URLs between instances (DSK-04).
+//! Per-user hand-off of launch URLs between instances (DSK-04), and the
+//! single SecurePlan CAD window: any later launch, with or without a URL,
+//! goes to the running instance and exits. Without a URL it asks the running
+//! instance to bring its window to the front.
 //!
 //! Pairing data never travels as a forwarded process argument, never through
 //! upstream's unauthenticated single-instance port, and never into logs. The
@@ -50,11 +53,29 @@ pub fn forward_launches(urls: &[String]) -> bool {
     !urls.is_empty() && urls.iter().all(|url| send_launch(&path, url).is_ok())
 }
 
+/// A launch without a URL: ask the running instance to show its window.
+/// `false` when none answers (none runs, or `handoff.json` is stale), so
+/// this launch starts as the primary.
+pub fn forward_focus() -> bool {
+    descriptor_path().is_some_and(|path| send(&path, &Request::Focus).is_ok())
+}
+
+/// What another launch asks of the running instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    Launch(String),
+    /// Bring the window to the front.
+    Focus,
+}
+
 /// Called by the instance that shows the editor: serve later hand-offs, then
 /// deliver this process's own launch URLs once.
 pub fn start_primary(urls: Vec<String>) {
     if let Some(path) = descriptor_path() {
-        let _ = serve(&path, super::deliver_launch);
+        let _ = serve(&path, |request| match request {
+            Request::Launch(url) => super::deliver_launch(url),
+            Request::Focus => super::deliver_focus(),
+        });
     }
     for url in urls {
         super::deliver_launch(url);
@@ -132,9 +153,9 @@ fn write_descriptor(path: &Path, port: u16, secret: &[u8; 32]) -> std::io::Resul
     std::fs::rename(&temporary, path)
 }
 
-/// Serve hand-offs for this instance: every authenticated launch URL is
-/// passed to `deliver`.
-pub fn serve(path: &Path, deliver: impl Fn(String) + Send + Sync + 'static) -> std::io::Result<()> {
+/// Serve hand-offs for this instance: every authenticated request is passed
+/// to `deliver`.
+pub fn serve(path: &Path, deliver: impl Fn(Request) + Send + Sync + 'static) -> std::io::Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let secret = random32()?;
     write_descriptor(path, listener.local_addr()?.port(), &secret)?;
@@ -143,8 +164,8 @@ pub fn serve(path: &Path, deliver: impl Fn(String) + Send + Sync + 'static) -> s
         for stream in listener.incoming().flatten() {
             let deliver = std::sync::Arc::clone(&deliver);
             std::thread::spawn(move || {
-                if let Some(url) = accept_one(stream, &secret) {
-                    deliver(url);
+                if let Some(request) = accept_one(stream, &secret) {
+                    deliver(request);
                 }
             });
         }
@@ -152,8 +173,9 @@ pub fn serve(path: &Path, deliver: impl Fn(String) + Send + Sync + 'static) -> s
     Ok(())
 }
 
-/// One hand-off: prove the secret, check the client's proof, take the URL.
-fn accept_one(stream: TcpStream, secret: &[u8; 32]) -> Option<String> {
+/// One hand-off: prove the secret, check the client's proof, take the URL
+/// or the focus request.
+fn accept_one(stream: TcpStream, secret: &[u8; 32]) -> Option<Request> {
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
     let mut writer = stream.try_clone().ok()?;
@@ -163,16 +185,29 @@ fn accept_one(stream: TcpStream, secret: &[u8; 32]) -> Option<String> {
     let server_nonce = random32().ok()?;
     let server_proof = proof(secret, SERVER_LABEL, &client_nonce).finalize().into_bytes();
     write_json(&mut writer, &json!({ "proof": to_hex(&server_proof), "nonce": to_hex(&server_nonce) })).ok()?;
-    let launch = read_json(&mut reader)?;
-    let client_proof: [u8; 32] = from_hex(launch["proof"].as_str()?)?;
-    let url = launch["url"].as_str()?.to_string();
-    let accepted = proof(secret, CLIENT_LABEL, &server_nonce).verify_slice(&client_proof).is_ok() && is_launch_url(&url);
+    let message = read_json(&mut reader)?;
+    let client_proof: [u8; 32] = from_hex(message["proof"].as_str()?)?;
+    let request = match message["op"].as_str()? {
+        "launch" => Request::Launch(message["url"].as_str()?.to_string()),
+        "focus" => Request::Focus,
+        _ => return None,
+    };
+    let accepted = proof(secret, CLIENT_LABEL, &server_nonce).verify_slice(&client_proof).is_ok()
+        && match &request {
+            Request::Launch(url) => is_launch_url(url),
+            Request::Focus => true,
+        };
     let _ = write_json(&mut writer, &json!({ "ok": accepted }));
-    accepted.then_some(url)
+    accepted.then_some(request)
 }
 
 /// Pass `url` to the running instance described by `path`.
 pub fn send_launch(path: &Path, url: &str) -> Result<(), HandoffError> {
+    send(path, &Request::Launch(url.to_string()))
+}
+
+/// Pass `request` to the running instance described by `path`.
+pub fn send(path: &Path, request: &Request) -> Result<(), HandoffError> {
     let descriptor: Value = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -195,7 +230,11 @@ pub fn send_launch(path: &Path, url: &str) -> Result<(), HandoffError> {
         .verify_slice(&server_proof)
         .map_err(|_| HandoffError::Unauthenticated)?;
     let client_proof = proof(&secret, CLIENT_LABEL, &server_nonce).finalize().into_bytes();
-    write_json(&mut writer, &json!({ "op": "launch", "proof": to_hex(&client_proof), "url": url })).map_err(|_| HandoffError::Io)?;
+    let message = match request {
+        Request::Launch(url) => json!({ "op": "launch", "proof": to_hex(&client_proof), "url": url }),
+        Request::Focus => json!({ "op": "focus", "proof": to_hex(&client_proof) }),
+    };
+    write_json(&mut writer, &message).map_err(|_| HandoffError::Io)?;
     let done = read_json(&mut reader).ok_or(HandoffError::Io)?;
     if done["ok"] == true {
         Ok(())
@@ -238,8 +277,8 @@ mod tests {
         let path = temp_path("deliver");
         let (sender, receiver) = mpsc::channel();
         let sender = std::sync::Mutex::new(sender);
-        serve(&path, move |url| {
-            let _ = sender.lock().unwrap().send(url);
+        serve(&path, move |request| {
+            let _ = sender.lock().unwrap().send(request);
         })
         .unwrap();
         #[cfg(unix)]
@@ -248,7 +287,7 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert_eq!(send_launch(&path, URL), Ok(()));
-        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), URL);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -281,10 +320,10 @@ mod tests {
     #[test]
     fn a_client_without_the_secret_is_refused() {
         let path = temp_path("client");
-        let (sender, receiver) = mpsc::channel::<String>();
+        let (sender, receiver) = mpsc::channel::<Request>();
         let sender = std::sync::Mutex::new(sender);
-        serve(&path, move |url| {
-            let _ = sender.lock().unwrap().send(url);
+        serve(&path, move |request| {
+            let _ = sender.lock().unwrap().send(request);
         })
         .unwrap();
         // Speak the protocol without knowing the secret.
@@ -298,9 +337,42 @@ mod tests {
         assert!(read_json(&mut reader).is_some());
         write_json(&mut writer, &json!({ "op": "launch", "proof": to_hex(&[0u8; 32]), "url": URL })).unwrap();
         assert_eq!(read_json(&mut reader).unwrap()["ok"], false);
+        // Nor may it ask for the window.
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        write_json(&mut writer, &json!({ "op": "hello", "nonce": to_hex(&[3u8; 32]) })).unwrap();
+        assert!(read_json(&mut reader).is_some());
+        write_json(&mut writer, &json!({ "op": "focus", "proof": to_hex(&[0u8; 32]) })).unwrap();
+        assert_eq!(read_json(&mut reader).unwrap()["ok"], false);
         assert!(receiver.recv_timeout(Duration::from_millis(300)).is_err(), "delivered without the secret");
         assert_eq!(send_launch(&temp_path("missing"), URL), Err(HandoffError::NoRunningInstance));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A launch without a URL asks the running instance for its window, and
+    /// sends nothing else.
+    #[test]
+    fn a_plain_launch_asks_the_running_instance_for_its_window() {
+        let path = temp_path("focus");
+        let (sender, receiver) = mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        serve(&path, move |request| {
+            let _ = sender.lock().unwrap().send(request);
+        })
+        .unwrap();
+        assert_eq!(send(&path, &Request::Focus), Ok(()));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Focus);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        // A crash left the descriptor behind: nothing listens, so this launch
+        // starts as the primary.
+        let stale = temp_path("stale");
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        write_descriptor(&stale, closed.local_addr().unwrap().port(), &[9u8; 32]).unwrap();
+        drop(closed);
+        assert_eq!(send(&stale, &Request::Focus), Err(HandoffError::NoRunningInstance));
+        std::fs::remove_dir_all(stale.parent().unwrap()).ok();
     }
 
     #[test]

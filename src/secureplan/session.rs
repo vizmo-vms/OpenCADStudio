@@ -1486,6 +1486,9 @@ impl OpenCADStudio {
         if owner == Some(tab_id) {
             self.secureplan.dialog = None;
         }
+        if self.secureplan.measuring.as_ref().is_some_and(|measuring| measuring.tab_id() == tab_id) {
+            self.secureplan.measuring = None;
+        }
     }
 
     /// An Apply ended without a commit: changes taken into its snapshot are

@@ -10,7 +10,7 @@
 
 pub mod guards;
 mod hooks;
-pub use hooks::{begin_cold_start, cold_start, deliver_launch, ColdStart, Msg, State, COLD_START_WAIT};
+pub use hooks::{begin_cold_start, cold_start, deliver_focus, deliver_launch, ColdStart, Msg, State, COLD_START_WAIT};
 
 // Modules for the planned SecurePlan tasks. Each is a stub until its task
 // lands, so later tasks never edit a shared `mod.rs`.
@@ -56,7 +56,7 @@ pub const APP_NAME: &str = "SecurePlan CAD";
 pub const CONFIG_DIR_NAME: &str = "SecurePlanCAD";
 /// SecurePlan CAD's own semantic version, `MAJOR.MINOR.PATCH` with MAJOR ≤ 255
 /// (MSI ProductVersion). Independent of upstream's calendar version.
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 /// Bridge protocol version (BRG-07).
 pub const PROTOCOL: u32 = 1;
 /// Release tags are `secureplan-cad-vX.Y.Z` (DSK-05).
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn version_is_a_valid_release_version() {
-        assert_eq!(release_tag(VERSION).as_deref(), Some("secureplan-cad-v0.2.0"));
+        assert_eq!(release_tag(VERSION).as_deref(), Some("secureplan-cad-v0.2.1"));
     }
 
     #[test]

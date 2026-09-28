@@ -6,7 +6,14 @@
 //! the design overlay as they change. On an empty survey the page goes to the
 //! survey origin, so the translation fields are fixed. Re-aligning a stored
 //! mapping shows the current and new alignment, and the overlay draws both.
+//!
+//! **Measure in drawing** hides the dialog while two points are picked (with
+//! object snaps, or typed), fills the known length with their distance and
+//! switches to calibration. Escape brings the dialog back unchanged.
 
+use std::sync::{Arc, Mutex};
+
+use glam::DVec3;
 use iced::widget::{column, text};
 use iced::{Element, Length};
 
@@ -14,6 +21,8 @@ use super::{Action, Dialog, Field, Form};
 use crate::app::secureplan::align::{calibrated_scale, mapping_at, top_left_corner, Alignment, Units};
 use crate::app::secureplan::publish::Mapping;
 use crate::app::{Message, OpenCADStudio};
+use crate::command::{CadCommand, CmdResult};
+use crate::scene::model::wire_model::WireModel;
 
 const UNITS: usize = 0;
 const CAD_LENGTH: usize = 1;
@@ -76,7 +85,15 @@ impl AlignDialog {
         }
         let mut dialog = Self {
             tab_id,
-            form: Form::new(fields, vec![("Confirm alignment".into(), Action::AlignConfirm), ("Cancel".into(), Action::Dismiss)], Action::Dismiss),
+            form: Form::new(
+                fields,
+                vec![
+                    ("Confirm alignment".into(), Action::AlignConfirm),
+                    ("Measure in drawing".into(), Action::AlignMeasure),
+                    ("Cancel".into(), Action::Dismiss),
+                ],
+                Action::Dismiss,
+            ),
             empty_survey,
             extents,
             before,
@@ -100,6 +117,15 @@ impl AlignDialog {
         let calibrating = self.units() == Some(Units::Unitless);
         self.form.fields[CAD_LENGTH].enabled = calibrating;
         self.form.fields[REAL_LENGTH].enabled = calibrating;
+    }
+
+    /// A length measured in the drawing: calibrate from it, then ask for its
+    /// real length.
+    pub fn measured(&mut self, length: f64) {
+        self.form.select(UNITS, unit_options().len() - 1);
+        self.refresh();
+        self.form.set_number(CAD_LENGTH, length);
+        self.form.focus = REAL_LENGTH;
     }
 
     /// The alignment the fields describe.
@@ -165,7 +191,106 @@ pub fn view(dialog: &AlignDialog) -> Element<'_, Message> {
     content.push(super::keys_hint()).into()
 }
 
+/// The command that measures for the dialog.
+const MEASURE: &str = "SECUREPLANMEASURE";
+
+/// The alignment dialog, hidden while [`MeasureCommand`] runs.
+#[derive(Debug)]
+pub struct Measuring {
+    dialog: AlignDialog,
+    length: Arc<Mutex<Option<f64>>>,
+}
+
+impl Measuring {
+    pub fn tab_id(&self) -> u64 {
+        self.dialog.tab_id
+    }
+}
+
+/// Two points, picked like any command's (object snaps, typed coordinates);
+/// their distance in drawing units, in plan (X and Y).
+struct MeasureCommand {
+    first: Option<DVec3>,
+    length: Arc<Mutex<Option<f64>>>,
+}
+
+impl CadCommand for MeasureCommand {
+    fn name(&self) -> &'static str {
+        MEASURE
+    }
+
+    fn prompt(&self) -> String {
+        match self.first {
+            None => "Measure in drawing  Specify first point:".into(),
+            Some(_) => "Measure in drawing  Specify second point:".into(),
+        }
+    }
+
+    fn on_point(&mut self, point: DVec3) -> CmdResult {
+        let Some(first) = self.first else {
+            self.first = Some(point);
+            return CmdResult::NeedPoint;
+        };
+        let length = (point - first).truncate().length();
+        if !(length.is_finite() && length > 0.0) {
+            return CmdResult::ReportError("SecurePlan: the two points are the same place. Pick two different points.".into());
+        }
+        *self.length.lock().unwrap_or_else(|e| e.into_inner()) = Some(length);
+        CmdResult::Measurement(format!("SecurePlan: measured {} drawing units.", super::format_number(length)))
+    }
+
+    fn on_enter(&mut self) -> CmdResult {
+        CmdResult::Cancel
+    }
+
+    fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {
+        let first = self.first?;
+        Some(WireModel::solid_f64("secureplan_measure".into(), vec![first.to_array(), point.to_array()], WireModel::CYAN, false))
+    }
+}
+
 impl OpenCADStudio {
+    /// **Measure in drawing**: hide the alignment dialog and ask for two points.
+    pub(crate) fn secureplan_measure_start(&mut self) {
+        let Some(Dialog::Align(dialog)) = self.secureplan.dialog.take() else { return };
+        let index = self.secureplan_tab_index(dialog.tab_id);
+        let editable = self.secureplan_can_edit_tab(dialog.tab_id);
+        let (Some(index), Ok(())) = (index, editable.clone()) else {
+            if let Err(message) = editable {
+                self.command_line.push_error(&message);
+            }
+            self.secureplan.dialog = Some(Dialog::Align(dialog));
+            return;
+        };
+        self.active_tab = index;
+        let length = Arc::new(Mutex::new(None));
+        let command = MeasureCommand { first: None, length: length.clone() };
+        self.command_line.push_info(&command.prompt());
+        self.tabs[index].active_cmd = Some(Box::new(command));
+        self.secureplan.measuring = Some(Measuring { dialog: *dialog, length });
+    }
+
+    /// Once the measuring command has ended (a length, Escape or anything
+    /// else), bring the alignment dialog back.
+    pub(crate) fn secureplan_settle_measure(&mut self) {
+        let Some(measuring) = &self.secureplan.measuring else { return };
+        let running = self.tabs.iter().find(|tab| tab.id == measuring.tab_id()).is_some_and(|tab| {
+            [&tab.active_cmd, &tab.suspended_cmd].iter().any(|command| command.as_ref().is_some_and(|c| c.name() == MEASURE))
+        });
+        // Another dialog showing is answered first.
+        if running || self.secureplan.dialog.is_some() {
+            return;
+        }
+        let Some(Measuring { mut dialog, length }) = self.secureplan.measuring.take() else { return };
+        if self.secureplan_tab_index(dialog.tab_id).is_none() {
+            return;
+        }
+        if let Some(length) = length.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            dialog.measured(length);
+        }
+        self.secureplan.dialog = Some(Dialog::Align(Box::new(dialog)));
+    }
+
     /// Open the alignment dialog for the active bound document.
     pub(crate) fn secureplan_open_align(&mut self, then_apply: bool) {
         if let Err(message) = self.secureplan_can_edit_survey() {
@@ -174,6 +299,7 @@ impl OpenCADStudio {
         }
         let index = self.active_tab;
         let _ = self.cancel_active_command_for_space_change();
+        self.secureplan.measuring = None;
         let tab = &self.tabs[index];
         let Some(bound) = self.secureplan.sessions.by_tab(tab.id) else { return };
         let Some(extents) = crate::app::secureplan::publish::visible_extents(&tab.scene) else {
@@ -253,6 +379,76 @@ mod tests {
         dialog.form.set_text(REAL_LENGTH, "5000".into());
         let calibrated = dialog.proposed().unwrap();
         assert_eq!((calibrated.units, calibrated.mapping.scale_mm_per_cad_unit), (Units::Unitless, 20.0));
+    }
+
+    /// PUB-02: Measure in drawing, through the dialog's keys, the dropdown
+    /// message and typed points at the command line.
+    #[test]
+    fn measure_in_drawing_fills_the_known_length_and_escape_changes_nothing() {
+        use crate::app::secureplan::session::tests::Harness;
+        use crate::app::secureplan::ui::{Dialog, FieldKind, Msg};
+        let mut h = Harness::new("measure");
+        h.survey_empty = false;
+        h.open_dxf();
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        let form = |h: &Harness| match &h.app.secureplan.dialog {
+            Some(Dialog::Align(dialog)) => dialog.form.clone(),
+            _ => panic!("no alignment dialog"),
+        };
+        let text = |form: &Form, index: usize| match &form.fields[index].kind {
+            FieldKind::Number { text } => text.clone(),
+            FieldKind::Choice { .. } => unreachable!(),
+        };
+        // Some choices of the user's own: rotation 90° from its dropdown, and a CAD point.
+        let _ = h.app.update(Message::SecurePlan(Msg::FormSelect(ROTATION, 1)));
+        let _ = h.app.update(Message::SecurePlan(Msg::FormInput(CAD_X, "12.5".into())));
+        let before = form(&h);
+        if let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog {
+            let mut ui = iced_test::simulator(view(dialog));
+            assert!(ui.find("  Measure in drawing").is_ok(), "offered whatever the units");
+            assert!(ui.find("‹ 90° ›").is_err(), "choices are dropdowns, not click-to-cycle buttons");
+        }
+        let measuring = |h: &Harness| h.app.tabs[h.app.active_tab].active_cmd.as_ref().is_some_and(|c| c.name() == MEASURE);
+        let point = |h: &mut Harness, typed: &str| {
+            let _ = h.app.update(Message::CommandInput(typed.into()));
+            let _ = h.app.update(Message::CommandSubmit);
+        };
+        // Shift+Tab from the first field reaches Cancel, then Measure in drawing.
+        h.app.secureplan.dialog.as_mut().unwrap().form_mut().focus = 0;
+        h.key(DialogKey::Previous);
+        h.key(DialogKey::Previous);
+        h.key(DialogKey::Activate);
+        assert!(h.app.secureplan.dialog.is_none() && measuring(&h), "the dialog hides while points are picked");
+        // Escape while picking: the dialog comes back as it was.
+        point(&mut h, "0,0");
+        let _ = h.app.update(Message::CommandEscape);
+        assert!(!measuring(&h));
+        let mut back = form(&h);
+        back.focus = before.focus;
+        assert_eq!(back, before, "Escape changes nothing");
+        // A zero length is refused and the second point asked again.
+        h.key(DialogKey::Activate);
+        assert!(measuring(&h));
+        point(&mut h, "10,10");
+        point(&mut h, "10,10");
+        assert!(h.app.command_line.last_error.clone().unwrap_or_default().contains("same place"));
+        assert!(measuring(&h) && h.app.secureplan.dialog.is_none());
+        point(&mut h, "40,50");
+        let after = form(&h);
+        assert_eq!(after.selected(UNITS), unit_options().len() - 1, "calibrating");
+        assert!(after.fields[CAD_LENGTH].enabled && after.fields[REAL_LENGTH].enabled);
+        assert_eq!(after.number(CAD_LENGTH), Some(50.0), "the distance in drawing units");
+        assert_eq!(after.focus, REAL_LENGTH);
+        assert_eq!(after.selected(ROTATION), 1, "the other fields are kept");
+        for index in [CAD_X, CAD_Y, SURVEY_X, SURVEY_Y] {
+            assert_eq!(text(&after, index), text(&before, index));
+        }
+        // Its real length, typed: 50 units are 5,000 mm, and the overlay previews it.
+        h.key(DialogKey::Backspace);
+        for c in "5000".chars() {
+            h.key(DialogKey::Char(c));
+        }
+        assert_eq!(h.app.secureplan_alignment_preview().map(|m| m.scale_mm_per_cad_unit), Some(100.0));
     }
 
     #[test]

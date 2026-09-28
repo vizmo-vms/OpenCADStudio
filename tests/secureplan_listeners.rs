@@ -170,3 +170,45 @@ fn secureplan_release_builds_refuse_the_headless_drawing_modes() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// One SecurePlan CAD window: a launch without a URL asks the running copy,
+/// over the authenticated per-user channel, to show its window and exits
+/// without one. When only a crash's stale `handoff.json` is left, the launch
+/// starts as the primary and serves later launches itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn secureplan_a_second_launch_shows_the_running_window_and_exits() {
+    use OpenCADStudio::app::secureplan::{handoff, CONFIG_DIR_NAME};
+    let dir = sentinel_dir("single");
+    let descriptor = dir.join(CONFIG_DIR_NAME).join("handoff.json");
+    let launch = || {
+        Command::new(env!("CARGO_BIN_EXE_OpenCADStudio"))
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("XDG_CONFIG_HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the SecurePlan CAD binary")
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender = std::sync::Mutex::new(sender);
+    handoff::serve(&descriptor, move |request| {
+        let _ = sender.lock().unwrap().send(request);
+    })
+    .unwrap();
+    let output = launch().wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), handoff::Request::Focus);
+
+    // A crash left a descriptor behind whose port nobody serves.
+    let port = free_port();
+    std::fs::write(&descriptor, format!("{{\"protocol\":1,\"port\":{port},\"secret\":\"{}\",\"pid\":1}}\n", "00".repeat(32))).unwrap();
+    let primary = launch();
+    let pid = primary.id();
+    let _ = primary.wait_with_output().unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
+    assert_eq!(written["pid"], pid, "the launch did not start as the primary");
+    std::fs::remove_dir_all(&dir).ok();
+}
