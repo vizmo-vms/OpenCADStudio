@@ -108,14 +108,14 @@ pub fn headless_file_refusal(export: bool, thumbnail: bool, script: bool) -> Opt
     )
 }
 
-/// Linux (DSK-02): no core file. A crash must not write the process memory
-/// (drawings, pairing secrets, session keys) to a core file in the working
-/// directory or to systemd-coredump's store, which honour `RLIMIT_CORE`, so
-/// the soft and hard limits are set to 0 before anything else runs. macOS
-/// starts apps with this limit already at 0.
+/// Linux (DSK-02): the soft and hard `RLIMIT_CORE` are set to 0 before
+/// anything else runs, so the kernel writes no core file and crash
+/// collectors that honour the limit store no process memory. It is not a
+/// guarantee: a collector the kernel pipes crashes to may ignore the limit
+/// (Ubuntu's apport can save the memory, drawings and session secrets
+/// included, in a crash report); that exception is accepted for the internal
+/// Linux build. macOS starts apps with this limit already at 0.
 ///
-/// A crash handler that the system pipes core dumps to (Ubuntu's apport) is
-/// not bound by the limit; see the SecurePlan CAD documentation.
 /// `PR_SET_DUMPABLE` is deliberately not cleared: that also denies
 /// `/proc/<pid>/root` to the user's own xdg-desktop-portal, which then
 /// refuses every request from SecurePlan CAD, the file chooser included.
@@ -274,7 +274,7 @@ mod tests {
         assert!(!trap.was_contacted(), "the image reference was fetched");
     }
 
-    /// DSK-02: on Linux a crash writes no core file, and the process stays
+    /// DSK-02: on Linux the core file limit is 0, and the process stays
     /// dumpable, so the user's own xdg-desktop-portal still answers it.
     /// (Lowering the limit in the test process harms no other test.)
     #[cfg(target_os = "linux")]

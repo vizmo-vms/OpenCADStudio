@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Install the SecurePlan CAD package on a disposable CI runner, check it, and
-# remove it again (DSK-05). Needs sudo; never run it on a workstation.
+# Install the internal SecurePlan CAD Linux test package on a disposable CI
+# runner, check it, and remove it again. Needs sudo; never run it on a
+# workstation.
 #
 #   packaging/secureplan/check-deb-install.sh <package .deb>
 #
-# Checks: apt installs it with its dependencies; `secureplan-cad --version`
+# Checks: apt installs it with its dependencies, desktop-file-utils (whose
+# trigger registers the link scheme) among them; `secureplan-cad --version`
 # names SecurePlan CAD and the package version; the desktop database lists it
 # as the handler of secureplan-cad: links (x-scheme-handler/secureplan-cad,
 # through the desktop-file-utils trigger) and registers no drawing types; the
@@ -19,8 +21,14 @@ fi
 version="$(dpkg-deb -f "$deb" Version)"
 cache=/usr/share/applications/mimeinfo.cache
 
+case ", $(dpkg-deb -f "$deb" Depends), " in
+  *", desktop-file-utils, "*) ;;
+  *) echo "error: the package does not depend on desktop-file-utils" >&2; exit 1 ;;
+esac
 sudo apt-get install -y "$deb"
 [ "$(dpkg-query -W -f '${Status} ${Version}' secureplan-cad)" = "install ok installed $version" ]
+[ "$(dpkg-query -W -f '${Status}' desktop-file-utils)" = "install ok installed" ]
+desktop-file-validate /usr/share/applications/in.vizmo.secureplan.cad.desktop
 out="$(env -u DISPLAY -u WAYLAND_DISPLAY secureplan-cad --version)"
 case "$out" in
   "SecurePlan CAD $version"*) ;;

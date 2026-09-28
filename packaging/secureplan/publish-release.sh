@@ -23,7 +23,7 @@ notes="${4:?notes file}"
 : "${GH_REPO:?GH_REPO must name the repository}"
 here="$(cd "$(dirname "$0")" && pwd)"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
-assets=(SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-linux-x64.deb SecurePlanCAD-source.tar.gz SHA256SUMS)
+assets=(SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-source.tar.gz SHA256SUMS)
 
 # The latest published release's tag, or `--none` when GitHub confirms there
 # is none (HTTP 404). Fails on anything else.

@@ -266,11 +266,10 @@ impl State {
                 None => line,
             });
         } else {
-            let lines = vec![format!("SecurePlan CAD {} was not installed.", outcome.version), outcome.message];
-            self.dialog = Some(match outcome.manual_command {
-                Some(command) => super::update::manual_install_dialog("Update not installed", lines, command),
-                None => Dialog::notice("Update not installed", lines),
-            });
+            self.dialog = Some(Dialog::notice(
+                "Update not installed",
+                vec![format!("SecurePlan CAD {} was not installed.", outcome.version), outcome.message],
+            ));
         }
     }
 }
@@ -1060,10 +1059,6 @@ impl OpenCADStudio {
                 self.secureplan_update_cancel_download();
                 Task::none()
             }
-            Action::CopyText(text) => {
-                self.command_line.push_info("SecurePlan: the command was copied.");
-                iced::clipboard::write(text).map(|_| Message::Noop)
-            }
         };
         // An export dialog that waited for this one comes up now.
         self.secureplan_show_waiting_export();
@@ -1302,27 +1297,15 @@ mod tests {
     fn the_first_start_after_an_update_reports_its_outcome() {
         use crate::app::secureplan::update_helper::Outcome;
         let mut app = app_with_drawing();
-        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: true, message: "SecurePlan CAD was updated to 0.2.0.".into(), manual_command: None });
+        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: true, message: "SecurePlan CAD was updated to 0.2.0.".into() });
         assert!(app.secureplan.dialog.is_none(), "a successful update opens no dialog");
         let _ = app.update(Message::SecurePlan(Msg::Tick));
         let history: Vec<String> = app.command_line.history.iter().map(|entry| entry.text.clone()).collect();
         assert!(history.iter().any(|line| line.contains("updated to 0.2.0")), "{history:?}");
-        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: false, message: "Windows Installer stopped with error 1603; SecurePlan CAD is unchanged.".into(), manual_command: None });
-        let Some(Dialog::Choice { title, lines, form }) = &app.secureplan.dialog else { panic!("no dialog for a failed update") };
+        app.secureplan.show_update_outcome(Outcome { version: "0.2.0".into(), installed: false, message: "Windows Installer stopped with error 1603; SecurePlan CAD is unchanged.".into() });
+        let Some(Dialog::Choice { title, lines, .. }) = &app.secureplan.dialog else { panic!("no dialog for a failed update") };
         assert_eq!(title, "Update not installed");
         assert!(lines.iter().any(|line| line.contains("1603")), "{lines:?}");
-        assert_eq!(form.buttons.len(), 1, "{:?}", form.buttons);
-        // Linux: the kept package's install command can be copied.
-        let command = "sudo apt install /tmp/secureplan-cad-update-1-2/SecurePlanCAD-linux-x64.deb".to_string();
-        app.secureplan.dialog = None;
-        app.secureplan.show_update_outcome(Outcome {
-            version: "0.2.0".into(),
-            installed: false,
-            message: format!("The system installer did not get permission to install the update. To install it, run this command in a terminal: {command}"),
-            manual_command: Some(command.clone()),
-        });
-        let Some(Dialog::Choice { form, .. }) = &app.secureplan.dialog else { panic!("no dialog for a kept package") };
-        assert_eq!(form.buttons[0], ("Copy command".to_string(), Action::CopyText(command)));
     }
 
     #[test]

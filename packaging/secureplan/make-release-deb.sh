@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Build the release Debian package of SecurePlan CAD for Linux x64 (DSK-05):
-# the package `secureplan-cad`, which installs
+# Build the Debian package of SecurePlan CAD for Linux x64 from a release
+# build. It is for internal testing only: SecurePlan CAD 0.2.2 does not
+# release Linux (the launch link's token is visible to other local users in
+# the process arguments), and the release workflow neither builds nor
+# publishes it. SecurePlan CI builds it and installs it on the runner to keep
+# the packaging honest. The package `secureplan-cad` installs
 #   /usr/bin/secureplan-cad                         the release build (--features secureplan)
 #   /usr/share/applications/in.vizmo.secureplan.cad.desktop
 #                                                   the menu entry, and the secureplan-cad: link
@@ -9,16 +13,17 @@
 #                                                   the Vizmo icon (make-icons.py)
 #   /usr/share/doc/secureplan-cad/copyright         GPL-3, with the source location
 #   /usr/share/doc/secureplan-cad/changelog.gz      this version, pointing to its release
-# and no maintainer scripts: the dpkg triggers of desktop-file-utils and the
-# hicolor icon theme refresh the MIME handler and icon caches. It registers no
-# drawing file types.
+# and no maintainer scripts: the dpkg triggers of desktop-file-utils (a
+# dependency, since the link scheme is registered only through it) and the
+# hicolor icon theme refresh the MIME handler and icon caches. It registers
+# no drawing file types, and it does not update itself.
 #
 #   packaging/secureplan/make-release-deb.sh <release binary> <output .deb>
 #
 # Needs dpkg-deb and dpkg-shlibdeps (dpkg-dev) and readelf (binutils); no
-# fakeroot (files are owned by root through --root-owner-group). The release
-# workflow builds on ubuntu-22.04, so the package runs on Ubuntu 22.04 and
-# later and on Debian 12 and later.
+# fakeroot (files are owned by root through --root-owner-group). Built on
+# ubuntu-22.04 (as CI does), the package runs on Ubuntu 22.04 and later and on
+# Debian 12 and later.
 set -euo pipefail
 umask 022
 
@@ -29,7 +34,6 @@ root="$(cd "$here/../.." && pwd)"
 version="$(sed -n 's/^pub const VERSION: &str = "\(.*\)";$/\1/p' "$root/src/secureplan/mod.rs")"
 test -n "$version"
 package="secureplan-cad"
-# The updater expects these (src/secureplan/update_helper.rs).
 program="/usr/bin/secureplan-cad"
 desktop_id="in.vizmo.secureplan.cad"
 icon_sizes=(16 24 32 48 64 128 256)
@@ -51,7 +55,7 @@ for size in "${icon_sizes[@]}"; do
   install -D -m 0644 "$here/linux/icon-$size.png" "$pkg/usr/share/icons/hicolor/${size}x${size}/apps/$desktop_id.png"
 done
 install -D -m 0644 "$here/linux/copyright" "$pkg/usr/share/doc/$package/copyright"
-maintainer="Vizmo <hari@vizmo.in>"
+maintainer="Vizmo <support@vizmo.in>"
 {
   echo "$package ($version) stable; urgency=medium"
   echo
@@ -76,11 +80,13 @@ test -n "$linked"
 # - libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6: X11 windows;
 # - libxkbcommon0, libxkbcommon-x11-0: the keyboard on both;
 # - libdbus-1-3: the file chooser (xdg-desktop-portal).
-runtime="libvulkan1, libegl1, libwayland-client0, libwayland-egl1, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libdbus-1-3"
+# And desktop-file-utils, whose trigger registers the secureplan-cad: scheme
+# (mimeinfo.cache); without it the browser cannot find the handler.
+runtime="libvulkan1, libegl1, libwayland-client0, libwayland-egl1, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libdbus-1-3, desktop-file-utils"
 # Usually present on a desktop: GPU drivers, the portal that shows the file
-# chooser, zenity (message boxes and the chooser without a portal), pkexec
-# (installing updates) and xdg-utils (opening links).
-recommends="mesa-vulkan-drivers | vulkan-icd, libegl-mesa0, xdg-desktop-portal-gtk | xdg-desktop-portal-backend, zenity, pkexec | policykit-1, xdg-utils"
+# chooser, zenity (message boxes and the chooser without a portal)
+# and xdg-utils (opening links).
+recommends="mesa-vulkan-drivers | vulkan-icd, libegl-mesa0, xdg-desktop-portal-gtk | xdg-desktop-portal-backend, zenity, xdg-utils"
 
 size_kib="$(du -sk --exclude=DEBIAN "$pkg" | cut -f1)"
 cat > "$pkg/DEBIAN/control" <<CONTROL

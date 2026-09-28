@@ -2,10 +2,8 @@ name: SecurePlan CAD release
 
 # Builds and publishes SecurePlan CAD releases (DSK-05, DSK-07):
 #   SecurePlanCAD-macos-arm64.dmg, SecurePlanCAD-macos-x64.dmg (ad-hoc signed),
-#   SecurePlanCAD-windows-x64.msi (per-user, no signing),
-#   SecurePlanCAD-linux-x64.deb (the secureplan-cad package, built on Ubuntu
-#   22.04 for Ubuntu 22.04+ and Debian 12+), the source archive
-#   SecurePlanCAD-source.tar.gz and SHA256SUMS over all five.
+#   SecurePlanCAD-windows-x64.msi (per-user, no signing), the source archive
+#   SecurePlanCAD-source.tar.gz and SHA256SUMS over all four.
 #
 # - Pushing the tag `secureplan-cad-vX.Y.Z` (on the secureplan branch, equal to
 #   VERSION in src/secureplan/mod.rs, with release notes in
@@ -13,8 +11,7 @@ name: SecurePlan CAD release
 #   publishes: draft release -> upload every asset -> download and verify
 #   them against SHA256SUMS -> publish and mark latest -> check that
 #   releases/latest/download/<name> serves them.
-# - A pull request into secureplan (or a secureplan-* release branch) that
-#   touches the release workflow,
+# - A pull request into secureplan that touches the release workflow,
 #   packaging or the updater, and a manual run (workflow_dispatch, which needs
 #   the workflow on the default branch), are always a DRY RUN: they build every
 #   asset, write and verify SHA256SUMS, and upload them as workflow artifacts
@@ -34,7 +31,7 @@ on:
   push:
     tags: ["secureplan-cad-v*"]
   pull_request:
-    branches: [secureplan, "secureplan-*"]
+    branches: [secureplan]
     paths:
       - .github/workflows/secureplan-release.yml
       - packaging/**
@@ -199,51 +196,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  linux:
-    name: Linux x64 package
-    needs: prepare
-    # The oldest supported base: the package runs on Ubuntu 22.04 and later
-    # and on Debian 12 and later.
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y \
-            libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev \
-            dpkg-dev desktop-file-utils
-
-      - name: Release build (secureplan)
-        run: cargo build --locked --release --features secureplan --bin OpenCADStudio
-
-      - name: The build embeds its fork commit
-        run: grep -aqF "$GITHUB_SHA" target/release/OpenCADStudio
-
-      - name: Build the package
-        run: packaging/secureplan/make-release-deb.sh target/release/OpenCADStudio SecurePlanCAD-linux-x64.deb
-
-      # Installs with apt on the runner, registers the secureplan-cad: scheme
-      # and the menu entry, runs, and uninstalls cleanly.
-      - name: Install and remove the package
-        run: packaging/secureplan/check-deb-install.sh SecurePlanCAD-linux-x64.deb
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: secureplan-cad-linux-x64
-          path: SecurePlanCAD-linux-x64.deb
-          if-no-files-found: error
-          retention-days: 14
-
   source:
     name: Source archive
     needs: prepare
@@ -270,7 +222,7 @@ jobs:
 
   checksums:
     name: SHA256SUMS
-    needs: [prepare, macos, windows, linux, source]
+    needs: [prepare, macos, windows, source]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -284,7 +236,7 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          assets=(SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-linux-x64.deb SecurePlanCAD-source.tar.gz)
+          assets=(SecurePlanCAD-macos-arm64.dmg SecurePlanCAD-macos-x64.dmg SecurePlanCAD-windows-x64.msi SecurePlanCAD-source.tar.gz)
           if [ "$(ls | sort)" != "$(printf '%s\n' "${assets[@]}" | sort)" ]; then
             echo "::error::unexpected assets: $(ls | tr '\n' ' ')"
             exit 1

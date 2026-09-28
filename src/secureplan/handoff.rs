@@ -14,7 +14,9 @@
 //!
 //! On Windows and Linux the operating system passes the first launch's URL as
 //! a process argument (Linux: the `.desktop` file's `Exec=… %u`); that
-//! instance uses it once and never forwards it.
+//! instance uses it once and never forwards it. On Linux other local users
+//! can read process arguments (`/proc/<pid>/cmdline`), launch token included,
+//! so the Linux package is for internal testing only and is not released.
 //!
 //! One window: the primary holds an exclusive per-user lock on
 //! `primary.lock` for its lifetime (the operating system releases it when the
@@ -107,9 +109,7 @@ pub fn claim_window(requests: &[Request]) -> Claim {
 /// ownership of the window; the descriptor is readiness to take requests.
 pub fn claim(dir: &Path, requests: &[Request], wait: Duration) -> Claim {
     let descriptor = dir.join("handoff.json");
-    let lock = std::fs::create_dir_all(dir).and_then(|_| {
-        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("primary.lock"))
-    });
+    let lock = open_lock(dir);
     let deadline = Instant::now() + wait;
     let mut pending: Vec<&Request> = requests.iter().collect();
     loop {
@@ -275,6 +275,58 @@ fn read_json(reader: &mut BufReader<TcpStream>) -> Option<Value> {
 fn write_json(stream: &mut TcpStream, value: &Value) -> std::io::Result<()> {
     writeln!(stream, "{value}")?;
     stream.flush()
+}
+
+/// Open `dir/primary.lock`. On Unix the folder and the lock must belong to
+/// the current user and are made private to them (0700 and 0600), so no
+/// other user can open the lock and hold it to keep the window from opening.
+/// A lock that an earlier build left readable by others is replaced rather
+/// than tightened: a descriptor another user opened then keeps only the old
+/// file.
+#[cfg(unix)]
+fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { geteuid() };
+    let foreign = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the SecurePlan CAD settings folder is not the user's own");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let folder = std::fs::metadata(dir)?;
+    if !folder.is_dir() || folder.uid() != uid {
+        return Err(foreign());
+    }
+    if folder.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = dir.join("primary.lock");
+    let open = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path);
+    let file = open()?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != uid {
+        return Err(foreign());
+    }
+    if metadata.mode() & 0o077 == 0 {
+        return Ok(file);
+    }
+    drop(file);
+    let fresh = dir.join("primary.lock.new");
+    let _ = std::fs::remove_file(&fresh);
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&fresh)?;
+    std::fs::rename(&fresh, &path)?;
+    let file = open()?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(foreign());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("primary.lock"))
 }
 
 /// Write the descriptor readable by the current user only.
@@ -809,6 +861,36 @@ mod tests {
         let dir = temp_dir("undescribable");
         std::fs::create_dir_all(dir.join("handoff.json")).unwrap();
         assert!(serve(&dir.join("handoff.json"), |_| true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: the settings folder and `primary.lock` are private to the
+    /// user. A lock an earlier build left readable, already held through a
+    /// descriptor opened then (as another user could), is replaced, so the
+    /// launch still owns the window; a private lock is kept as it is.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_is_private_and_a_readable_one_held_elsewhere_is_replaced() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+        let dir = temp_dir("private-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("primary.lock");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let held = std::fs::File::open(&path).unwrap();
+        held.try_lock().unwrap();
+        let Claim::Primary(lock) = claim(&dir, &[], Duration::from_millis(200)) else { panic!("a lock held through a readable file kept the window") };
+        assert_eq!((mode(&dir), mode(&path)), (0o700, 0o600));
+        assert_ne!(held.metadata().unwrap().ino(), std::fs::metadata(&path).unwrap().ino());
+        assert!(!dir.join("primary.lock.new").exists());
+        assert!(matches!(claim(&dir, &[], Duration::from_millis(200)), Claim::Unanswered), "the new lock is not exclusive");
+        let inode = lock.metadata().unwrap().ino();
+        drop(lock);
+        let Claim::Primary(lock) = claim(&dir, &[], Duration::from_millis(200)) else { panic!("the private lock was not taken") };
+        assert_eq!(lock.metadata().unwrap().ino(), inode, "a private lock was replaced");
+        drop((lock, held));
         std::fs::remove_dir_all(&dir).ok();
     }
 
