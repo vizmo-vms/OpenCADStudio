@@ -76,6 +76,15 @@ fn main() -> iced::Result {
         if OpenCADStudio::app::secureplan::handoff::forward_launches(&launch_urls) {
             return Ok(());
         }
+        // Started by the macOS launcher while a link is on its way over the
+        // hand-off: no editor window until a session opens, as for a link
+        // start (BRG-02). The flag carries no pairing data.
+        #[cfg(feature = "secureplan")]
+        let awaiting_launch = args.secureplan_awaiting_launch && launch_urls.is_empty();
+        #[cfg(feature = "secureplan")]
+        if awaiting_launch {
+            OpenCADStudio::app::secureplan::begin_awaiting_launch();
+        }
         // Started by links alone: a link no website may use opens nothing;
         // otherwise the editor stays hidden until a session opens (DSK-04).
         #[cfg(feature = "secureplan")]
@@ -179,14 +188,31 @@ fn main() -> iced::Result {
         // binary re-spawning itself, most of all. A flag list here would rot
         // the first time a mode is added; a position cannot.
         //
-        // SecurePlan CAD keeps one window: a launch without a URL asks the
-        // running copy, over the authenticated per-user channel, to show its
-        // window, and exits. With none running (or only a stale descriptor)
-        // this launch is the primary.
+        // SecurePlan CAD keeps one window: the primary holds a per-user lock
+        // for its lifetime. Any other launch hands its URLs (or, without one,
+        // a request to show the window) to the primary over the authenticated
+        // per-user channel and exits, retrying while the primary is still
+        // starting. With no primary (a crash's stale descriptor included)
+        // this launch takes the lock and is the primary.
         #[cfg(feature = "secureplan")]
-        if launch_urls.is_empty() && OpenCADStudio::app::secureplan::handoff::forward_focus() {
-            return Ok(());
-        }
+        let primary_lock = {
+            use OpenCADStudio::app::secureplan::handoff::{self, Claim, Request};
+            let requests: Vec<Request> = if awaiting_launch {
+                Vec::new()
+            } else if launch_urls.is_empty() {
+                vec![Request::Focus]
+            } else {
+                launch_urls.iter().cloned().map(Request::Launch).collect()
+            };
+            match handoff::claim_window(&requests) {
+                Claim::Primary(lock) => lock,
+                Claim::Forwarded => return Ok(()),
+                Claim::Unanswered => {
+                    eprintln!("SecurePlan CAD is already running but did not answer; try again.");
+                    return Ok(());
+                }
+            }
+        };
         if !args.new_instance {
             if let io::single_instance::Claim::Existing(stream) = io::single_instance::claim() {
                 // Only bare files forward. `--read-only` / `--script` / `--new`
@@ -205,7 +231,7 @@ fn main() -> iced::Result {
 
         // This instance receives later launches, and uses its own once.
         #[cfg(feature = "secureplan")]
-        OpenCADStudio::app::secureplan::handoff::start_primary(launch_urls);
+        OpenCADStudio::app::secureplan::handoff::start_primary(primary_lock, launch_urls);
 
         // GUI: stash the startup config for `app::boot` to pick up.
         let script_lines = args

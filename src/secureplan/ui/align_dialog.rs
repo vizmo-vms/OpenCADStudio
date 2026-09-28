@@ -48,6 +48,11 @@ pub struct AlignDialog {
     pub before: Option<Alignment>,
     /// Continue to Apply once the alignment is confirmed.
     pub then_apply: bool,
+    /// The session and drawing generation the dialog was opened for: a
+    /// replaced drawing or a reconnect makes it stale.
+    pub opened_for: (Option<crate::app::secureplan::bridge::SessionId>, u64),
+    /// Why **Measure in drawing** could not start, shown in the dialog.
+    pub measure_problem: Option<String>,
 }
 
 fn unit_options() -> Vec<String> {
@@ -98,6 +103,8 @@ impl AlignDialog {
             extents,
             before,
             then_apply,
+            opened_for: (None, 0),
+            measure_problem: None,
         };
         dialog.refresh();
         dialog
@@ -188,6 +195,9 @@ pub fn view(dialog: &AlignDialog) -> Element<'_, Message> {
         }
         Err(problem) => content = content.push(text(format!("To do: {problem}")).size(12)),
     }
+    if let Some(problem) = &dialog.measure_problem {
+        content = content.push(text(format!("Measure in drawing: {problem}")).size(12).width(Length::Fixed(520.0)));
+    }
     content.push(super::keys_hint()).into()
 }
 
@@ -207,8 +217,22 @@ impl Measuring {
     }
 }
 
-/// Two points, picked like any command's (object snaps, typed coordinates);
-/// their distance in drawing units, in plan (X and Y).
+/// Why the active space cannot be measured for the alignment: only model
+/// coordinates are drawing units (a paper layout outside a model viewport is
+/// in sheet units, and the block editor in the block's own units).
+fn measure_space_problem(scene: &crate::scene::Scene) -> Option<&'static str> {
+    if scene.block_edit_block.is_some() {
+        Some("it measures the drawing, not a block. Cancel, close the block editor, then open Align again.")
+    } else if scene.current_layout != "Model" && scene.active_viewport.is_none() {
+        Some("it measures model space. Cancel, switch to the Model tab or into a layout viewport, then open Align again.")
+    } else {
+        None
+    }
+}
+
+/// Two points, picked like any command's (object snaps, typed coordinates),
+/// in the world coordinate system whatever the UCS; their distance in
+/// drawing units, in plan (X and Y), which is what the alignment scales.
 struct MeasureCommand {
     first: Option<DVec3>,
     length: Arc<Mutex<Option<f64>>>,
@@ -262,6 +286,13 @@ impl OpenCADStudio {
             self.secureplan.dialog = Some(Dialog::Align(dialog));
             return;
         };
+        if let Some(problem) = measure_space_problem(&self.tabs[index].scene) {
+            let mut dialog = dialog;
+            dialog.measure_problem = Some(problem.to_string());
+            self.command_line.push_error(&format!("SecurePlan: Measure in drawing: {problem}"));
+            self.secureplan.dialog = Some(Dialog::Align(dialog));
+            return;
+        }
         self.active_tab = index;
         let length = Arc::new(Mutex::new(None));
         let command = MeasureCommand { first: None, length: length.clone() };
@@ -282,13 +313,26 @@ impl OpenCADStudio {
             return;
         }
         let Some(Measuring { mut dialog, length }) = self.secureplan.measuring.take() else { return };
-        if self.secureplan_tab_index(dialog.tab_id).is_none() {
+        let Some(index) = self.secureplan_tab_index(dialog.tab_id) else { return };
+        // The drawing was replaced or reconnected meanwhile: the form
+        // describes a drawing that is gone.
+        if !self.secureplan_align_current(&dialog) {
+            self.command_line.push_info("SecurePlan: the drawing changed while measuring. Open Align again.");
             return;
         }
-        if let Some(length) = length.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            dialog.measured(length);
+        let length = length.lock().unwrap_or_else(|e| e.into_inner()).take();
+        dialog.measure_problem = None;
+        match (length, measure_space_problem(&self.tabs[index].scene)) {
+            (Some(length), None) => dialog.measured(length),
+            (Some(_), Some(problem)) => dialog.measure_problem = Some(problem.to_string()),
+            (None, _) => {}
         }
         self.secureplan.dialog = Some(Dialog::Align(Box::new(dialog)));
+    }
+
+    /// Whether the alignment dialog still describes its tab's drawing.
+    fn secureplan_align_current(&self, dialog: &AlignDialog) -> bool {
+        self.secureplan.sessions.by_tab(dialog.tab_id).is_some_and(|bound| (bound.session, bound.generation) == dialog.opened_for)
     }
 
     /// Open the alignment dialog for the active bound document.
@@ -308,7 +352,8 @@ impl OpenCADStudio {
         };
         let declared = Units::declared(tab.scene.document.header.insertion_units);
         let empty = crate::app::secureplan::session::survey_is_empty(bound);
-        let dialog = AlignDialog::new(tab.id, declared, bound.alignment, empty, crate::app::secureplan::publish::default_window(extents), then_apply);
+        let mut dialog = AlignDialog::new(tab.id, declared, bound.alignment, empty, crate::app::secureplan::publish::default_window(extents), then_apply);
+        dialog.opened_for = (bound.session, bound.generation);
         self.secureplan.dialog = Some(Dialog::Align(Box::new(dialog)));
     }
 
@@ -324,6 +369,11 @@ impl OpenCADStudio {
     pub(crate) fn secureplan_confirm_align(&mut self) -> iced::Task<Message> {
         let Some(Dialog::Align(dialog)) = &self.secureplan.dialog else { return iced::Task::none() };
         let (tab_id, then_apply) = (dialog.tab_id, dialog.then_apply);
+        if !self.secureplan_align_current(dialog) {
+            self.secureplan.dialog = None;
+            self.command_line.push_error("SecurePlan: the drawing changed. Open Align again.");
+            return iced::Task::none();
+        }
         let proposed = match dialog.proposed() {
             Ok(proposed) => proposed,
             Err(problem) => {
@@ -399,8 +449,18 @@ mod tests {
             FieldKind::Number { text } => text.clone(),
             FieldKind::Choice { .. } => unreachable!(),
         };
-        // Some choices of the user's own: rotation 90° from its dropdown, and a CAD point.
-        let _ = h.app.update(Message::SecurePlan(Msg::FormSelect(ROTATION, 1)));
+        // Some choices of the user's own: rotation 90° from its rendered
+        // dropdown, and a CAD point.
+        let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog else { panic!("no alignment dialog") };
+        let picked = crate::app::secureplan::ui::tests::pick_rendered(view(dialog), "Rotation", 1);
+        assert!(matches!(picked.as_slice(), [Message::SecurePlan(Msg::FormSelect(ROTATION, 1))]), "{picked:?}");
+        for message in picked {
+            let _ = h.app.update(message);
+        }
+        assert_eq!((form(&h).selected(ROTATION), form(&h).focus), (1, ROTATION));
+        if let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog {
+            assert!(crate::app::secureplan::ui::tests::shows_focus(view(dialog), "Rotation"));
+        }
         let _ = h.app.update(Message::SecurePlan(Msg::FormInput(CAD_X, "12.5".into())));
         let before = form(&h);
         if let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog {
@@ -449,6 +509,125 @@ mod tests {
             h.key(DialogKey::Char(c));
         }
         assert_eq!(h.app.secureplan_alignment_preview().map(|m| m.scale_mm_per_cad_unit), Some(100.0));
+    }
+
+    fn measuring(h: &crate::app::secureplan::session::tests::Harness) -> bool {
+        h.app.tabs.iter().any(|tab| tab.active_cmd.as_ref().is_some_and(|c| c.name() == MEASURE))
+    }
+
+    fn start_measuring(h: &mut crate::app::secureplan::session::tests::Harness) {
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        let _ = h.app.update(Message::SecurePlan(crate::app::secureplan::ui::Msg::Action(Action::AlignMeasure)));
+    }
+
+    fn typed_point(h: &mut crate::app::secureplan::session::tests::Harness, typed: &str) {
+        let _ = h.app.update(Message::CommandInput(typed.into()));
+        let _ = h.app.update(Message::CommandSubmit);
+    }
+
+    /// Only model coordinates are drawing units: a paper layout outside a
+    /// model viewport and the block editor are refused, with the reason in
+    /// the dialog.
+    #[test]
+    fn measure_refuses_paper_space_and_the_block_editor() {
+        use crate::app::secureplan::session::tests::Harness;
+        let mut h = Harness::new("measure_space");
+        h.open_dxf();
+        for case in ["paper", "block editor"] {
+            let index = h.app.active_tab;
+            let scene = &mut h.app.tabs[index].scene;
+            if case == "paper" {
+                scene.current_layout = "Layout1".into();
+                scene.active_viewport = None;
+            } else {
+                scene.block_edit_block = Some(scene.current_layout_block_handle_pub());
+            }
+            start_measuring(&mut h);
+            assert!(!measuring(&h), "{case}: measuring started");
+            let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog else { panic!("{case}: the dialog closed") };
+            let problem = dialog.measure_problem.clone().unwrap_or_default();
+            assert!(problem.contains(if case == "paper" { "model space" } else { "not a block" }), "{case}: {problem}");
+            assert!(iced_test::simulator(view(dialog)).find(format!("Measure in drawing: {problem}")).is_ok(), "{case}: not shown");
+            let scene = &mut h.app.tabs[index].scene;
+            scene.current_layout = "Model".into();
+            scene.block_edit_block = None;
+            h.key(DialogKey::Cancel);
+        }
+        start_measuring(&mut h);
+        assert!(measuring(&h), "model space measures");
+    }
+
+    /// Typed points follow the UCS; the length is the world one.
+    #[test]
+    fn measure_takes_world_lengths_whatever_the_ucs() {
+        use crate::app::secureplan::session::tests::Harness;
+        let mut h = Harness::new("measure_ucs");
+        h.open_dxf();
+        assert_eq!(h.app.automation_op(r#"{"op":"run","cmd":"UCS Z 30"}"#)["ok"], true);
+        let index = h.app.active_tab;
+        assert!(h.app.tabs[index].active_ucs.is_some(), "the UCS is rotated");
+        start_measuring(&mut h);
+        typed_point(&mut h, "100,200");
+        typed_point(&mut h, "130,240");
+        let Some(Dialog::Align(dialog)) = &h.app.secureplan.dialog else { panic!("no alignment dialog") };
+        assert_eq!(dialog.form.number(CAD_LENGTH), Some(50.0));
+    }
+
+    /// PUB-02: a drawing replaced or reconnected while its length is picked
+    /// takes the hidden form with it, also when another document is active;
+    /// and a stale form cannot be confirmed.
+    #[test]
+    fn a_drawing_replaced_or_reconnected_while_measuring_does_not_bring_its_form_back() {
+        use crate::app::secureplan::session::tests::{plan_update, Harness, BASE};
+        use crate::app::secureplan::session::Format;
+        use crate::app::secureplan::{overlay, testutil};
+        for change in ["planUpdate", "reconnect", "planUpdate elsewhere"] {
+            let mut h = Harness::new(&format!("measure_{}", change.len()));
+            h.open_dxf();
+            let bound_id = h.tab_id();
+            let index_of = |h: &Harness| h.app.tabs.iter().position(|tab| tab.id == bound_id).unwrap();
+            if change.ends_with("elsewhere") {
+                // Another document: a Start tab before the survey's.
+                h.app.tabs.insert(0, crate::app::document::DocumentTab::new_start());
+                h.app.active_tab = index_of(&h);
+            }
+            start_measuring(&mut h);
+            assert!(measuring(&h), "{change}");
+            if change.ends_with("elsewhere") {
+                let other = (0..h.app.tabs.len()).find(|&i| i != index_of(&h)).unwrap();
+                let _ = h.app.update(Message::TabSwitch(other));
+            }
+            if change == "reconnect" {
+                h.pair_again(9, None);
+                h.open(Some(("synthetic.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", serde_json::Value::Null, "none", "edit");
+            } else {
+                plan_update(&mut h, Some(("new.dxf", "image/vnd.dxf", testutil::synthetic_dxf())), BASE);
+            }
+            let alignment = |h: &Harness| h.app.secureplan.sessions.by_tab(bound_id).unwrap().alignment;
+            let before = alignment(&h);
+            // Answer what the page showed, and end any picking where it runs.
+            for _ in 0..3 {
+                if h.app.secureplan.dialog.is_some() && !matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))) {
+                    h.key(DialogKey::Cancel);
+                }
+            }
+            let bound = index_of(&h);
+            let _ = h.app.update(Message::TabSwitch(bound));
+            let _ = h.app.update(Message::CommandEscape);
+            assert!(!matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "{change}: the old form came back");
+            assert!(h.app.secureplan.measuring.is_none(), "{change}");
+            assert_eq!(alignment(&h), before, "{change}");
+        }
+        // Confirming a form whose drawing changed changes nothing.
+        let mut h = Harness::new("measure_confirm");
+        h.open_dxf();
+        let _ = h.app.dispatch_command("SECUREPLANALIGN");
+        let before = h.bound().alignment;
+        let tab = h.tab_id();
+        h.app.secureplan.sessions.by_tab_mut(tab).unwrap().generation += 1;
+        let _ = h.app.update(Message::SecurePlan(crate::app::secureplan::ui::Msg::Action(Action::AlignConfirm)));
+        assert!(h.app.secureplan.dialog.is_none());
+        assert_eq!(h.bound().alignment, before, "a stale form was confirmed");
     }
 
     #[test]

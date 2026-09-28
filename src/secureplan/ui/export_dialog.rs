@@ -652,6 +652,43 @@ mod tests {
         assert!(ExportDialog::new(1, key, "x2".into(), composed).version_note.is_none());
     }
 
+    /// DSK-06: the rendered dropdowns choose the format and the
+    /// acknowledgement; a fixed acknowledgement says so and cannot change.
+    #[test]
+    fn the_dropdowns_choose_the_format_and_the_acknowledgement() {
+        use crate::app::secureplan::ui::tests::{pick_rendered, shows_focus};
+        use crate::app::secureplan::ui::{Dialog, Msg};
+        let composed = |version: &str| export::Composed {
+            document: testutil::synthetic_document(),
+            composition: Default::default(),
+            format: Format::Dwg,
+            version: version.into(),
+            lost_entities: 1,
+            stem: "synthetic".into(),
+        };
+        let key = JobKey { session: 1, serial: 1 };
+        let dialog = ExportDialog::new(1, key, "x1".into(), composed("AC1032"));
+        assert!(dialog.form.fields[ACKNOWLEDGE].enabled, "a lost object needs the acknowledgement");
+        let mut app = crate::app::OpenCADStudio::new_for_test();
+        let format = pick_rendered(view(&dialog), "Format and version", 1);
+        let acknowledge = pick_rendered(view(&dialog), "Export without the objects listed", 1);
+        app.secureplan.dialog = Some(Dialog::Export(Box::new(dialog)));
+        for (messages, field) in [(format, FORMAT), (acknowledge, ACKNOWLEDGE)] {
+            let [Message::SecurePlan(chosen @ Msg::FormSelect(index, 1))] = messages.as_slice() else { panic!("{messages:?}") };
+            assert_eq!(*index, field);
+            let _ = app.update(Message::SecurePlan(chosen.clone()));
+            let Some(Dialog::Export(dialog)) = &app.secureplan.dialog else { panic!("the dialog closed") };
+            assert_eq!((dialog.form.selected(field), dialog.form.focus), (1, field));
+            assert!(shows_focus(view(dialog), dialog.form.fields[field].label));
+        }
+        let Some(Dialog::Export(dialog)) = &app.secureplan.dialog else { panic!("the dialog closed") };
+        assert_eq!(dialog.choice(), export::choice(1));
+        // Nothing lost: the acknowledgement is fixed.
+        let dialog = ExportDialog::new(1, key, "x2".into(), export::Composed { lost_entities: 0, ..composed("AC1032") });
+        assert!(!dialog.form.fields[ACKNOWLEDGE].enabled);
+        assert!(pick_rendered(view(&dialog), "Export without the objects listed", 1).is_empty(), "a fixed choice changed");
+    }
+
     #[test]
     fn a_format_that_cannot_hold_the_drawing_needs_the_acknowledgement() {
         let mut h = exporting("export_format_loss", "edit");

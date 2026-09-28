@@ -192,6 +192,10 @@ fn secureplan_a_second_launch_shows_the_running_window_and_exits() {
             .spawn()
             .expect("run the SecurePlan CAD binary")
     };
+    // The running copy holds the window's lock and serves the hand-off.
+    let handoff::Claim::Primary(Some(lock)) = handoff::claim(&dir.join(CONFIG_DIR_NAME), &[], std::time::Duration::ZERO) else {
+        panic!("no primary lock")
+    };
     let (sender, receiver) = std::sync::mpsc::channel();
     let sender = std::sync::Mutex::new(sender);
     handoff::serve(&descriptor, move |request| {
@@ -202,7 +206,9 @@ fn secureplan_a_second_launch_shows_the_running_window_and_exits() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), handoff::Request::Focus);
 
-    // A crash left a descriptor behind whose port nobody serves.
+    // A crash left a descriptor behind whose port nobody serves, and the
+    // lock free.
+    drop(lock);
     let port = free_port();
     std::fs::write(&descriptor, format!("{{\"protocol\":1,\"port\":{port},\"secret\":\"{}\",\"pid\":1}}\n", "00".repeat(32))).unwrap();
     let primary = launch();

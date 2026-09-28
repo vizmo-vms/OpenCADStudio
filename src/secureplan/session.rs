@@ -2519,7 +2519,7 @@ pub(crate) mod tests {
 
     const SURVEY: &str = "7d3c1f6e-2b4a-4c8d-9e0f-1a2b3c4d5e6f";
 
-    fn plan_update(h: &mut Harness, drawing: Option<(&str, &str, Vec<u8>)>, base: &str) {
+    pub(crate) fn plan_update(h: &mut Harness, drawing: Option<(&str, &str, Vec<u8>)>, base: &str) {
         let mut update = sample("planUpdate-applied");
         update["drawingTransferId"] = match drawing {
             Some((name, media, bytes)) => json!(h.transfer(name, media, &bytes)),

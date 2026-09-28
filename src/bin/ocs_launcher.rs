@@ -87,8 +87,8 @@ fn deliver_or_launch(files: &[String]) {
 
 /// SecurePlan CAD: hand `secureplan-cad:` launch URLs to the running editor
 /// over the per-user channel, never as a process argument (DSK-04). With no
-/// editor running, start one without arguments and hand the URLs over once it
-/// is listening.
+/// editor running, start one that waits windowless for them (BRG-02) and
+/// hand the URLs over once it is listening.
 #[cfg(all(target_os = "macos", feature = "secureplan"))]
 fn deliver_launches(urls: Vec<String>) {
     use OpenCADStudio::app::secureplan::handoff;
@@ -99,7 +99,7 @@ fn deliver_launches(urls: Vec<String>) {
         if pending.is_empty() {
             return;
         }
-        deliver_or_launch(&[]);
+        deliver_or_launch(&[handoff::AWAITING_LAUNCH_ARG.to_string()]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !pending.is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(200));

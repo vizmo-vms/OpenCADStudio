@@ -14,11 +14,19 @@
 //!
 //! On Windows the operating system passes the first launch's URL as a process
 //! argument; that instance uses it once and never forwards it.
+//!
+//! One window: the primary holds an exclusive per-user lock on
+//! `primary.lock` for its lifetime (the operating system releases it when the
+//! process ends, however it ends). A launch that cannot take the lock never
+//! becomes a second primary: it keeps handing its request over until the
+//! owner answers, and gives up without a window after [`CLAIM_WAIT`].
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
@@ -53,11 +61,65 @@ pub fn forward_launches(urls: &[String]) -> bool {
     !urls.is_empty() && urls.iter().all(|url| send_launch(&path, url).is_ok())
 }
 
-/// A launch without a URL: ask the running instance to show its window.
-/// `false` when none answers (none runs, or `handoff.json` is stale), so
-/// this launch starts as the primary.
-pub fn forward_focus() -> bool {
-    descriptor_path().is_some_and(|path| send(&path, &Request::Focus).is_ok())
+/// The flag the macOS launcher starts the GUI with while a launch URL is on
+/// its way over the hand-off: start without the editor window, as a link
+/// start does (BRG-02). It carries no pairing data.
+pub const AWAITING_LAUNCH_ARG: &str = "--secureplan-awaiting-launch";
+
+/// How long a launch keeps trying to reach the instance that owns the window.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(10);
+const CLAIM_RETRY: Duration = Duration::from_millis(50);
+
+/// What a launch turned out to be.
+#[derive(Debug)]
+pub enum Claim {
+    /// This process owns the window; the lock is held until it exits (none
+    /// when the lock file cannot be opened at all).
+    Primary(Option<std::fs::File>),
+    /// The running instance took every request (or there were none to send).
+    Forwarded,
+    /// Another instance owns the window but did not answer in time.
+    Unanswered,
+}
+
+/// Become the primary, or hand `requests` to the instance that is.
+pub fn claim_window(requests: &[Request]) -> Claim {
+    match crate::config::config_dir() {
+        Some(dir) => claim(&dir, requests, CLAIM_WAIT),
+        None => Claim::Primary(None),
+    }
+}
+
+/// [`claim_window`] in `dir` (tests use their own).
+pub fn claim(dir: &Path, requests: &[Request], wait: Duration) -> Claim {
+    let descriptor = dir.join("handoff.json");
+    let lock = std::fs::create_dir_all(dir).and_then(|_| {
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("primary.lock"))
+    });
+    let deadline = Instant::now() + wait;
+    let mut pending: Vec<&Request> = requests.iter().collect();
+    loop {
+        match &lock {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => return Claim::Primary(lock.ok()),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(_)) => return Claim::Primary(None),
+            },
+            // No lock to take: the hand-off alone decides, as before.
+            Err(_) => {
+                pending.retain(|request| send(&descriptor, request).is_err());
+                return if pending.is_empty() && !requests.is_empty() { Claim::Forwarded } else { Claim::Primary(None) };
+            }
+        }
+        pending.retain(|request| send(&descriptor, request).is_err());
+        if pending.is_empty() {
+            return Claim::Forwarded;
+        }
+        if Instant::now() >= deadline {
+            return Claim::Unanswered;
+        }
+        std::thread::sleep(CLAIM_RETRY);
+    }
 }
 
 /// What another launch asks of the running instance.
@@ -68,17 +130,34 @@ pub enum Request {
     Focus,
 }
 
-/// Called by the instance that shows the editor: serve later hand-offs, then
-/// deliver this process's own launch URLs once.
-pub fn start_primary(urls: Vec<String>) {
+/// The primary's lock and descriptor, held until the process exits.
+static PRIMARY: Mutex<Option<(Option<std::fs::File>, PathBuf)>> = Mutex::new(None);
+/// Set once the primary is shutting down: no more hand-offs are taken.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Called by the instance that shows the editor, holding `lock` from
+/// [`claim_window`]: serve later hand-offs, then deliver this process's own
+/// launch URLs once.
+pub fn start_primary(lock: Option<std::fs::File>, urls: Vec<String>) {
     if let Some(path) = descriptor_path() {
         let _ = serve(&path, |request| match request {
             Request::Launch(url) => super::deliver_launch(url),
             Request::Focus => super::deliver_focus(),
         });
+        *PRIMARY.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock, path));
     }
     for url in urls {
         super::deliver_launch(url);
+    }
+}
+
+/// The primary is exiting: take no more hand-offs and withdraw the
+/// descriptor, so a new launch waits for the lock and then starts afresh.
+pub fn stop_serving() {
+    let primary = PRIMARY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, path)) = primary.as_ref() {
+        STOPPING.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -162,6 +241,9 @@ pub fn serve(path: &Path, deliver: impl Fn(Request) + Send + Sync + 'static) -> 
     let deliver = std::sync::Arc::new(deliver);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            if STOPPING.load(Ordering::SeqCst) {
+                continue;
+            }
             let deliver = std::sync::Arc::clone(&deliver);
             std::thread::spawn(move || {
                 if let Some(request) = accept_one(stream, &secret) {
@@ -373,6 +455,99 @@ mod tests {
         drop(closed);
         assert_eq!(send(&stale, &Request::Focus), Err(HandoffError::NoRunningInstance));
         std::fs::remove_dir_all(stale.parent().unwrap()).ok();
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("secureplan_claim_{tag}_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    /// A primary as `main` runs one: it serves once it holds the lock, after
+    /// `delay` (its start-up), and keeps the lock until `stop` is set.
+    fn primary(dir: PathBuf, delay: Duration, stop: std::sync::Arc<AtomicBool>, seen: mpsc::Sender<Request>) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            let Claim::Primary(lock) = claim(&dir, &[], Duration::ZERO) else { return false };
+            std::thread::sleep(delay);
+            let seen = std::sync::Mutex::new(seen);
+            serve(&dir.join("handoff.json"), move |request| {
+                let _ = seen.lock().unwrap().send(request);
+            })
+            .unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(lock);
+            true
+        })
+    }
+
+    /// DSK-04, one window: launches at the same moment make one primary; the
+    /// others hand over to it.
+    #[test]
+    fn simultaneous_launches_make_one_primary() {
+        let dir = temp_dir("simultaneous");
+        let (sender, receiver) = mpsc::channel();
+        let launches: Vec<_> = (0..6)
+            .map(|_| {
+                let (dir, sender) = (dir.clone(), sender.clone());
+                std::thread::spawn(move || match claim(&dir, &[Request::Focus], Duration::from_secs(10)) {
+                    Claim::Primary(lock) => {
+                        let sender = std::sync::Mutex::new(sender);
+                        serve(&dir.join("handoff.json"), move |request| {
+                            let _ = sender.lock().unwrap().send(request);
+                        })
+                        .unwrap();
+                        Some(lock)
+                    }
+                    Claim::Forwarded => None,
+                    Claim::Unanswered => panic!("the primary never answered"),
+                })
+            })
+            .collect();
+        let locks: Vec<_> = launches.into_iter().map(|launch| launch.join().unwrap()).collect();
+        assert_eq!(locks.iter().filter(|lock| lock.is_some()).count(), 1, "one primary");
+        for _ in 0..5 {
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Focus);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A launch while the primary is still starting (its descriptor not yet
+    /// written, a crash's stale one in its place) waits for it; a launch
+    /// after the primary ended starts afresh; a primary that never answers
+    /// is not joined by a second window.
+    #[test]
+    fn a_launch_waits_for_a_starting_primary_and_takes_over_an_ended_one() {
+        let dir = temp_dir("delayed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        write_descriptor(&dir.join("handoff.json"), closed.local_addr().unwrap().port(), &[9u8; 32]).unwrap();
+        drop(closed);
+        let (sender, receiver) = mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let first = primary(dir.clone(), Duration::from_millis(400), stop.clone(), sender.clone());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(claim(&dir, &[Request::Launch(URL.into())], Duration::from_secs(10)), Claim::Forwarded));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()));
+        // The macOS launcher's awaiting start has nothing to send: it leaves.
+        assert!(matches!(claim(&dir, &[], Duration::from_secs(10)), Claim::Forwarded));
+        stop.store(true, Ordering::SeqCst);
+        assert!(first.join().unwrap());
+        // The primary is gone, its listener with it (its descriptor stale):
+        // the next launch is the primary.
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        write_descriptor(&dir.join("handoff.json"), closed.local_addr().unwrap().port(), &[9u8; 32]).unwrap();
+        drop(closed);
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_secs(10)), Claim::Primary(Some(_))));
+        // A primary that holds the window but never answers.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let silent = primary(dir.clone(), Duration::from_secs(3600), stop.clone(), sender);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_millis(300)), Claim::Unanswered));
+        stop.store(true, Ordering::SeqCst);
+        drop(silent);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
