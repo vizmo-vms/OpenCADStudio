@@ -100,74 +100,7 @@ impl OpenCADStudio {
             self.resume_transparent_parent(i);
             return task;
         }
-        // A new command abandons any grip edit and its numeric input.
-        let had_pending_grip_input = self.grip_pending.take().is_some();
-        let had_active_grip = self.cancel_active_grip_edit();
-        if had_pending_grip_input || had_active_grip {
-            self.command_line.input.clear();
-        }
-        // Starting a command closes any open ribbon dropdown (e.g. a style
-        // combo left open) so it does not stay stuck behind the new tool.
-        self.ribbon.close_dropdown();
-        // Selection keywords last only for the round that asked for them: a
-        // Remove or a fixed Window sense must not quietly still be in force
-        // when the next command asks for objects. (#596)
-        self.select_remove_mode = false;
-        {
-            let mut selection = self.tabs[i].scene.selection.borrow_mut();
-            // Cancel the active selection gesture before the new command starts.
-            selection.left_down = false;
-            selection.left_press_pos = None;
-            selection.left_press_time = None;
-            selection.left_dragging = false;
-            selection.box_anchor = None;
-            selection.box_anchor_world = None;
-            selection.box_current = None;
-            selection.box_crossing = false;
-            selection.box_crossing_locked = false;
-            selection.poly_active = false;
-            selection.poly_points.clear();
-            selection.poly_crossing = false;
-        }
-        // Cancel any running command before starting a new one.
-        if self.tabs[i].active_cmd.is_some() {
-            self.tabs[i].scene.clear_preview_wire();
-            self.tabs[i].active_cmd = None;
-            // Interrupting an ADDSELECTED draw with another command reverts its
-            // template-property override too (#239).
-            self.restore_add_selected_defaults();
-        }
-        // A command parked behind a transparent zoom / MTP goes with it.
-        self.tabs[i].suspended_cmd = None;
-        self.tabs[i].transparent_resume = false;
-        // Starting any command leaves interactive navigation modes (their own
-        // command arms below re-enable the selected one).
-        self.tabs[i].pan_mode = false;
-        self.tabs[i].orbit_mode = false;
-        self.tabs[i].zoom_dynamic_mode = false;
-        // Reset the last committed point so the first click of the new command
-        // is not constrained by ortho/polar relative to a previous command's endpoint.
-        self.last_point = None;
-        // A new command collects its own points, so the previous command's
-        // accepted snaps must not leak into it.
-        self.clear_accepted_snaps();
-        // Starting a command restarts the right-click cycle, so its first
-        // right-click acts as Enter rather than opening the context menu.
-        self.tabs[i]
-            .scene
-            .selection
-            .borrow_mut()
-            .right_click_entered = false;
-        // A fresh command starts at the polar/cartesian default — clear
-        // any `,`-driven reshape and locked dynamic-input values from a
-        // previous command. Otherwise a bare Enter on the first point prompt
-        // can commit that stale coordinate instead of accepting the command's
-        // default (LIMITS then compares an unintended lower-left point with
-        // the displayed default upper-right).
-        self.dyn_user_reshaped = false;
-        self.dyn_coord_absolute = false;
-        self.tabs[i].dyn_fields.clear();
-        self.tabs[i].dyn_active = 0;
+        self.reset_command_start_state(i);
 
         if let Some(path_str) = cmd.strip_prefix("OPEN_RECENT:") {
             let path = PathBuf::from(path_str);
@@ -236,6 +169,80 @@ impl OpenCADStudio {
         self.command_line
             .push_error(crate::tf!("Unknown command: {cmd}").as_ref());
         self.finish_dispatch(cmd)
+    }
+
+    /// The interaction state every new command starts from in tab `i`: any
+    /// running command and grip edit cancelled, no gesture in progress, and no
+    /// previous point, accepted snap or dynamic-input value carried over.
+    pub(crate) fn reset_command_start_state(&mut self, i: usize) {
+        // A new command abandons any grip edit and its numeric input.
+        let had_pending_grip_input = self.grip_pending.take().is_some();
+        let had_active_grip = self.cancel_active_grip_edit();
+        if had_pending_grip_input || had_active_grip {
+            self.command_line.input.clear();
+        }
+        // Starting a command closes any open ribbon dropdown (e.g. a style
+        // combo left open) so it does not stay stuck behind the new tool.
+        self.ribbon.close_dropdown();
+        // Selection keywords last only for the round that asked for them: a
+        // Remove or a fixed Window sense must not quietly still be in force
+        // when the next command asks for objects. (#596)
+        self.select_remove_mode = false;
+        {
+            let mut selection = self.tabs[i].scene.selection.borrow_mut();
+            // Cancel the active selection gesture before the new command starts.
+            selection.left_down = false;
+            selection.left_press_pos = None;
+            selection.left_press_time = None;
+            selection.left_dragging = false;
+            selection.box_anchor = None;
+            selection.box_anchor_world = None;
+            selection.box_current = None;
+            selection.box_crossing = false;
+            selection.box_crossing_locked = false;
+            selection.poly_active = false;
+            selection.poly_points.clear();
+            selection.poly_crossing = false;
+        }
+        // Cancel any running command before starting a new one.
+        if self.tabs[i].active_cmd.is_some() {
+            self.tabs[i].scene.clear_preview_wire();
+            self.tabs[i].active_cmd = None;
+            // Interrupting an ADDSELECTED draw with another command reverts its
+            // template-property override too (#239).
+            self.restore_add_selected_defaults();
+        }
+        // A command parked behind a transparent zoom / MTP goes with it.
+        self.tabs[i].suspended_cmd = None;
+        self.tabs[i].transparent_resume = false;
+        // Starting any command leaves interactive navigation modes (their own
+        // command arms below re-enable the selected one).
+        self.tabs[i].pan_mode = false;
+        self.tabs[i].orbit_mode = false;
+        self.tabs[i].zoom_dynamic_mode = false;
+        // Reset the last committed point so the first click of the new command
+        // is not constrained by ortho/polar relative to a previous command's endpoint.
+        self.last_point = None;
+        // A new command collects its own points, so the previous command's
+        // accepted snaps must not leak into it.
+        self.clear_accepted_snaps();
+        // Starting a command restarts the right-click cycle, so its first
+        // right-click acts as Enter rather than opening the context menu.
+        self.tabs[i]
+            .scene
+            .selection
+            .borrow_mut()
+            .right_click_entered = false;
+        // A fresh command starts at the polar/cartesian default — clear
+        // any `,`-driven reshape and locked dynamic-input values from a
+        // previous command. Otherwise a bare Enter on the first point prompt
+        // can commit that stale coordinate instead of accepting the command's
+        // default (LIMITS then compares an unintended lower-left point with
+        // the displayed default upper-right).
+        self.dyn_user_reshaped = false;
+        self.dyn_coord_absolute = false;
+        self.tabs[i].dyn_fields.clear();
+        self.tabs[i].dyn_active = 0;
     }
 
     /// Try each command family in source order, returning the first that

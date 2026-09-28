@@ -2,7 +2,9 @@
 //! text labels and non-colour status cues (DSK-06).
 //!
 //! Keyboard, in every dialog: Tab and Shift+Tab (or the Up and Down arrows)
-//! move focus; Left and Right change a choice; typing edits a number field and
+//! move focus; Left and Right change a choice (the pinned iced `pick_list`
+//! opens only with the mouse, so its list is not reachable from the
+//! keyboard); typing edits a number field and
 //! Backspace deletes; Enter activates the focused button (in a field it
 //! activates the first button); Space activates a button or changes a choice;
 //! Escape cancels. The focused control has a thick outline and a "›" marker,
@@ -16,7 +18,7 @@ pub mod import_dialog;
 pub mod trust_dialog;
 pub mod update_dialog;
 
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Background, Border, Element, Length, Theme, Vector};
 
 use crate::app::secureplan::bridge::SessionId;
@@ -46,6 +48,8 @@ pub enum Action {
     /// Answer a re-pair to an open document (BRG-05).
     Repair(SessionId, bool),
     AlignConfirm,
+    /// The alignment dialog's **Measure in drawing** (PUB-02).
+    AlignMeasure,
     ApplyConfirm,
     ApplyReset,
     /// Convert tab `.0`'s selection (CNV-01).
@@ -160,6 +164,15 @@ impl Form {
     pub fn set_text(&mut self, index: usize, value: String) {
         if let Some(Field { kind: FieldKind::Number { text }, enabled: true, .. }) = self.fields.get_mut(index) {
             *text = value.chars().filter(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+')).take(32).collect();
+        }
+    }
+
+    /// Choose option `option` of choice field `index` (its dropdown).
+    pub fn select(&mut self, index: usize, option: usize) {
+        if let Some(Field { kind: FieldKind::Choice { options, selected }, enabled: true, .. }) = self.fields.get_mut(index) {
+            if option < options.len() {
+                *selected = option;
+            }
         }
     }
 
@@ -318,18 +331,36 @@ pub fn dialog_button(label: &str, focused: bool, message: Message) -> Element<'s
         .into()
 }
 
+/// One option of a choice field's dropdown.
+#[derive(Debug, Clone, PartialEq)]
+struct ChoiceOption<'a> {
+    index: usize,
+    label: &'a str,
+}
+
+impl std::fmt::Display for ChoiceOption<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
 fn field_view<'a>(index: usize, field: &'a Field, focused: bool) -> Element<'a, Message> {
     let marker = if focused { "›" } else { " " };
     let label = text(format!("{marker} {}", field.label)).size(13).width(Length::Fixed(200.0));
     let control: Element<'a, Message> = match &field.kind {
+        // A dropdown styled as upstream's (src/ui/style/form.rs); a fixed
+        // choice reads "(fixed)" rather than relying on a disabled look.
+        FieldKind::Choice { options, selected } if field.enabled => {
+            let choices: Vec<ChoiceOption<'a>> = options.iter().enumerate().map(|(index, label)| ChoiceOption { index, label }).collect();
+            let current = choices.get(*selected).cloned();
+            pick_list(current, choices, ToString::to_string)
+                .on_select(move |choice: ChoiceOption<'a>| Message::SecurePlan(Msg::FormSelect(index, choice.index)))
+                .text_size(13)
+                .padding([3, 6])
+                .into()
+        }
         FieldKind::Choice { options, selected } => {
-            let value = options.get(*selected).cloned().unwrap_or_default();
-            let shown = if field.enabled { format!("‹ {value} ›") } else { format!("{value} (fixed)") };
-            let mut choice = button(text(shown).size(13)).padding([4, 10]);
-            if field.enabled {
-                choice = choice.on_press(Message::SecurePlan(Msg::FormCycle(index)));
-            }
-            choice.into()
+            text(format!("{} (fixed)", options.get(*selected).map_or("", String::as_str))).size(13).into()
         }
         FieldKind::Number { text: value } => {
             let mut input = text_input("", value).size(13).width(Length::Fixed(160.0));
@@ -403,7 +434,7 @@ pub fn keys_hint() -> Element<'static, Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn form() -> Form {
@@ -438,6 +469,64 @@ mod tests {
         form.key(DialogKey::Previous);
         assert_eq!(form.focus, 4);
         assert_eq!(form.key(DialogKey::Cancel), Some(Action::Dismiss));
+    }
+
+    /// The label a field shows, focused or not.
+    fn label_bounds(ui: &mut iced_test::Simulator<'_, Message>, label: &str) -> Option<iced::Rectangle> {
+        [format!("› {label}"), format!("  {label}")].into_iter().find_map(|text| ui.find(text).ok()).and_then(|target| target.visible_bounds())
+    }
+
+    /// Open the dropdown of the field labelled `label` in `element` and click
+    /// its option `option`, as a user does: the messages it sends.
+    pub(crate) fn pick_rendered(element: Element<'_, Message>, label: &str, option: usize) -> Vec<Message> {
+        let mut ui = iced_test::simulator(element);
+        let bounds = label_bounds(&mut ui, label).unwrap_or_else(|| panic!("no field {label}"));
+        // The dropdown sits right of the fixed-width label; its rows are one
+        // text line plus padding tall, listed below it.
+        let row = 13.0 * 1.3 + 6.0;
+        let x = bounds.x + bounds.width + 8.0 + 20.0;
+        let y = bounds.center_y();
+        ui.point_at(iced::Point::new(x, y));
+        let _ = ui.simulate(iced_test::simulator::click());
+        // The open list picks the option the pointer moved over.
+        let over = iced::Point::new(x, y + row / 2.0 + (option as f32 + 0.5) * row);
+        ui.point_at(over);
+        let _ = ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: over })]);
+        let _ = ui.simulate(iced_test::simulator::click());
+        ui.into_messages().collect()
+    }
+
+    /// Whether the field labelled `label` shows the focus marker.
+    pub(crate) fn shows_focus(element: Element<'_, Message>, label: &str) -> bool {
+        iced_test::simulator(element).find(format!("› {label}")).is_ok()
+    }
+
+    #[test]
+    fn a_dropdown_choice_sets_the_field_and_the_arrows_still_change_it() {
+        let mut form = form();
+        form.select(0, 1);
+        assert_eq!(form.selected(0), 1, "the dropdown's choice");
+        form.select(0, 7);
+        assert_eq!(form.selected(0), 1, "no such option");
+        form.key(DialogKey::Left);
+        assert_eq!(form.selected(0), 0, "Left still changes the focused choice");
+        form.key(DialogKey::Space);
+        assert_eq!(form.selected(0), 1, "and Space");
+        form.fields[0].enabled = false;
+        form.select(0, 0);
+        assert_eq!(form.selected(0), 1, "a fixed choice stays");
+        // Rendered: the dropdown sends the choice it was clicked to; a fixed
+        // choice is text that says so and sends nothing.
+        let mut form = self::form();
+        form.focus = 2;
+        let messages = pick_rendered(form_view(&form), "Units", 1);
+        assert!(matches!(messages.as_slice(), [Message::SecurePlan(Msg::FormSelect(0, 1))]), "{messages:?}");
+        form.select(0, 1);
+        form.focus = 0;
+        assert!(shows_focus(form_view(&form), "Units"), "focus shows as the marker");
+        form.fields[0].enabled = false;
+        assert!(iced_test::simulator(form_view(&form)).find("m (fixed)").is_ok());
+        assert!(pick_rendered(form_view(&form), "Units", 0).is_empty(), "a fixed choice changed");
     }
 
     #[test]

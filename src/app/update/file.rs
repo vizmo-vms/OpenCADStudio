@@ -3159,6 +3159,8 @@ impl OpenCADStudio {
         {
             self.secureplan_keep_all_recovery();
             self.secureplan_update_on_exit();
+            // Later launches wait for this process to end, then start afresh.
+            crate::app::secureplan::handoff::stop_serving();
         }
         self.cleanup_autosaves();
         iced::exit()

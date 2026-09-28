@@ -77,6 +77,12 @@ pub struct Cli {
     #[arg(help = crate::t!("Start a new editor process.").into_owned(), long_help = None)]
     pub new_instance: bool,
 
+    /// SecurePlan CAD's macOS launcher: a launch link follows over the
+    /// authenticated hand-off, so start without the editor window.
+    #[cfg(feature = "secureplan")]
+    #[arg(long = "secureplan-awaiting-launch", hide = true)]
+    pub secureplan_awaiting_launch: bool,
+
     /// Open read-only: editing is allowed but saving is disabled.
     #[arg(long)]
     #[arg(help = crate::t!("Open read-only: saving is disabled.").into_owned(), long_help = None)]

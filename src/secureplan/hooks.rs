@@ -74,6 +74,11 @@ use crate::app::{Message, OpenCADStudio};
 pub enum Msg {
     /// A `secureplan-cad:` launch URL, from the OS hand-off or the test driver.
     Launch(Redacted<String>),
+    /// Another launch without a URL: show the window (one window only).
+    Focus,
+    /// A launch URL (`Some`) or a request for the window (`None`) handed over
+    /// by another launch; it is acted on only if taken with its receipt.
+    HandedOff(Option<Redacted<String>>, Receipt),
     Bridge(BridgeEvent),
     TrustAnswer(bool),
     DialogKey(DialogKey),
@@ -101,7 +106,8 @@ pub enum Msg {
     ImportPicked(u64, u64, Option<Redacted<PathBuf>>),
     /// Mouse input in a dialog field.
     FormInput(usize, String),
-    FormCycle(usize),
+    /// A dialog dropdown's choice (field, option).
+    FormSelect(usize, usize),
     /// A dialog button.
     Action(Action),
     /// Time for the automatic update check (startup, then daily; DSK-07).
@@ -132,10 +138,15 @@ pub struct State {
     pub cold_start: bool,
     /// The window showing only the trust prompt while there is no editor window.
     pub prompt_window: Option<iced::window::Id>,
+    /// Whether a pairing was handed to the bridge, so a windowless start has
+    /// a session to wait for.
+    pub pairing_started: bool,
     /// Bound documents and their sessions (DSK-03, BRG-05).
     pub sessions: super::session::Sessions,
     /// The SecurePlan dialog showing, if any (below the trust prompt).
     pub dialog: Option<Dialog>,
+    /// The alignment dialog, hidden while a length is measured in the drawing.
+    pub measuring: Option<super::ui::align_dialog::Measuring>,
     pub recovery: super::recovery::Store,
     /// Whether the read-only design overlay is drawn (OVL-01).
     pub overlay_visible: bool,
@@ -193,8 +204,10 @@ impl Default for State {
             bridge: None,
             cold_start: COLD_START.load(Ordering::SeqCst),
             prompt_window: None,
+            pairing_started: false,
             sessions: Default::default(),
             dialog: None,
+            measuring: None,
             recovery: Default::default(),
             overlay_visible: true,
             next_job: 0,
@@ -331,8 +344,8 @@ fn after(wait: Duration, message: Message) -> Task<Message> {
 // ── Launch inbox ────────────────────────────────────────────────────────────
 
 struct Inbox {
-    sender: Mutex<mpsc::Sender<String>>,
-    receiver: Mutex<Option<mpsc::Receiver<String>>>,
+    sender: Mutex<mpsc::Sender<Msg>>,
+    receiver: Mutex<Option<mpsc::Receiver<Msg>>>,
 }
 
 fn inbox() -> &'static Inbox {
@@ -343,9 +356,61 @@ fn inbox() -> &'static Inbox {
     })
 }
 
+/// For `main`, when the macOS launcher started this process while a link is
+/// on its way: boot without the editor window, as a link start does.
+pub fn begin_awaiting_launch() {
+    COLD_START.store(true, Ordering::SeqCst);
+}
+
 /// Hand a launch URL to the running application (OS hand-off, test driver).
 pub fn deliver_launch(url: String) {
-    let _ = inbox().sender.lock().unwrap_or_else(|e| e.into_inner()).send(url);
+    let _ = inbox().sender.lock().unwrap_or_else(|e| e.into_inner()).send(Msg::Launch(url.into()));
+}
+
+/// The answer to a handed-over request: sent once the application has
+/// taken it, unless the hand-off gave up first.
+#[derive(Clone)]
+pub struct Receipt(Arc<Mutex<Option<mpsc::Sender<()>>>>);
+
+impl std::fmt::Debug for Receipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Receipt")
+    }
+}
+
+impl Receipt {
+    pub fn new(sender: mpsc::Sender<()>) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+
+    /// The application takes the request: `false` when the hand-off has
+    /// given up on it already.
+    fn take(&self) -> bool {
+        match self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(sender) => sender.send(()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// The hand-off gives up: `true` if the application took it meanwhile.
+    fn withdraw(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take().is_none()
+    }
+}
+
+/// A request another launch handed over (the hand-off listener): whether the
+/// application took it within [`handoff::TAKE_WAIT`](super::handoff::TAKE_WAIT).
+pub fn hand_off(request: super::handoff::Request) -> bool {
+    let (sender, receiver) = mpsc::channel();
+    let receipt = Receipt::new(sender);
+    let url = match request {
+        super::handoff::Request::Launch(url) => Some(url.into()),
+        super::handoff::Request::Focus => None,
+    };
+    if inbox().sender.lock().unwrap_or_else(|e| e.into_inner()).send(Msg::HandedOff(url, receipt.clone())).is_err() {
+        return false;
+    }
+    receiver.recv_timeout(super::handoff::TAKE_WAIT).is_ok() || receipt.withdraw()
 }
 
 /// Forward a blocking std receiver into an iced subscription stream.
@@ -382,7 +447,7 @@ fn driver_commands() -> impl iced::futures::Stream<Item = Message> {
 
 fn launches() -> impl iced::futures::Stream<Item = Message> {
     let receiver = inbox().receiver.lock().unwrap_or_else(|e| e.into_inner()).take();
-    forward(receiver, |url| Message::SecurePlan(Msg::Launch(url.into())))
+    forward(receiver, Message::SecurePlan)
 }
 
 fn dialog_key(event: iced::Event, status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
@@ -401,6 +466,12 @@ impl OpenCADStudio {
     pub(crate) fn secureplan_update(&mut self, msg: Msg) -> Task<Message> {
         match msg {
             Msg::Launch(url) => self.secureplan_launch(url.expose()),
+            Msg::Focus => self.secureplan_focus(),
+            // Exiting, this process takes nothing more: the other launch
+            // retries and starts afresh once this one has ended.
+            Msg::HandedOff(_, receipt) if super::handoff::stopping() || !receipt.take() => Task::none(),
+            Msg::HandedOff(Some(url), _) => self.secureplan_launch(url.expose()),
+            Msg::HandedOff(None, _) => self.secureplan_focus(),
             Msg::TrustAnswer(accept) => self.secureplan_answer_trust(accept),
             Msg::DialogKey(key) if self.secureplan.trust.prompt().is_some() => match key {
                 DialogKey::Next | DialogKey::Previous | DialogKey::Left | DialogKey::Right => {
@@ -429,9 +500,9 @@ impl OpenCADStudio {
                 }
                 Task::none()
             }
-            Msg::FormCycle(index) => {
+            Msg::FormSelect(index, option) => {
                 if let Some(dialog) = self.secureplan.dialog.as_mut() {
-                    dialog.form_mut().cycle(index, true);
+                    dialog.form_mut().select(index, option);
                     dialog.form_mut().focus = index;
                 }
                 self.secureplan_refresh_dialog();
@@ -500,6 +571,30 @@ impl OpenCADStudio {
             // Nothing opened in time: leave without ever showing the editor.
             Msg::ColdStartExpired if self.main_window.is_none() => self.exit_app(),
             Msg::ColdStartExpired => Task::none(),
+        }
+    }
+
+    /// A link start (or the macOS launcher's awaiting start) leaves if no
+    /// session opens in time, even when no link ever arrives.
+    pub(crate) fn secureplan_cold_start_expiry(&self) -> Task<Message> {
+        after(COLD_START_WAIT, Message::SecurePlan(Msg::ColdStartExpired))
+    }
+
+    /// Bring the editor window to the front for another launch: restored if
+    /// minimised, then focused. Waiting for a session with no window yet,
+    /// the launch opens the editor as a first launch would.
+    fn secureplan_focus(&mut self) -> Task<Message> {
+        if self.main_window.is_none() && self.secureplan_windowless() {
+            return Task::batch([self.open_main_window(), self.focus_cmd_input()]);
+        }
+        self.secureplan_raise_window()
+    }
+
+    /// Restore the editor window if minimised, then focus it.
+    fn secureplan_raise_window(&self) -> Task<Message> {
+        match self.main_window {
+            Some(id) => iced::window::minimize(id, false).chain(iced::window::gain_focus(id)),
+            None => Task::none(),
         }
     }
 
@@ -604,7 +699,7 @@ impl OpenCADStudio {
         let windowless = self.secureplan_windowless();
         let Ok(request) = pairing::parse_launch_url(url) else {
             self.command_line.push_warning("SecurePlan: ignored an invalid SecurePlan CAD link.");
-            return Task::none();
+            return self.secureplan_leave_if_nothing_waits();
         };
         let received = Instant::now();
         let decision = self.secureplan.trust.on_launch(request, &self.secureplan.settings, received);
@@ -623,9 +718,20 @@ impl OpenCADStudio {
                 Task::none()
             }
             Decision::Prompt => self.secureplan_open_prompt_window(),
-            Decision::Ignore => Task::none(),
+            // A link no website may use (BRG-02), or one that must wait.
+            Decision::Ignore => return self.secureplan_leave_if_nothing_waits(),
         };
         Task::batch([shown, after(COLD_START_WAIT, Message::SecurePlan(Msg::ColdStartExpired))])
+    }
+
+    /// A windowless start that has nothing to wait for (no trust prompt and
+    /// no pairing started) leaves at once, as a link start that no website
+    /// may use does (BRG-02).
+    fn secureplan_leave_if_nothing_waits(&mut self) -> Task<Message> {
+        if self.secureplan_windowless() && self.secureplan.trust.prompt().is_none() && !self.secureplan.pairing_started {
+            return self.exit_app();
+        }
+        Task::none()
     }
 
     fn secureplan_answer_trust(&mut self, accept: bool) -> Task<Message> {
@@ -658,6 +764,7 @@ impl OpenCADStudio {
             Some(bridge) => {
                 self.secureplan_sync_trust();
                 bridge.add_pending_received(request, received);
+                self.secureplan.pairing_started = true;
             }
             None => self.command_line.push_error(
                 "SecurePlan CAD could not listen on 127.0.0.1:47815–47819. Close other copies of SecurePlan CAD and try again.",
@@ -681,10 +788,13 @@ impl OpenCADStudio {
                     ));
                 }
                 self.secureplan_session_opened(session, origin, survey, intent);
-                // The editor appears once there is a session to work in.
+                // The editor appears once there is a session to work in; an
+                // editor already open comes forward for it (DSK-04). A pairing
+                // still pending never moves it (BRG-02).
                 if self.secureplan_windowless() {
                     return Task::batch([self.open_main_window(), self.focus_cmd_input()]);
                 }
+                return self.secureplan_raise_window();
             }
             BridgeEvent::Closed { session, .. } => {
                 if self.secureplan.sessions.by_session_mut(session).is_some() {
@@ -812,7 +922,7 @@ impl OpenCADStudio {
     pub(crate) fn secureplan_action(&mut self, action: Action) -> Task<Message> {
         // The dialog that asked closes, unless the action keeps it.
         let keeps_dialog =
-            matches!(action, Action::AlignConfirm | Action::ApplyConfirm | Action::ApplyReset | Action::ExportSave | Action::ExportCancel);
+            matches!(action, Action::AlignConfirm | Action::AlignMeasure | Action::ApplyConfirm | Action::ApplyReset | Action::ExportSave | Action::ExportCancel);
         if !keeps_dialog {
             self.secureplan.dialog = None;
         }
@@ -881,6 +991,10 @@ impl OpenCADStudio {
                 None => Task::none(),
             },
             Action::AlignConfirm => self.secureplan_confirm_align(),
+            Action::AlignMeasure => {
+                self.secureplan_measure_start();
+                Task::none()
+            }
             Action::ApplyConfirm => self.secureplan_confirm_apply(),
             Action::ApplyReset => {
                 if let Some(Dialog::Apply(dialog)) = self.secureplan.dialog.as_mut() {
@@ -1243,6 +1357,145 @@ mod tests {
         let events = bridge.take_events().unwrap();
         app.secureplan.bridge = Some(Arc::clone(&bridge));
         (app, bridge, events, launch(ORIGIN, pairing))
+    }
+
+    /// One window: another launch without a URL brings the editor forward;
+    /// a link start still waiting for its session opens the editor as a
+    /// first launch would.
+    #[test]
+    fn another_launch_brings_the_window_forward() {
+        let mut app = app_with_drawing();
+        let main = iced::window::Id::unique();
+        app.main_window = Some(main);
+        let task = app.update(Message::SecurePlan(Msg::Focus));
+        assert_eq!(window_actions(task), raised(main), "the window was not restored and focused");
+        assert_eq!(app.main_window, Some(main), "a second window opened");
+        let (mut app, ..) = link_started_app(92);
+        assert_eq!(app.main_window, None);
+        let _ = app.update(Message::SecurePlan(Msg::Focus));
+        assert!(app.main_window.is_some(), "the editor did not open");
+    }
+
+    /// The window actions a task runs, in order.
+    fn window_actions(task: Task<Message>) -> Vec<String> {
+        use iced::futures::StreamExt;
+        use iced_runtime::window::Action as Window;
+        let Some(stream) = iced_runtime::task::into_stream(task) else { return Vec::new() };
+        pollster::block_on(stream.collect::<Vec<_>>())
+            .into_iter()
+            .filter_map(|action| match action {
+                iced_runtime::Action::Window(Window::Minimize(id, minimized)) => Some(format!("minimize {id:?} {minimized}")),
+                iced_runtime::Action::Window(Window::GainFocus(id)) => Some(format!("focus {id:?}")),
+                iced_runtime::Action::Window(_) => Some("another window action".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `task` ends the application.
+    fn exits(task: Task<Message>) -> bool {
+        use iced::futures::StreamExt;
+        let Some(stream) = iced_runtime::task::into_stream(task) else { return false };
+        pollster::block_on(stream.collect::<Vec<_>>()).iter().any(|action| matches!(action, iced_runtime::Action::Exit))
+    }
+
+    fn raised(id: iced::window::Id) -> Vec<String> {
+        vec![format!("minimize {id:?} false"), format!("focus {id:?}")]
+    }
+
+    /// DSK-04: a request handed over by another launch counts as delivered
+    /// only once the application has taken it. One the hand-off gave up on
+    /// (too late) is not acted on.
+    #[test]
+    fn a_handed_over_request_is_answered_only_once_the_application_takes_it() {
+        let (mut app, _bridge, _events, _request) = link_started_app(121);
+        app.secureplan.cold_start = false;
+        let main = iced::window::Id::unique();
+        app.main_window = Some(main);
+        let (sender, receiver) = mpsc::channel();
+        let taken = app.update(Message::SecurePlan(Msg::HandedOff(None, Receipt::new(sender))));
+        assert!(receiver.try_recv().is_ok(), "the hand-off was not answered");
+        assert_eq!(window_actions(taken), raised(main));
+        let (sender, receiver) = mpsc::channel();
+        let receipt = Receipt::new(sender);
+        assert!(!receipt.withdraw(), "withdrawn before it was taken");
+        let late = app.update(Message::SecurePlan(Msg::HandedOff(None, receipt)));
+        assert!(window_actions(late).is_empty(), "a withdrawn request was acted on");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// DSK-04: a link handed to a running editor brings it forward once its
+    /// session opens; while the pairing is pending, or only prompted for,
+    /// the window stays as it is (BRG-02).
+    #[test]
+    fn a_session_opened_brings_the_running_editor_forward_and_a_pending_pairing_does_not() {
+        for trusted in [true, false] {
+            let (mut app, bridge, events, request) = link_started_app(if trusted { 97 } else { 98 });
+            app.secureplan.cold_start = false;
+            let main = iced::window::Id::unique();
+            app.main_window = Some(main);
+            if trusted {
+                app.secureplan.settings.trust(ORIGIN);
+            }
+            let pending = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+            assert!(window_actions(pending).is_empty(), "trusted {trusted}: a pending pairing moved the window");
+            if !trusted {
+                let answered = app.update(Message::SecurePlan(Msg::TrustAnswer(true)));
+                assert!(window_actions(answered).is_empty(), "the answer alone moved the window");
+            }
+            let _web = connect_web(bridge.port(), &request).expect("the link pairs");
+            let opened = next_event(&events);
+            assert!(matches!(opened, BridgeEvent::Opened { .. }));
+            let task = app.update(Message::SecurePlan(Msg::Bridge(opened)));
+            assert_eq!(window_actions(task), raised(main), "trusted {trusted}");
+            assert_eq!(app.main_window, Some(main), "a second window opened");
+            std::fs::remove_dir_all(app.secureplan.settings_path.clone().unwrap().parent().unwrap()).ok();
+        }
+    }
+
+    /// F2d/BRG-02: the macOS launcher starts the editor with only a flag
+    /// while the link follows over the hand-off; it boots windowless, like a
+    /// link start, whatever the link's website turns out to be.
+    #[test]
+    fn the_launchers_awaiting_start_stays_windowless_for_every_origin() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["SecurePlanCAD", super::super::handoff::AWAITING_LAUNCH_ARG]).unwrap();
+        assert!(cli.secureplan_awaiting_launch && cli.files.is_empty(), "the flag carries nothing else");
+        for (n, case) in ["trusted", "declined", "ineligible"].into_iter().enumerate() {
+            let (app, bridge, events, request) = link_started_app(100 + n as u8);
+            // As `main` boots it after `begin_awaiting_launch`.
+            let (mut app, _boot) = OpenCADStudio::boot_from(app);
+            assert_eq!(app.main_window, None, "{case}: the editor opened before any link");
+            let request = if case == "ineligible" { launch("http://secureplan.example", 110) } else { request };
+            if case == "trusted" {
+                app.secureplan.settings.trust(ORIGIN);
+            }
+            let launched = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+            assert_eq!(app.main_window, None, "{case}: the editor opened before the session");
+            // A link no website may use: the process leaves at once (BRG-02).
+            // (The other cases also wait on the expiry timer: not collected.)
+            if case == "ineligible" {
+                assert!(exits(launched), "an ineligible link left the process waiting");
+            }
+            match case {
+                "trusted" => {
+                    let _web = connect_web(bridge.port(), &request).expect("a trusted link pairs silently");
+                    let opened = next_event(&events);
+                    let _ = app.update(Message::SecurePlan(Msg::Bridge(opened)));
+                    assert!(app.main_window.is_some(), "the editor opens with the session");
+                }
+                "declined" => {
+                    assert!(app.secureplan.prompt_window.is_some(), "only the trust prompt shows");
+                    let _ = app.update(Message::SecurePlan(Msg::TrustAnswer(false)));
+                    assert_eq!((app.secureplan.prompt_window, app.main_window), (None, None));
+                }
+                _ => {
+                    assert_eq!(app.secureplan.prompt_window, None, "an ineligible website was prompted for");
+                    assert_eq!(app.main_window, None);
+                }
+            }
+            std::fs::remove_dir_all(app.secureplan.settings_path.clone().unwrap().parent().unwrap()).ok();
+        }
     }
 
     #[test]

@@ -170,3 +170,117 @@ fn secureplan_release_builds_refuse_the_headless_drawing_modes() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// One SecurePlan CAD window: a launch without a URL asks the running copy,
+/// over the authenticated per-user channel, to show its window and exits
+/// without one. When only a crash's stale `handoff.json` is left, the launch
+/// starts as the primary and serves later launches itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn secureplan_a_second_launch_shows_the_running_window_and_exits() {
+    use OpenCADStudio::app::secureplan::{handoff, CONFIG_DIR_NAME};
+    let dir = sentinel_dir("single");
+    let descriptor = dir.join(CONFIG_DIR_NAME).join("handoff.json");
+    let launch = || {
+        Command::new(env!("CARGO_BIN_EXE_OpenCADStudio"))
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("XDG_CONFIG_HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the SecurePlan CAD binary")
+    };
+    // The running copy holds the window's lock and serves the hand-off.
+    let handoff::Claim::Primary(lock) = handoff::claim(&dir.join(CONFIG_DIR_NAME), &[], std::time::Duration::ZERO) else {
+        panic!("no primary lock")
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender = std::sync::Mutex::new(sender);
+    let _serving = handoff::serve(&descriptor, move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
+    let output = launch().wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), handoff::Request::Focus);
+
+    // A crash left a descriptor behind whose port nobody serves, and the
+    // lock free.
+    drop(lock);
+    let port = free_port();
+    std::fs::write(&descriptor, format!("{{\"protocol\":1,\"port\":{port},\"secret\":\"{}\",\"pid\":1}}\n", "00".repeat(32))).unwrap();
+    let primary = launch();
+    let pid = primary.id();
+    let _ = primary.wait_with_output().unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
+    assert_eq!(written["pid"], pid, "the launch did not start as the primary");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The real binary started with `args` and `XDG_CONFIG_HOME=dir`, no display.
+#[cfg(target_os = "linux")]
+fn start_in(dir: &std::path::Path, args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_OpenCADStudio"))
+        .args(args)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("XDG_CONFIG_HOME", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the SecurePlan CAD binary")
+}
+
+/// DSK-04: the macOS launcher's awaiting start (the real binary, with its
+/// flag) waits for an exiting primary to end and then owns the window,
+/// ready for the launcher's link. Next to a ready primary it leaves without
+/// sending it anything.
+#[cfg(target_os = "linux")]
+#[test]
+fn secureplan_the_launchers_awaiting_start_takes_over_from_an_exiting_primary() {
+    use OpenCADStudio::app::secureplan::{handoff, CONFIG_DIR_NAME};
+    let dir = sentinel_dir("awaiting");
+    let config = dir.join(CONFIG_DIR_NAME);
+    let descriptor = config.join("handoff.json");
+    // A primary that is exiting: it owns the window, no longer serves.
+    let handoff::Claim::Primary(lock) = handoff::claim(&config, &[], std::time::Duration::ZERO) else { panic!("no primary lock") };
+    let awaiting = start_in(&dir, &[handoff::AWAITING_LAUNCH_ARG]);
+    let pid = awaiting.id();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!descriptor.exists(), "a second primary started while the first owned the window");
+    drop(lock);
+    let _ = awaiting.wait_with_output().unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
+    assert_eq!(written["pid"], pid, "the awaiting start left instead of taking over");
+
+    // A ready primary: the awaiting start leaves at once.
+    let handoff::Claim::Primary(lock) = handoff::claim(&config, &[], std::time::Duration::ZERO) else { panic!("no primary lock") };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender = std::sync::Mutex::new(sender);
+    let _serving = handoff::serve(&descriptor, move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
+    let output = start_in(&dir, &[handoff::AWAITING_LAUNCH_ARG]).wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(receiver.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the awaiting start asked for something");
+    let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
+    assert_eq!(written["pid"], std::process::id());
+    drop(lock);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// DSK-04: a launch that cannot own the window (no lock can be made) or
+/// cannot be reached by later launches (no descriptor can be written)
+/// starts nothing and says why.
+#[cfg(target_os = "linux")]
+#[test]
+fn secureplan_a_launch_that_cannot_own_the_window_starts_nothing() {
+    use OpenCADStudio::app::secureplan::CONFIG_DIR_NAME;
+    for blocked in ["primary.lock", "handoff.json"] {
+        let dir = sentinel_dir(&format!("unowned_{}", blocked.len()));
+        std::fs::create_dir_all(dir.join(CONFIG_DIR_NAME).join(blocked)).unwrap();
+        let output = start_in(&dir, &[]).wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{blocked}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot use its settings folder"), "{blocked}: {output:?}");
+        assert!(dir.join(CONFIG_DIR_NAME).join(blocked).is_dir());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

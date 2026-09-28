@@ -310,6 +310,26 @@ mod tests {
         ApplyDialog::new(1, base.snapshot, 0, [0.0, 0.0, 30000.0, 18000.0], base.alignment, empty, false, Some(3), layout::references(&scene))
     }
 
+    /// DSK-06: the rendered dropdown chooses the view, and the choice and
+    /// the focus show.
+    #[test]
+    fn the_view_dropdown_chooses_a_layout() {
+        use crate::app::secureplan::ui::tests::{pick_rendered, shows_focus};
+        use crate::app::secureplan::ui::{Dialog, Msg};
+        let dialog = layout_dialog(0.0, false);
+        let messages = pick_rendered(view(&dialog), "Published view", 2);
+        let [Message::SecurePlan(chosen @ Msg::FormSelect(VIEW, 2))] = messages.as_slice() else { panic!("{messages:?}") };
+        let mut app = crate::app::OpenCADStudio::new_for_test();
+        app.secureplan.dialog = Some(Dialog::Apply(Box::new(dialog)));
+        app.secureplan.dialog.as_mut().unwrap().form_mut().focus = 5;
+        let _ = app.update(Message::SecurePlan(chosen.clone()));
+        let Some(Dialog::Apply(dialog)) = &app.secureplan.dialog else { panic!("the dialog closed") };
+        assert_eq!(dialog.layout().map(|(name, _)| name.as_str()), Some("Sheet A1"));
+        assert!(!dialog.form.fields[X0].enabled, "refreshed for a layout");
+        assert_eq!(dialog.form.focus, VIEW);
+        assert!(shows_focus(view(dialog), "Published view"));
+    }
+
     #[test]
     fn a_layout_is_chosen_by_keyboard_and_publishes_its_sheet() {
         let mut dialog = layout_dialog(0.0, false);
