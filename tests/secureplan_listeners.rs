@@ -14,6 +14,26 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("run the SecurePlan CAD binary")
 }
 
+/// Wait for a SecurePlan CAD process started with piped output, failing
+/// instead of hanging when it (or a child holding its output, such as a
+/// message box) does not finish within `limit`.
+fn finish(mut child: std::process::Child, limit: std::time::Duration) -> std::process::Output {
+    let deadline = std::time::Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("SecurePlan CAD did not exit within {limit:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    receiver.recv_timeout(std::time::Duration::from_secs(10)).expect("a child of SecurePlan CAD kept its output open").unwrap()
+}
+
+const EXIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
@@ -199,7 +219,7 @@ fn secureplan_a_second_launch_shows_the_running_window_and_exits() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let sender = std::sync::Mutex::new(sender);
     let _serving = handoff::serve(&descriptor, move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
-    let output = launch().wait_with_output().unwrap();
+    let output = finish(launch(), EXIT_LIMIT);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), handoff::Request::Focus);
 
@@ -210,7 +230,7 @@ fn secureplan_a_second_launch_shows_the_running_window_and_exits() {
     std::fs::write(&descriptor, format!("{{\"protocol\":1,\"port\":{port},\"secret\":\"{}\",\"pid\":1}}\n", "00".repeat(32))).unwrap();
     let primary = launch();
     let pid = primary.id();
-    let _ = primary.wait_with_output().unwrap();
+    let _ = finish(primary, EXIT_LIMIT);
     let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
     assert_eq!(written["pid"], pid, "the launch did not start as the primary");
     std::fs::remove_dir_all(&dir).ok();
@@ -249,7 +269,7 @@ fn secureplan_the_launchers_awaiting_start_takes_over_from_an_exiting_primary() 
     std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(!descriptor.exists(), "a second primary started while the first owned the window");
     drop(lock);
-    let _ = awaiting.wait_with_output().unwrap();
+    let _ = finish(awaiting, EXIT_LIMIT);
     let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
     assert_eq!(written["pid"], pid, "the awaiting start left instead of taking over");
 
@@ -258,7 +278,7 @@ fn secureplan_the_launchers_awaiting_start_takes_over_from_an_exiting_primary() 
     let (sender, receiver) = std::sync::mpsc::channel();
     let sender = std::sync::Mutex::new(sender);
     let _serving = handoff::serve(&descriptor, move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
-    let output = start_in(&dir, &[handoff::AWAITING_LAUNCH_ARG]).wait_with_output().unwrap();
+    let output = finish(start_in(&dir, &[handoff::AWAITING_LAUNCH_ARG]), EXIT_LIMIT);
     assert!(output.status.success(), "{output:?}");
     assert!(receiver.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "the awaiting start asked for something");
     let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
@@ -277,7 +297,7 @@ fn secureplan_a_launch_that_cannot_own_the_window_starts_nothing() {
     for blocked in ["primary.lock", "handoff.json"] {
         let dir = sentinel_dir(&format!("unowned_{}", blocked.len()));
         std::fs::create_dir_all(dir.join(CONFIG_DIR_NAME).join(blocked)).unwrap();
-        let output = start_in(&dir, &[]).wait_with_output().unwrap();
+        let output = finish(start_in(&dir, &[]), EXIT_LIMIT);
         assert_eq!(output.status.code(), Some(1), "{blocked}: {output:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("cannot use its settings folder"), "{blocked}: {output:?}");
         assert!(dir.join(CONFIG_DIR_NAME).join(blocked).is_dir());

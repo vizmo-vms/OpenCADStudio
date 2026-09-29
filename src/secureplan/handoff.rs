@@ -12,8 +12,11 @@
 //! sides prove knowledge of the secret before the URL is sent, so a process
 //! that has taken over a stale port learns nothing.
 //!
-//! On Windows the operating system passes the first launch's URL as a process
-//! argument; that instance uses it once and never forwards it.
+//! On Windows and Linux the operating system passes the first launch's URL as
+//! a process argument (Linux: the `.desktop` file's `Exec=… %u`); that
+//! instance uses it once and never forwards it. On Linux other local users
+//! can read process arguments (`/proc/<pid>/cmdline`), launch token included,
+//! so the Linux package is for internal testing only and is not released.
 //!
 //! One window: the primary holds an exclusive per-user lock on
 //! `primary.lock` for its lifetime (the operating system releases it when the
@@ -106,9 +109,7 @@ pub fn claim_window(requests: &[Request]) -> Claim {
 /// ownership of the window; the descriptor is readiness to take requests.
 pub fn claim(dir: &Path, requests: &[Request], wait: Duration) -> Claim {
     let descriptor = dir.join("handoff.json");
-    let lock = std::fs::create_dir_all(dir).and_then(|_| {
-        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("primary.lock"))
-    });
+    let lock = open_lock(dir);
     let deadline = Instant::now() + wait;
     let mut pending: Vec<&Request> = requests.iter().collect();
     loop {
@@ -215,16 +216,30 @@ pub fn stop_serving() {
 }
 
 /// Tell the user why SecurePlan CAD did not start: on standard error, and in
-/// a message box on macOS and Windows, where nobody sees standard error.
+/// a message box, since an app started from a menu or a link has nobody
+/// reading standard error (on Linux the box needs `zenity`).
 pub fn report_start_problem(message: &str) {
     eprintln!("{message}");
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    if !names_a_display(std::env::var_os("DISPLAY"), std::env::var_os("WAYLAND_DISPLAY")) {
+        return;
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("SecurePlan CAD")
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
+}
+
+/// Linux: whether the environment names a desktop session to show a message
+/// box on. Without one (a terminal, a service, a test) no box may open: GTK
+/// would still reach the default Wayland socket in `XDG_RUNTIME_DIR` and wait
+/// there for OK, so the process would never exit.
+#[cfg(target_os = "linux")]
+fn names_a_display(x11: Option<std::ffi::OsString>, wayland: Option<std::ffi::OsString>) -> bool {
+    [x11, wayland].iter().flatten().any(|name| !name.is_empty())
 }
 
 /// Why a hand-off failed. Carries no URL content.
@@ -273,6 +288,48 @@ fn read_json(reader: &mut BufReader<TcpStream>) -> Option<Value> {
 fn write_json(stream: &mut TcpStream, value: &Value) -> std::io::Result<()> {
     writeln!(stream, "{value}")?;
     stream.flush()
+}
+
+/// Open `dir/primary.lock`. On Unix the folder and the lock must belong to
+/// the current user (otherwise nothing may start) and are made private to
+/// them (0700 and 0600), so no other user can open the lock from now on and
+/// hold it to keep the window from opening. A lock an earlier build left
+/// readable is tightened in place, never replaced: every launch, and an
+/// older instance still running, keeps locking the same file, so there is
+/// still one window and a running older instance still takes hand-offs.
+#[cfg(unix)]
+fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { geteuid() };
+    let foreign = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the SecurePlan CAD settings folder is not the user's own");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let folder = std::fs::metadata(dir)?;
+    if !folder.is_dir() || folder.uid() != uid {
+        return Err(foreign());
+    }
+    if folder.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(dir.join("primary.lock"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != uid {
+        return Err(foreign());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        // fchmod on the open file: the same inode, whoever holds it.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("primary.lock"))
 }
 
 /// Write the descriptor readable by the current user only.
@@ -808,6 +865,104 @@ mod tests {
         std::fs::create_dir_all(dir.join("handoff.json")).unwrap();
         assert!(serve(&dir.join("handoff.json"), |_| true).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A settings folder and lock as an earlier build left them: 0755 and
+    /// 0644. Returns the lock's inode.
+    #[cfg(unix)]
+    fn legacy_lock(dir: &Path) -> u64 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("primary.lock");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::metadata(&path).unwrap().ino()
+    }
+
+    #[cfg(unix)]
+    fn mode_and_inode(path: &Path) -> (u32, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).unwrap();
+        (metadata.mode() & 0o777, metadata.ino())
+    }
+
+    /// DSK-04: the settings folder and `primary.lock` become private to the
+    /// user (0700 and 0600). A readable lock from an earlier build is
+    /// tightened in place, never replaced, so it stays exclusive.
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_lock_is_made_private_in_place() {
+        let dir = temp_dir("private-lock");
+        let inode = legacy_lock(&dir);
+        let Claim::Primary(lock) = claim(&dir, &[], Duration::from_millis(200)) else { panic!("the free lock was not taken") };
+        assert_eq!(mode_and_inode(&dir).0, 0o700);
+        assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
+        assert!(matches!(claim(&dir, &[], Duration::from_millis(200)), Claim::Unanswered), "a second launch took the held lock");
+        drop(lock);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: an older instance still running holds the readable lock. A new
+    /// launch tightens it in place but does not take the window: it hands its
+    /// request to that instance over the authenticated hand-off.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_older_instance_keeps_the_window_and_takes_hand_offs() {
+        let dir = temp_dir("legacy-primary");
+        let inode = legacy_lock(&dir);
+        let legacy = std::fs::OpenOptions::new().read(true).write(true).open(dir.join("primary.lock")).unwrap();
+        legacy.try_lock().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        let serving = serve(&dir.join("handoff.json"), move |request| sender.lock().unwrap().send(request).is_ok()).unwrap();
+        assert!(matches!(claim(&dir, &[Request::Launch(URL.into())], Duration::from_secs(5)), Claim::Forwarded));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Request::Launch(URL.into()));
+        assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
+        serving.stop();
+        assert!(matches!(claim(&dir, &[Request::Focus], Duration::from_millis(300)), Claim::Unanswered), "the held lock was bypassed");
+        drop(legacy);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DSK-04: launches that all find the readable lock at once agree on one
+    /// window: they lock the same file, tightened in place.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_launches_on_a_readable_lock_start_one_window() {
+        let dir = temp_dir("concurrent-migration");
+        let inode = legacy_lock(&dir);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let launches: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, start) = (dir.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    match claim(&dir, &[], Duration::from_millis(500)) {
+                        Claim::Primary(lock) => Some(lock),
+                        Claim::Unanswered => None,
+                        other => panic!("unexpected claim: {other:?}"),
+                    }
+                })
+            })
+            .collect();
+        let locks: Vec<_> = launches.into_iter().map(|launch| launch.join().unwrap()).collect();
+        assert_eq!(locks.iter().filter(|lock| lock.is_some()).count(), 1, "one primary");
+        assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
+        drop(locks);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A start problem opens a message box on Linux only where a desktop
+    /// session is named; otherwise the process just exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_start_problem_opens_a_box_only_in_a_named_desktop_session() {
+        let name = |value: &str| Some(std::ffi::OsString::from(value));
+        assert!(!names_a_display(None, None));
+        assert!(!names_a_display(name(""), name("")));
+        assert!(names_a_display(name(":0"), None));
+        assert!(names_a_display(None, name("wayland-0")));
     }
 
     #[test]

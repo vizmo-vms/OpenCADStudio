@@ -1,0 +1,26 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: SecurePlan CAD
+Upstream-Contact: https://github.com/vizmo-vms/OpenCADStudio
+Source: https://github.com/vizmo-vms/OpenCADStudio
+Comment: SecurePlan CAD by Vizmo is built on Open CAD Studio. The corresponding
+ source, build scripts and SHA-256 checksums are published with every release
+ (SecurePlanCAD-source.tar.gz) at
+ https://github.com/vizmo-vms/OpenCADStudio/releases
+
+Files: *
+Copyright: © 2026 Hakan Seven and the Open CAD Studio contributors
+           © 2026 Vizmo (the SecurePlan CAD changes)
+License: GPL-3
+
+License: GPL-3
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License version 3 as published by
+ the Free Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".

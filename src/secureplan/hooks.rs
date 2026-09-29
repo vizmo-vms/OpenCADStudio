@@ -624,6 +624,12 @@ impl OpenCADStudio {
             resizable: false,
             exit_on_close_request: false,
             icon: super::home::window_icon(),
+            // The dock shows the window as SecurePlan CAD (its .desktop file).
+            #[cfg(target_os = "linux")]
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: crate::io::file_association::APP_ID.to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         });
         self.secureplan.prompt_window = Some(id);

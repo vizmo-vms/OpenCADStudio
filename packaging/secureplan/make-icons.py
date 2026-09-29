@@ -10,7 +10,9 @@ Run it with the pinned Pillow (requirements-icons.txt), from the repository root
 Reads assets/secureplan/vizmo-logo-mark.png (224 x 224, the SecurePlan web
 app's src/assets/vizmo-logo-mark.png) and writes, next to this script:
 - AppIcon.icns: the macOS .app and .dmg icon (make-release-dmg.sh, make-dev-app.sh);
-- AppIcon.ico: the Windows executable (build.rs) and MSI (build-msi.ps1) icon.
+- AppIcon.ico: the Windows executable (build.rs) and MSI (build-msi.ps1) icon;
+- linux/icon-<size>.png: the Linux package's hicolor icons (make-release-deb.sh),
+  the same 256 px icon as Windows and smaller sizes from it.
 
 The 256 px Windows icon holds the mark itself, unscaled and centred; the Rust
 test `the_window_icon_and_about_are_vizmo_and_name_the_source` checks that
@@ -25,6 +27,7 @@ from PIL import Image
 
 PILLOW = "12.1.1"
 HERE = Path(__file__).resolve().parent
+LINUX_SIZES = (16, 24, 32, 48, 64, 128, 256)
 SOURCE = HERE.parent.parent / "assets" / "secureplan" / "vizmo-logo-mark.png"
 
 
@@ -50,10 +53,15 @@ def main() -> None:
     # macOS icons keep a margin around the artwork, as Apple's template does.
     scaled(mark, 1024, 0.8).save(HERE / "AppIcon.icns")
     # Windows: the mark at its own size in the 256 px icon, smaller sizes from it.
-    unscaled(mark, 256).save(
+    icon = unscaled(mark, 256)
+    icon.save(
         HERE / "AppIcon.ico",
         sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )
+    # Linux: the same icons as PNG files for the hicolor theme.
+    for size in LINUX_SIZES:
+        png = icon if size == 256 else icon.resize((size, size), Image.Resampling.LANCZOS)
+        png.save(HERE / "linux" / f"icon-{size}.png", optimize=True)
 
 
 if __name__ == "__main__":

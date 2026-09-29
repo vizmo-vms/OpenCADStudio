@@ -68,6 +68,11 @@ pub fn platform_asset() -> Option<&'static str> {
     }
 }
 
+/// What a manual check says on a build that does not update itself: any
+/// platform without a release asset, which includes the Linux package, an
+/// internal test build only (it never checks for updates).
+pub const NO_UPDATES: &str = "Updates aren't available for this build; install a newer package manually.";
+
 /// The only identifying header: the product and its version.
 fn user_agent() -> String {
     format!("SecurePlanCAD/{VERSION}")
@@ -602,7 +607,7 @@ impl OpenCADStudio {
         if update.asset.is_none() {
             self.secureplan.dialog = Some(Dialog::notice(
                 "Updates",
-                vec!["SecurePlan CAD updates itself on macOS and Windows only.".into(), installed_line()],
+                vec![NO_UPDATES.into(), installed_line()],
             ));
             return Task::none();
         }
@@ -1380,6 +1385,32 @@ pub(crate) mod tests {
         assert_eq!(dialog(&app).as_deref(), Some("Update not installed"));
         assert!(!mock.requests().iter().any(|request| request.target.starts_with("/download")), "it downloaded anyway");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A build without a release asset (Linux) never checks: no automatic
+    /// check, no request, and a manual check explains how to update.
+    #[test]
+    fn a_build_without_a_release_asset_offers_no_updates() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(platform_asset(), None, "the Linux package does not update itself");
+        let mock = Mock::start();
+        mock.release("9.0.0", ASSET, b"bytes", 2 * HOUR);
+        let mut app = OpenCADStudio::new_for_test();
+        app.secureplan.update.endpoints = mock.endpoints();
+        app.secureplan.update.asset = None;
+        assert!(!app.secureplan.update.automatic(&app.secureplan.settings));
+        let before = app.command_line.history.len();
+        for _ in 0..3 {
+            let _ = app.update(Message::SecurePlan(Msg::UpdateDue));
+        }
+        assert_eq!(app.command_line.history.len(), before, "automatic checks were not silent");
+        assert!(app.secureplan.dialog.is_none());
+        let _ = app.dispatch_command("SECUREPLANUPDATE");
+        let Some(Dialog::Choice { title, lines, .. }) = &app.secureplan.dialog else { panic!("no notice for a manual check") };
+        assert_eq!(title, "Updates");
+        assert_eq!(lines[0], NO_UPDATES);
+        assert!(lines[1].starts_with("Installed: SecurePlan CAD"), "{lines:?}");
+        assert!(mock.requests().is_empty(), "a build without an asset contacted the release server");
     }
 
     #[test]
