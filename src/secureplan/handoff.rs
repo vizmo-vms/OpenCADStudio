@@ -220,6 +220,10 @@ pub fn stop_serving() {
 /// reading standard error (on Linux the box needs `zenity`).
 pub fn report_start_problem(message: &str) {
     eprintln!("{message}");
+    #[cfg(target_os = "linux")]
+    if !names_a_display(std::env::var_os("DISPLAY"), std::env::var_os("WAYLAND_DISPLAY")) {
+        return;
+    }
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
@@ -227,6 +231,15 @@ pub fn report_start_problem(message: &str) {
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
+}
+
+/// Linux: whether the environment names a desktop session to show a message
+/// box on. Without one (a terminal, a service, a test) no box may open: GTK
+/// would still reach the default Wayland socket in `XDG_RUNTIME_DIR` and wait
+/// there for OK, so the process would never exit.
+#[cfg(target_os = "linux")]
+fn names_a_display(x11: Option<std::ffi::OsString>, wayland: Option<std::ffi::OsString>) -> bool {
+    [x11, wayland].iter().flatten().any(|name| !name.is_empty())
 }
 
 /// Why a hand-off failed. Carries no URL content.
@@ -938,6 +951,18 @@ mod tests {
         assert_eq!(mode_and_inode(&dir.join("primary.lock")), (0o600, inode));
         drop(locks);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A start problem opens a message box on Linux only where a desktop
+    /// session is named; otherwise the process just exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_start_problem_opens_a_box_only_in_a_named_desktop_session() {
+        let name = |value: &str| Some(std::ffi::OsString::from(value));
+        assert!(!names_a_display(None, None));
+        assert!(!names_a_display(name(""), name("")));
+        assert!(names_a_display(name(":0"), None));
+        assert!(names_a_display(None, name("wayland-0")));
     }
 
     #[test]
