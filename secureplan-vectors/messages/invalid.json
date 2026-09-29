@@ -1094,6 +1094,28 @@
       }
     },
     {
+      "name": "applyProgress-awaiting-with-progress",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "applyProgress",
+        "requestId": "apply-1",
+        "step": "awaitingConfirmation",
+        "progress": 0.5
+      }
+    },
+    {
+      "name": "applyProgress-unknown-step",
+      "direction": "webToDesktop",
+      "layer": "schema",
+      "message": {
+        "type": "applyProgress",
+        "requestId": "apply-1",
+        "step": "confirming",
+        "progress": null
+      }
+    },
+    {
       "name": "applyResult-mixed",
       "direction": "webToDesktop",
       "layer": "schema",

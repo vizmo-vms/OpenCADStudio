@@ -12,6 +12,7 @@
 
 pub mod align_dialog;
 pub mod apply_dialog;
+pub mod apply_progress;
 pub mod convert_menu;
 pub mod export_dialog;
 pub mod import_dialog;
@@ -52,6 +53,9 @@ pub enum Action {
     AlignMeasure,
     ApplyConfirm,
     ApplyReset,
+    /// The Apply progress dialog's Cancel (while the outputs are built) and Close.
+    ApplyProgressCancel,
+    ApplyProgressClose,
     /// Convert tab `.0`'s selection (CNV-01).
     Convert(u64, crate::app::secureplan::convert::Kind),
     /// The export dialog's **Export…** and Cancel (EXP-03).
@@ -418,6 +422,15 @@ pub fn view<'a>(base: Element<'a, Message>, dialog: &'a Dialog) -> Element<'a, M
         Dialog::Export(dialog) => ("Export CAD with the SecurePlan design", export_dialog::view(dialog)),
         Dialog::Update(dialog) => ("Update available", update_dialog::view(dialog)),
     };
+    modal(base, title, body)
+}
+
+/// The Apply progress dialog, stacked over `base` as a modal.
+pub fn progress_view<'a>(base: Element<'a, Message>, dialog: &'a apply_progress::ApplyProgress) -> Element<'a, Message> {
+    modal(base, dialog.title(), apply_progress::view(dialog))
+}
+
+fn modal<'a>(base: Element<'a, Message>, title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
     crate::ui::modal::modal(
         base,
         title,

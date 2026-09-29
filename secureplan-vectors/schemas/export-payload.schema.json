@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "export-payload.schema.json",
   "title": "SecurePlan CAD bridge protocol v1: CAD export payload (EXP-01, EXP-02)",
-  "description": "Transferred as application/vnd.secureplan.export+json (UTF-8, at most 8388608 bytes). Built from one captured saved snapshot, in world millimetres, with live catalog display data. Comments, photos, contacts and pricing are never included. notes is empty unless includeNotes; coverage is empty unless includeCoverage.",
+  "description": "Transferred as application/vnd.secureplan.export+json (UTF-8, at most 8388608 bytes). Built from one captured saved snapshot, in world millimetres, with live catalog display data. Comments, photos, contacts and pricing are never included. notes is empty unless includeNotes; coverage is empty unless includeCoverage. Schema version 2 (SecurePlan CAD 0.2.2) always carries the icons the web canvas draws, so the desktop export dialog can offer SecurePlan icons or standard symbols; a version 1 reader rejects it, and a version 2 reader rejects version 1. The icon rules in common.schema.json#/$defs/icons apply.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "snapshot", "options", "walls", "doors", "routes", "devices", "targets", "drawings", "labels", "notes", "coverage"],
+  "required": ["schemaVersion", "snapshot", "options", "icons", "walls", "doors", "routes", "devices", "targets", "drawings", "labels", "notes", "coverage"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "snapshot": {
       "type": "object",
       "additionalProperties": false,
@@ -17,6 +17,7 @@
         "documentHash": { "$ref": "common.schema.json#/$defs/sha256" }
       }
     },
+    "icons": { "$ref": "common.schema.json#/$defs/icons" },
     "options": {
       "type": "object",
       "additionalProperties": false,
@@ -79,18 +80,21 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "kind", "name", "iconKey", "customIcon", "color", "label", "status", "position", "rotationDeg"],
+        "required": ["id", "kind", "name", "iconKey", "customIcon", "color", "label", "status", "position", "rotationDeg", "symbolScale", "iconId", "badge"],
         "properties": {
           "id": { "$ref": "common.schema.json#/$defs/elementId" },
           "kind": { "enum": ["camera", "equipment", "asset"] },
           "name": { "$ref": "common.schema.json#/$defs/label" },
           "iconKey": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
-          "customIcon": { "description": "true when the catalog item uses a custom raster icon; the desktop then draws the disclosed standard vector symbol for iconKey.", "type": "boolean" },
+          "customIcon": { "description": "true when the catalog item uses a custom raster icon.", "type": "boolean" },
           "color": { "$ref": "common.schema.json#/$defs/color" },
           "label": { "$ref": "common.schema.json#/$defs/label" },
           "status": { "$ref": "common.schema.json#/$defs/status" },
           "position": { "$ref": "common.schema.json#/$defs/pointMm" },
-          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" }
+          "rotationDeg": { "$ref": "common.schema.json#/$defs/rotationDeg" },
+          "symbolScale": { "$ref": "common.schema.json#/$defs/symbolScale" },
+          "iconId": { "description": "The icon the web canvas draws, or null for the desktop's built-in standard symbol for iconKey.", "oneOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/iconId" }] },
+          "badge": { "$ref": "common.schema.json#/$defs/badge" }
         }
       }
     },

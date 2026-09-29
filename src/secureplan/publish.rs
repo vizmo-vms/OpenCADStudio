@@ -1026,6 +1026,9 @@ fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMa
     let mut handles: Vec<(u64, (f64, acadrust::types::Transform))> = tolerances.into_iter().collect();
     handles.sort_by_key(|(handle, _)| *handle);
     for (handle, (tolerance, transform)) in handles {
+        if build_cancelled() {
+            return Err(CANCELLED.into());
+        }
         let handle = acadrust::types::Handle::new(handle);
         let Some(entity) = document.get_entity(handle) else { continue };
         let located = |error: String| located(entity, tolerance, &transform, error);
@@ -1536,11 +1539,97 @@ impl ApplyError {
     }
 }
 
+/// The stages of building Apply's outputs, as the progress dialog lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStage {
+    Drawing,
+    Pdf,
+    Snap,
+}
+
+/// An Apply's build, shared by its worker and the progress dialog: the stage
+/// it has reached, whether the user cancelled it, and the bytes of its
+/// outputs sent to SecurePlan so far.
+///
+/// Cancelling is checked between the stages (before the drawing is written,
+/// before the published view is prepared, before the PDF and before the snap
+/// file) and, inside preparation, before each curve is flattened. The
+/// drawing writer, the scene rebuild, the PDF writer and the snap extraction
+/// run to the end of their stage once started, so a cancel takes effect at
+/// the next check; the dialog closes at once and the result is dropped.
+#[derive(Debug, Default)]
+pub struct BuildControl {
+    stage: std::sync::atomic::AtomicU8,
+    cancelled: std::sync::atomic::AtomicBool,
+    pub sent: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BuildControl {
+    pub fn stage(&self) -> BuildStage {
+        match self.stage.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => BuildStage::Drawing,
+            1 => BuildStage::Pdf,
+            _ => BuildStage::Snap,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn sent(&self) -> u64 {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Enter `stage`, unless the build was cancelled.
+    fn enter(&self, stage: BuildStage) -> Result<(), ApplyError> {
+        if self.is_cancelled() {
+            return Err(ApplyError::new(super::session::ErrorCode::Internal, CANCELLED));
+        }
+        self.stage.store(stage as u8, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+const CANCELLED: &str = "Apply was cancelled.";
+
+thread_local! {
+    /// The build this worker thread runs, for the checks inside preparation.
+    static BUILD: std::cell::RefCell<Option<std::sync::Arc<BuildControl>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn build_cancelled() -> bool {
+    BUILD.with(|build| build.borrow().as_ref().is_some_and(|control| control.is_cancelled()))
+}
+
 /// Build the drawing, PDF and snap file from `snapshot` alone, in memory (no
 /// temporary files). Writer errors, known content loss and any output over
 /// 50 MiB stop Apply.
 pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutputs, ApplyError> {
+    build_outputs_with(snapshot, plan, &std::sync::Arc::new(BuildControl::default()))
+}
+
+/// [`build_outputs`], reporting its stage to `control` and stopping when it
+/// is cancelled.
+pub fn build_outputs_with(snapshot: &Snapshot, plan: &ApplyPlan, control: &std::sync::Arc<BuildControl>) -> Result<ApplyOutputs, ApplyError> {
+    struct Current;
+    impl Drop for Current {
+        fn drop(&mut self) {
+            BUILD.with(|build| build.borrow_mut().take());
+        }
+    }
+    BUILD.with(|build| *build.borrow_mut() = Some(std::sync::Arc::clone(control)));
+    let _current = Current;
+    build_stages(snapshot, plan, control)
+}
+
+fn build_stages(snapshot: &Snapshot, plan: &ApplyPlan, control: &BuildControl) -> Result<ApplyOutputs, ApplyError> {
     use super::session::{Drawing, ErrorCode, Format};
+    control.enter(BuildStage::Drawing)?;
     let transform = plan.transform().map_err(|error| ApplyError::new(ErrorCode::Internal, format!("The published page does not fit: {error:?}.")))?;
     check_contract(plan).map_err(|message| ApplyError::new(ErrorCode::Internal, message))?;
     // Damaged items the reader dropped are published only with the user's
@@ -1594,6 +1683,7 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
     };
 
     // The published view comes from the same snapshot.
+    control.enter(BuildStage::Pdf)?;
     let mut scene = crate::scene::Scene::new();
     scene.document = snapshot.document.clone();
     scene.annotation_scale = snapshot.annotation_scale;
@@ -1603,7 +1693,9 @@ pub fn build_outputs(snapshot: &Snapshot, plan: &ApplyPlan) -> Result<ApplyOutpu
         PublishedView::Layout(reference) => prepare_layout(&scene, reference, transform),
     }
     .map_err(|message| ApplyError::new(ErrorCode::Internal, message))?;
+    control.enter(BuildStage::Pdf)?;
     let pdf = page_pdf(&publication).map_err(|_| ApplyError::new(ErrorCode::WriterError, "The published PDF could not be written."))?;
+    control.enter(BuildStage::Snap)?;
     let snap = page_snap(&publication);
 
     let outputs = ApplyOutputs { drawing, written, original: snapshot.pending_original.clone(), pdf: pdf.bytes, snap, transform, omitted_images: pdf.omitted_images };
@@ -2792,5 +2884,27 @@ pub(crate) mod tests {
         doc.add_entity(EntityType::Ellipse(ellipse)).unwrap();
         let refused = prepare_model(&crate::app::secureplan::snap::tests::scene_of(doc), transform).err().expect("refused");
         assert!(refused.starts_with("An ellipse near (525000.00, -180000.00) is too large"), "{refused}");
+    }
+
+    #[test]
+    fn a_build_reports_its_stages_and_stops_when_cancelled() {
+        let scene = synthetic_dxf_scene();
+        let snapshot = Snapshot { document: scene.document.clone(), annotation_scale: 1.0, loaded: None, modified: true, pending_original: None, lost_entities: 0 };
+        let window = [0.0, 0.0, 30000.0, 18000.0];
+        let mapping = crate::app::secureplan::align::mapping_at(window, 1.0, 0, [0.0, 0.0]);
+        let plan = ApplyPlan { view: PublishedView::Model { window_cad: window }, mapping, mm_per_pt: choose_mm_per_pt(window, &mapping).unwrap(), damaged_acknowledged: false };
+        let control = std::sync::Arc::new(BuildControl::default());
+        assert_eq!(control.stage(), BuildStage::Drawing);
+        build_outputs_with(&snapshot, &plan, &control).unwrap();
+        assert_eq!(control.stage(), BuildStage::Snap, "it went through every stage");
+        control.cancel();
+        assert_eq!(build_outputs_with(&snapshot, &plan, &control).unwrap_err().message, CANCELLED);
+        assert!(!build_cancelled(), "the worker's build is forgotten when it ends");
+        // Inside preparation, each curve checks before it is flattened.
+        BUILD.with(|build| *build.borrow_mut() = Some(std::sync::Arc::clone(&control)));
+        let result = prepare_model(&scene, plan.transform().unwrap());
+        BUILD.with(|build| build.borrow_mut().take());
+        assert_eq!(result.err().as_deref(), Some(CANCELLED), "the synthetic plan has curves to flatten");
+        assert!(prepare_model(&scene, plan.transform().unwrap()).is_ok(), "no build on this thread: never cancelled");
     }
 }

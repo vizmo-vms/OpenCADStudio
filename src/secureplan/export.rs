@@ -7,7 +7,7 @@
 //!
 //! | Content | CAD representation | Layer |
 //! | --- | --- | --- |
-//! | Cameras, equipment, assets | a static symbol block per kind, with a text label | `…-CAMERA`, `…-EQUIPMENT`, `…-ASSET` |
+//! | Cameras, equipment, assets | a static block per icon, kind and badge (SecurePlan icons) or per kind (standard symbols), with a text label | `…-CAMERA`, `…-EQUIPMENT`, `…-ASSET` |
 //! | Walls | lines, one layer per material and status | `…-WALL-<MATERIAL>-<STATUS>` |
 //! | Doors and openings | lines, one layer per status | `…-DOOR-<STATUS>` |
 //! | Cable routes | polylines, with a "label (cable type)" text | `…-ROUTE` |
@@ -26,6 +26,19 @@
 //! achieves there, drawn on the target's layer; its required PPM, from the
 //! target itself, is a separate text below it. The other `labels[]` entries
 //! (doors and the rest) are the engineering labels.
+//!
+//! The export dialog's **Device symbols** choice (EXP-02) decides the device
+//! blocks when the export is written: *SecurePlan icons* (the default) draws
+//! each device as the SecurePlan canvas does ([`symbols::icon_block`]), in its
+//! colour and at its symbol scale, with its label centred below the symbol
+//! at the canvas's per-kind offset and size, turned with the symbol;
+//! *Standard symbols* draws the standard block of its kind with the label
+//! beside it, as SecurePlan CAD 0.2.1 did, both scaled by the device's symbol
+//! scale. A device whose icon is an uploaded picture, cannot be read, or is
+//! none keeps the standard symbol and label with either choice, and the
+//! summary says so. Everything else in the export is
+//! the same for both choices, so the drawing is read and the design composed
+//! once; the chosen device blocks are added to a copy when it is written.
 //!
 //! Layer and block names are collision-free: when any of them already exists
 //! (a re-imported earlier export), every new name takes the first free
@@ -46,6 +59,7 @@ use acadrust::{CadDocument, DxfVersion, EntityType};
 use serde::Deserialize;
 
 use super::align::world_to_cad;
+use super::icons::{self, Decoded};
 use super::publish::Mapping;
 use super::session::Format;
 use super::symbols::{self, DeviceKind};
@@ -116,6 +130,11 @@ pub struct Device {
     pub status: String,
     pub position: Point,
     pub rotation_deg: f64,
+    pub symbol_scale: f64,
+    /// The icon the web canvas draws, or `None` for the standard symbol.
+    pub icon_id: Option<String>,
+    /// Equipment's badge ("SW", "NVR").
+    pub badge: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -166,6 +185,9 @@ pub struct Payload {
     pub schema_version: u32,
     pub snapshot: SnapshotId,
     pub options: Options,
+    /// The icons, decoded from base64 (checked by [`icons::parse_list`]).
+    #[serde(skip)]
+    pub icons: Vec<icons::IconData>,
     pub walls: Vec<Wall>,
     pub doors: Vec<Door>,
     pub routes: Vec<Route>,
@@ -184,7 +206,90 @@ pub fn parse_payload(bytes: &[u8]) -> Result<Payload, String> {
     }
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| "The export payload is not JSON.".to_string())?;
     super::protocol::validate_payload("export-payload.schema.json", &value).map_err(|e| format!("The export payload is invalid: {}.", e.0))?;
-    serde_json::from_value(value).map_err(|_| "The export payload is invalid.".to_string())
+    let icons = icons::parse_list(&value["icons"], &value["devices"]).map_err(|e| format!("The export payload is invalid: {e}."))?;
+    let mut payload: Payload = serde_json::from_value(value).map_err(|_| "The export payload is invalid.".to_string())?;
+    payload.icons = icons;
+    Ok(payload)
+}
+
+/// The export dialog's "Device symbols" choice (EXP-02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeviceSymbols {
+    /// Each device as the SecurePlan canvas draws it.
+    #[default]
+    Icons,
+    /// The standard symbol of each device's kind.
+    Standard,
+}
+
+impl DeviceSymbols {
+    pub const LABELS: [&'static str; 2] = ["SecurePlan icons", "Standard symbols"];
+
+    pub fn from_index(index: usize) -> Self {
+        if index == 1 { DeviceSymbols::Standard } else { DeviceSymbols::Icons }
+    }
+}
+
+/// A device, composed, whose block and label are added when the export is
+/// written with the chosen device symbols.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedDevice {
+    pub kind: DeviceKind,
+    pub at: Vector3,
+    pub color: Color,
+    /// CAD angles (radians) of the device's facing and of world +X.
+    pub facing: f64,
+    pub upright: f64,
+    /// Drawing units per world mm.
+    pub unit: f64,
+    pub symbol_scale: f64,
+    /// Its SecurePlan icon block (the name without the prefix), if it has one.
+    pub icon_block: Option<String>,
+    /// The label text: the element's label, else its name, else its kind.
+    pub caption: String,
+}
+
+impl PlacedDevice {
+    /// The label with its SecurePlan icon: centred under the symbol where
+    /// the canvas puts it (per kind, times the symbol scale), turned with
+    /// the symbol by `rotation` (CAD radians).
+    pub fn icon_label(&self, rotation: f64) -> EntityType {
+        let web = self.kind.web();
+        let k = self.unit * self.symbol_scale;
+        let down = (web.label_top + web.label_size / 2.0) * k;
+        // Below the centre in the symbol's frame (y up in CAD).
+        let at = Vector3::new(self.at.x + down * rotation.sin(), self.at.y - down * rotation.cos(), 0.0);
+        let mut text = Text::with_value(&self.caption, at).with_height(web.label_size * symbols::CAP_HEIGHT * k).with_rotation(rotation);
+        text.horizontal_alignment = acadrust::entities::TextHorizontalAlignment::Center;
+        text.vertical_alignment = acadrust::entities::TextVerticalAlignment::Middle;
+        text.alignment_point = Some(at);
+        EntityType::Text(text)
+    }
+
+    /// The label beside the standard symbol, placed as 0.2.1 placed it and
+    /// scaled with the symbol.
+    pub fn standard_label(&self) -> EntityType {
+        let k = self.unit * self.symbol_scale;
+        let height = TEXT_HEIGHT_MM * k;
+        text(&self.caption, Vector3::new(self.at.x + 2.2 * symbols::SYMBOL_RADIUS_MM * k, self.at.y - height / 2.0, 0.0), height)
+    }
+}
+
+/// A SecurePlan icon block to make if the user chooses SecurePlan icons:
+/// its linework is generated only then, when the export is written.
+#[derive(Debug, Clone)]
+pub struct IconSource {
+    /// The block name without the prefix.
+    pub key: String,
+    pub kind: DeviceKind,
+    pub tree: Arc<resvg::usvg::Tree>,
+    pub badge: Option<String>,
+}
+
+impl PartialEq for IconSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
 }
 
 /// What the export adds, for the summary and the tests.
@@ -192,14 +297,28 @@ pub fn parse_payload(bytes: &[u8]) -> Result<Payload, String> {
 pub struct Composition {
     /// Each new layer and how many entities it holds, in creation order.
     pub layers: Vec<(String, usize)>,
-    /// The new symbol blocks.
-    pub blocks: Vec<String>,
+    /// The devices, placed when the export is written ([`place_devices`]).
+    pub placed: Vec<PlacedDevice>,
+    /// The SecurePlan icon blocks, made only when SecurePlan icons are
+    /// chosen; each within [`symbols::MAX_ICON_VERTICES`] and all together
+    /// within [`symbols::MAX_EXPORT_ICON_VERTICES`] generated vertices.
+    pub icon_sources: Vec<IconSource>,
     /// `SECUREPLAN-`, or `SECUREPLAN-<n>-` when the plain names were taken.
     pub prefix: String,
     /// Layers named `SECUREPLAN…` the drawing already had.
     pub existing_secureplan_layers: usize,
-    /// Devices whose catalog icon is a custom raster: drawn with the standard symbol.
+    /// Devices whose catalog icon is a custom raster (`customIcon`).
     pub custom_icons: usize,
+    /// Devices whose icon is an uploaded picture, which has no linework:
+    /// the standard symbol with either choice.
+    pub raster_icons: usize,
+    /// Devices whose SVG icon could not be read: the standard symbol.
+    pub unreadable_icons: usize,
+    /// Devices the web sends without an icon: the standard symbol.
+    pub without_icons: usize,
+    /// Devices whose SVG icon would need more linework than the budgets
+    /// allow: the standard symbol.
+    pub detailed_icons: usize,
     pub walls: usize,
     pub doors: usize,
     pub routes: usize,
@@ -212,8 +331,8 @@ pub struct Composition {
 }
 
 impl Composition {
-    /// The summary lines of the export dialog.
-    pub fn summary(&self) -> Vec<String> {
+    /// The summary lines of the export dialog, for the chosen device symbols.
+    pub fn summary(&self, symbols: DeviceSymbols) -> Vec<String> {
         let optional = |count: Option<usize>, what: &str| match count {
             Some(count) => format!("{count} {what}"),
             None => format!("{what}: not included"),
@@ -236,15 +355,33 @@ impl Composition {
             n if n <= 8 => lines.push(format!("New layers: {}.", names.join(", "))),
             n => lines.push(format!("{n} new layers: {}, …", names[..8].join(", "))),
         }
-        if self.devices > 0 {
-            let shapes: Vec<&str> = DeviceKind::ALL.iter().map(|kind| kind.describe()).collect();
-            lines.push(format!("Devices are standard symbols ({}), labelled with their SecurePlan label.", shapes.join(", ")));
-        }
-        if self.custom_icons > 0 {
-            lines.push(format!(
-                "{} device(s) use a custom icon in SecurePlan; the export draws the standard symbol of their kind instead.",
-                self.custom_icons
-            ));
+        let shapes: Vec<&str> = DeviceKind::ALL.iter().map(|kind| kind.describe()).collect();
+        match symbols {
+            _ if self.devices == 0 => {}
+            DeviceSymbols::Standard => {
+                lines.push(format!("Devices are standard symbols ({}), labelled with their SecurePlan label.", shapes.join(", ")));
+                if self.custom_icons > 0 {
+                    lines.push(format!(
+                        "{} device(s) use a custom icon in SecurePlan; the export draws the standard symbol of their kind instead.",
+                        self.custom_icons
+                    ));
+                }
+            }
+            DeviceSymbols::Icons => {
+                lines.push(
+                    "Devices are drawn as in SecurePlan: a filled circle in the device colour with its icon (and badge), one block per icon, labelled with their SecurePlan label."
+                        .into(),
+                );
+                let standard = [
+                    (self.raster_icons, "use an uploaded picture as their icon, which has no CAD linework"),
+                    (self.unreadable_icons, "have an icon that could not be read"),
+                    (self.without_icons, "have no SecurePlan icon"),
+                    (self.detailed_icons, "have an icon too detailed to convert to CAD linework"),
+                ];
+                for (count, why) in standard.into_iter().filter(|(count, _)| *count > 0) {
+                    lines.push(format!("{count} device(s) {why}; the export draws the standard symbol of their kind ({}) instead.", shapes.join(", ")));
+                }
+            }
         }
         lines.push("Existing drawing content is not changed. Security linework already in the drawing (for example from a re-imported export) stays and may overlap the new layers.".into());
         if self.existing_secureplan_layers > 0 {
@@ -278,15 +415,16 @@ fn layer_color(key: &str) -> i16 {
     }
 }
 
-/// Entities to add, each on a layer given by its key (the name without the prefix).
+/// Entities to add, each on a layer given by its key (the name without the
+/// prefix); `None` holds a device's place until it is written.
 struct Plan {
-    items: Vec<(String, EntityType)>,
+    items: Vec<(String, Option<EntityType>)>,
     kinds: Vec<DeviceKind>,
 }
 
 impl Plan {
     fn add(&mut self, key: &str, entity: EntityType) {
-        self.items.push((key.to_string(), entity));
+        self.items.push((key.to_string(), Some(entity)));
     }
 }
 
@@ -340,6 +478,11 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
     };
     let mut plan = Plan { items: Vec::new(), kinds: Vec::new() };
     let mut composition = Composition::default();
+    // Each icon decoded once: an SVG's tree, or why it has no linework.
+    let decoded: Vec<Option<Decoded>> = payload.icons.iter().map(icons::decode).collect();
+    // Icon blocks over the linework budgets, and the vertices of those kept.
+    let mut detailed: Vec<String> = Vec::new();
+    let mut vertices = 0usize;
 
     for wall in &payload.walls {
         let key = format!("WALL-{}-{}", tag(&wall.material), tag(&wall.status));
@@ -378,18 +521,59 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
         }
         composition.custom_icons += usize::from(device.custom_icon);
         let at = cad(device.position);
-        let mut insert = Insert::new(format!("SYMBOL-{}", kind.tag()), at)
-            .with_uniform_scale(symbols::SYMBOL_RADIUS_MM * unit)
-            .with_rotation(angle(device.position, device.rotation_deg));
-        insert.common.color = rgb(&device.color);
-        plan.add(kind.tag(), EntityType::Insert(insert));
+        let index = device.icon_id.as_ref().and_then(|id| payload.icons.iter().position(|icon| icon.id == *id));
+        let icon_block = match index.map(|i| (&payload.icons[i].id, &decoded[i])) {
+            None => {
+                composition.without_icons += 1;
+                None
+            }
+            Some((_, Some(Decoded::Raster(_)))) => {
+                composition.raster_icons += 1;
+                None
+            }
+            Some((_, None)) => {
+                composition.unreadable_icons += 1;
+                None
+            }
+            Some((id, Some(Decoded::Svg(tree)))) => {
+                let badge = device.badge.as_deref().filter(|_| kind == DeviceKind::Equipment);
+                let key = format!("ICON-{}-{}{}", id.to_ascii_uppercase(), kind.tag(), badge.map(|b| format!("-{b}")).unwrap_or_default());
+                // Counted now, generated only if SecurePlan icons are chosen.
+                if !detailed.contains(&key) && !composition.icon_sources.iter().any(|source| source.key == key) {
+                    let needed = symbols::icon_vertices(kind, tree);
+                    if needed <= symbols::MAX_ICON_VERTICES && vertices + needed <= symbols::MAX_EXPORT_ICON_VERTICES {
+                        vertices += needed;
+                        composition.icon_sources.push(IconSource { key: key.clone(), kind, tree: Arc::clone(tree), badge: badge.map(str::to_string) });
+                    } else {
+                        detailed.push(key.clone());
+                    }
+                }
+                if detailed.contains(&key) {
+                    composition.detailed_icons += 1;
+                    None
+                } else {
+                    Some(key)
+                }
+            }
+        };
         let caption = [device.label.trim(), device.name.trim()].into_iter().find(|s| !s.is_empty()).unwrap_or(match kind {
             DeviceKind::Camera => "Camera",
             DeviceKind::Equipment => "Equipment",
             DeviceKind::Asset => "Asset",
         });
-        let beside = Vector3::new(at.x + 2.2 * symbols::SYMBOL_RADIUS_MM * unit, at.y - height / 2.0, 0.0);
-        plan.add(kind.tag(), text(caption, beside, height));
+        // The symbol and the label take their places when written.
+        plan.items.extend([(kind.tag().to_string(), None), (kind.tag().to_string(), None)]);
+        composition.placed.push(PlacedDevice {
+            kind,
+            at,
+            color: rgb(&device.color),
+            facing: angle(device.position, device.rotation_deg),
+            upright: angle(device.position, 0.0),
+            unit,
+            symbol_scale: device.symbol_scale,
+            icon_block,
+            caption: caption.to_string(),
+        });
     }
     for target in &payload.targets {
         let at = cad(target.position);
@@ -498,7 +682,9 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
         }
     }
     plan.kinds.sort();
-    let block_keys: Vec<String> = plan.kinds.iter().map(|kind| format!("SYMBOL-{}", kind.tag())).collect();
+    // Every block either choice may add.
+    let block_keys: Vec<String> =
+        plan.kinds.iter().map(|kind| format!("SYMBOL-{}", kind.tag())).chain(composition.icon_sources.iter().map(|source| source.key.clone())).collect();
     composition.existing_secureplan_layers =
         document.layers.iter().filter(|layer| layer.name.to_ascii_uppercase().starts_with("SECUREPLAN")).count();
     // One prefix for every new name, the first under which none exists.
@@ -516,23 +702,73 @@ pub fn compose(document: &mut CadDocument, payload: &Payload, mapping: &Mapping)
         layer.color = Color::from_index(layer_color(key));
         let _ = document.layers.add(layer);
     }
-    for (kind, key) in plan.kinds.iter().zip(&block_keys) {
-        define_block(document, &format!("{prefix}{key}"), symbols::symbol(*kind));
-        composition.blocks.push(format!("{prefix}{key}"));
-    }
     let mut counts = vec![0usize; keys.len()];
-    for (key, mut entity) in plan.items {
+    for (key, entity) in plan.items {
         let slot = keys.iter().position(|k| *k == key).expect("listed above");
         counts[slot] += 1;
-        entity.common_mut().layer = format!("{prefix}{key}");
-        if let EntityType::Insert(insert) = &mut entity {
-            insert.block_name = format!("{prefix}{}", insert.block_name);
+        if let Some(mut entity) = entity {
+            entity.common_mut().layer = format!("{prefix}{key}");
+            let _ = document.add_entity(entity);
         }
-        let _ = document.add_entity(entity);
     }
     composition.layers = keys.iter().map(|key| format!("{prefix}{key}")).zip(counts).collect();
     composition.prefix = prefix;
     composition
+}
+
+/// Add the composed devices to `document` with the chosen device symbols:
+/// each device's block (defined once) and label, on its kind's layer.
+/// Returns the blocks defined.
+pub fn place_devices(document: &mut CadDocument, composition: &Composition, choice: DeviceSymbols) -> Vec<String> {
+    let prefix = &composition.prefix;
+    let mut defined: Vec<String> = Vec::new();
+    for device in &composition.placed {
+        let icon = composition
+            .icon_sources
+            .iter()
+            .find(|source| choice == DeviceSymbols::Icons && device.icon_block.as_ref() == Some(&source.key));
+        let (key, content, scale, rotation, mut label) = match icon {
+            Some(source) => {
+                let rotation = if device.kind.web().rotates { device.facing } else { device.upright };
+                // The linework is generated once per block, here.
+                let content = if defined.contains(&format!("{prefix}{}", source.key)) {
+                    Vec::new()
+                } else {
+                    symbols::icon_block(source.kind, &source.tree, source.badge.as_deref())
+                };
+                (source.key.clone(), content, device.unit * device.symbol_scale, rotation, device.icon_label(rotation))
+            }
+            // As with 0.2.1, at the device's symbol scale.
+            None => (
+                format!("SYMBOL-{}", device.kind.tag()),
+                symbols::symbol(device.kind),
+                symbols::SYMBOL_RADIUS_MM * device.unit * device.symbol_scale,
+                device.facing,
+                device.standard_label(),
+            ),
+        };
+        let name = format!("{prefix}{key}");
+        if !defined.contains(&name) {
+            define_block(document, &name, content);
+            defined.push(name.clone());
+        }
+        let layer = format!("{prefix}{}", device.kind.tag());
+        let mut insert = Insert::new(name, device.at).with_uniform_scale(scale).with_rotation(rotation);
+        insert.common.color = device.color;
+        insert.common.layer = layer.clone();
+        let _ = document.add_entity(EntityType::Insert(insert));
+        label.common_mut().layer = layer;
+        let _ = document.add_entity(label);
+    }
+    defined
+}
+
+/// Write the composed export with the chosen device symbols, on a copy of
+/// `document` (on a worker), and check the header.
+pub fn write_export(document: &CadDocument, composition: &Composition, choice: DeviceSymbols, format: Format, version: DxfVersion) -> Result<Vec<u8>, WriteError> {
+    let mut document = document.clone();
+    place_devices(&mut document, composition, choice);
+    write(&document, format, version)
 }
 
 /// Define block `name` with `entities` at the origin. Every handle is newly
@@ -782,14 +1018,18 @@ pub(crate) mod tests {
         samples["samples"].as_array().unwrap().iter().find(|s| s["name"] == "export").unwrap()["value"].clone()
     }
 
-    /// Every row of EXP-02: all included, and a custom icon.
+    /// Every row of EXP-02: all included, and a custom picture icon.
     pub(crate) fn full_payload() -> Payload {
         let mut value = sample_payload();
+        value["icons"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "a0b1c2", "mediaType": "image/png", "data": crate::app::secureplan::icons::tests::b64(&crate::app::secureplan::icons::tests::png_bytes(4, 4)),
+        }));
         value["options"] = serde_json::json!({ "includeNotes": true, "includeCoverage": true });
         value["coverage"] = serde_json::json!([{ "elementId": "camera-1", "polygon": [[6000, 3000], [9000, 3000], [9000, 6000]] }]);
         value["devices"].as_array_mut().unwrap().push(serde_json::json!({
             "id": "reader-1", "kind": "asset", "name": "Card reader", "iconKey": "card-reader", "customIcon": true,
             "color": "#00ff00", "label": "", "status": "In Place", "position": [1000, 2000], "rotationDeg": 0,
+            "symbolScale": 1, "iconId": "a0b1c2", "badge": null,
         }));
         // A wall's own label: an engineering label.
         value["labels"].as_array_mut().unwrap().push(serde_json::json!({ "elementId": "wall-1", "text": "W-01", "position": [6000, 100] }));
@@ -817,6 +1057,7 @@ pub(crate) mod tests {
         let layers_before = document.layers.iter().count();
         let payload = full_payload();
         let composition = compose(&mut document, &payload, &mapping());
+        let blocks = place_devices(&mut document, &composition, DeviceSymbols::Standard);
         // Nothing the drawing had changed.
         for (handle, debug) in &before {
             let entity = document.get_entity(acadrust::types::Handle::new(*handle)).expect("still there");
@@ -831,6 +1072,7 @@ pub(crate) mod tests {
                 "SECUREPLAN-DOOR-IN-PLACE",
                 "SECUREPLAN-ROUTE",
                 "SECUREPLAN-CAMERA",
+                "SECUREPLAN-EQUIPMENT",
                 "SECUREPLAN-ASSET",
                 "SECUREPLAN-TARGET",
                 "SECUREPLAN-DRAWING",
@@ -848,8 +1090,8 @@ pub(crate) mod tests {
         let route: Vec<_> = on_layer(&document, "SECUREPLAN-ROUTE").collect();
         assert!(matches!(route[0], EntityType::LwPolyline(p) if p.vertices.len() == 2));
         assert!(matches!(route[1], EntityType::Text(t) if t.value == "C-01 (Cat6)"));
-        // Devices: symbol blocks with their catalog colour, labelled.
-        assert_eq!(composition.blocks, ["SECUREPLAN-SYMBOL-CAMERA", "SECUREPLAN-SYMBOL-ASSET"]);
+        // Standard symbols: a block per kind with the catalog colour, labelled, as with 0.2.1.
+        assert_eq!(blocks, ["SECUREPLAN-SYMBOL-CAMERA", "SECUREPLAN-SYMBOL-EQUIPMENT", "SECUREPLAN-SYMBOL-ASSET"]);
         let camera: Vec<_> = on_layer(&document, "SECUREPLAN-CAMERA").collect();
         let EntityType::Insert(insert) = camera[0] else { panic!("a symbol") };
         assert_eq!(insert.block_name, "SECUREPLAN-SYMBOL-CAMERA");
@@ -861,7 +1103,7 @@ pub(crate) mod tests {
         assert!(matches!(camera[1], EntityType::Text(t) if t.value == "CAM-01"));
         let asset: Vec<_> = on_layer(&document, "SECUREPLAN-ASSET").collect();
         assert!(matches!(asset[1], EntityType::Text(t) if t.value == "Card reader"), "an empty label falls back to the name");
-        assert_eq!(composition.custom_icons, 1);
+        assert_eq!(composition.custom_icons, 2, "the recorder and the card reader");
         let block = document.block_records.get("SECUREPLAN-SYMBOL-CAMERA").expect("the camera symbol");
         assert_eq!(block.entity_handles.len(), symbols::symbol(DeviceKind::Camera).len());
         // Targets, drawings, labels, notes and coverage.
@@ -882,8 +1124,14 @@ pub(crate) mod tests {
         assert!(matches!(on_layer(&document, "SECUREPLAN-NOTE").next(), Some(EntityType::MText(t)) if t.value == "Synthetic note"));
         assert!(matches!(on_layer(&document, "SECUREPLAN-COVERAGE").next(), Some(EntityType::LwPolyline(p)) if p.is_closed));
         assert_eq!((composition.notes, composition.coverage), (Some(1), Some(1)));
-        assert!(composition.summary().iter().any(|line| line.contains("custom icon")));
-        assert!(composition.summary().iter().any(|line| line.contains("may overlap")));
+        let standard = composition.summary(DeviceSymbols::Standard);
+        assert!(standard.iter().any(|line| line.contains("custom icon")));
+        assert!(standard.iter().any(|line| line.contains("may overlap")));
+        assert!(standard.iter().any(|line| line.contains("Devices are standard symbols")));
+        // The layer counts hold the devices placed when written.
+        for (layer, count) in &composition.layers {
+            assert_eq!(on_layer(&document, layer).count(), *count, "{layer}");
+        }
     }
 
     #[test]
@@ -892,7 +1140,8 @@ pub(crate) mod tests {
         let mapping = Mapping { cad_origin: [100.0, 500.0], anchor_mm: [1000.0, 2000.0], scale_mm_per_cad_unit: 10.0, quarter_turns: 1 };
         let mut document = testutil::synthetic_document();
         let payload = full_payload();
-        compose(&mut document, &payload, &mapping);
+        let composition = compose(&mut document, &payload, &mapping);
+        place_devices(&mut document, &composition, DeviceSymbols::Standard);
         let wall = on_layer(&document, "SECUREPLAN-WALL-GLASS-PROPOSED").next().unwrap();
         let EntityType::LwPolyline(wall) = wall else { panic!("wall linework") };
         for (vertex, world) in wall.vertices.iter().zip([payload.walls[0].start, payload.walls[0].end]) {
@@ -953,18 +1202,25 @@ pub(crate) mod tests {
     fn an_earlier_export_in_the_drawing_is_never_merged_into() {
         let payload = full_payload();
         let mut document = testutil::synthetic_document();
-        compose(&mut document, &payload, &mapping());
+        let first = compose(&mut document, &payload, &mapping());
+        place_devices(&mut document, &first, DeviceSymbols::Icons);
         let first_entities = document.entities().count();
         // Export again from a drawing that already holds the first export.
         let second = compose(&mut document, &payload, &mapping());
         assert_eq!(second.prefix, "SECUREPLAN-2-");
         assert!(second.layers.iter().all(|(name, _)| name.starts_with("SECUREPLAN-2-")));
-        assert_eq!(second.blocks, ["SECUREPLAN-2-SYMBOL-CAMERA", "SECUREPLAN-2-SYMBOL-ASSET"]);
-        assert_eq!(second.existing_secureplan_layers, 10);
+        let blocks = place_devices(&mut document, &second, DeviceSymbols::Standard);
+        assert_eq!(blocks, ["SECUREPLAN-2-SYMBOL-CAMERA", "SECUREPLAN-2-SYMBOL-EQUIPMENT", "SECUREPLAN-2-SYMBOL-ASSET"]);
+        assert_eq!(second.existing_secureplan_layers, 11);
         let first_layer = on_layer(&document, "SECUREPLAN-ROUTE").count();
         assert_eq!(first_layer, 2, "the first export's layers gained nothing");
         assert!(document.entities().count() > first_entities);
-        assert!(second.summary().iter().any(|line| line.contains("SECUREPLAN-2-")));
+        assert!(second.summary(DeviceSymbols::Icons).iter().any(|line| line.contains("SECUREPLAN-2-")));
+        // A drawing holding only an icon block of an earlier export still moves the prefix.
+        let mut document = testutil::synthetic_document();
+        let icon = first.icon_sources[0].key.clone();
+        define_block(&mut document, &format!("SECUREPLAN-{icon}"), Vec::new());
+        assert_eq!(compose(&mut document, &payload, &mapping()).prefix, "SECUREPLAN-2-");
     }
 
     #[test]
@@ -1001,6 +1257,231 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn secureplan_icons_are_one_block_per_icon_kind_and_badge() {
+        use crate::app::secureplan::icons::tests::{b64, png_bytes, CIRCLE_SVG};
+        let mut value = sample_payload();
+        let svg_id = value["icons"][0]["id"].as_str().unwrap().to_string();
+        value["icons"].as_array_mut().unwrap().extend([
+            serde_json::json!({ "id": "p1", "mediaType": "image/png", "data": b64(&png_bytes(4, 4)) }),
+            serde_json::json!({ "id": "bad", "mediaType": "image/svg+xml", "data": b64(b"<svg") }),
+            serde_json::json!({ "id": "c2", "mediaType": "image/svg+xml", "data": b64(CIRCLE_SVG.as_bytes()) }),
+        ]);
+        let device = |id: &str, kind: &str, icon: Option<&str>, badge: Option<&str>, scale: f64, rotation: f64| {
+            serde_json::json!({
+                "id": id, "kind": kind, "name": id, "iconKey": "generic", "customIcon": false, "color": "#336699", "label": id,
+                "status": "Proposed", "position": [1000, 1000], "rotationDeg": rotation, "symbolScale": scale, "iconId": icon, "badge": badge,
+            })
+        };
+        value["devices"].as_array_mut().unwrap().extend([
+            device("camera-2", "camera", Some(&svg_id), None, 1.0, 90.0),
+            device("switch-1", "equipment", Some("c2"), Some("SW"), 2.0, 90.0),
+            device("switch-2", "equipment", Some("c2"), Some("NVR"), 1.0, 0.0),
+            device("photo-1", "asset", Some("p1"), None, 1.0, 0.0),
+            device("broken-1", "asset", Some("bad"), None, 1.0, 0.0),
+        ]);
+        let payload = parse_payload(value.to_string().as_bytes()).unwrap();
+        let mut document = testutil::synthetic_document();
+        let composition = compose(&mut document, &payload, &mapping());
+        assert_eq!((composition.raster_icons, composition.unreadable_icons, composition.without_icons), (1, 1, 1), "nvr-1 has none");
+        let before = document.clone();
+        let blocks = place_devices(&mut document, &composition, DeviceSymbols::Icons);
+        let icon = |id: &str, rest: &str| format!("SECUREPLAN-ICON-{}-{rest}", id.to_ascii_uppercase());
+        assert_eq!(
+            blocks,
+            [
+                icon(&svg_id, "CAMERA"),
+                "SECUREPLAN-SYMBOL-EQUIPMENT".to_string(),
+                icon("c2", "EQUIPMENT-SW"),
+                icon("c2", "EQUIPMENT-NVR"),
+                "SECUREPLAN-SYMBOL-ASSET".to_string(),
+            ],
+            "the two cameras share one block; a badge makes its own"
+        );
+        let inserts: Vec<&Insert> = document
+            .entities()
+            .filter_map(|e| match e {
+                EntityType::Insert(insert) if insert.common.layer.starts_with("SECUREPLAN") => Some(insert),
+                _ => None,
+            })
+            .collect();
+        // Cameras stay upright on the canvas; equipment turns (90° in the
+        // world, y down, is 270° in CAD); the scale is the symbol scale in
+        // drawing units, the colour the device's.
+        assert!(inserts[0].rotation.abs() < 1e-12 && inserts[2].rotation.abs() < 1e-12, "cameras upright");
+        assert!((inserts[3].rotation - 270f64.to_radians()).abs() < 1e-12 && (inserts[3].x_scale() - 2.0).abs() < 1e-12);
+        assert_eq!(inserts[3].common.color, Color::Rgb { r: 0x33, g: 0x66, b: 0x99 });
+        assert!(
+            (inserts[1].x_scale() - symbols::SYMBOL_RADIUS_MM * composition.placed[1].symbol_scale).abs() < 1e-9,
+            "without an icon: the standard symbol, as with 0.2.1, at its symbol scale"
+        );
+        let record = document.block_records.get(&icon("c2", "EQUIPMENT-SW")).unwrap();
+        let content: Vec<&EntityType> = record.entity_handles.iter().filter_map(|h| document.get_entity(*h)).collect();
+        assert!(matches!(content[0], EntityType::Hatch(h) if h.is_solid) && content[0].common().color == Color::ByBlock);
+        assert!(matches!(content.last(), Some(EntityType::Text(t)) if t.value == "SW"));
+        let summary = composition.summary(DeviceSymbols::Icons);
+        assert!(summary.iter().any(|l| l.starts_with("1 device(s) use an uploaded picture")), "{summary:?}");
+        assert!(summary.iter().any(|l| l.starts_with("1 device(s) have an icon that could not be read")));
+        // Standard symbols: one block per kind, exactly as with 0.2.1.
+        let mut standard = before.clone();
+        let blocks = place_devices(&mut standard, &composition, DeviceSymbols::Standard);
+        assert_eq!(blocks, ["SECUREPLAN-SYMBOL-CAMERA", "SECUREPLAN-SYMBOL-EQUIPMENT", "SECUREPLAN-SYMBOL-ASSET"]);
+        let record = standard.block_records.get("SECUREPLAN-SYMBOL-CAMERA").unwrap();
+        assert_eq!(record.entity_handles.len(), symbols::symbol(DeviceKind::Camera).len());
+        let standard_inserts = standard.entities().filter_map(|e| match e {
+            EntityType::Insert(insert) if insert.common.layer.starts_with("SECUREPLAN") => Some(insert),
+            _ => None,
+        });
+        for (insert, placed) in standard_inserts.zip(&composition.placed) {
+            assert!((insert.x_scale() - symbols::SYMBOL_RADIUS_MM * placed.symbol_scale).abs() < 1e-9, "{}: at its symbol scale", placed.caption);
+        }
+        // Both choices place every device and its label.
+        for document in [&document, &standard] {
+            for (layer, count) in &composition.layers {
+                assert_eq!(on_layer(document, layer).count(), *count, "{layer}");
+            }
+        }
+    }
+
+    /// The symbol and its label follow the chosen layout and the device's
+    /// symbol scale: with its SecurePlan icon, the label is centred below
+    /// the symbol at the canvas's per-kind offset and size and turns with it;
+    /// with a standard symbol (chosen, or the fallback), the label sits
+    /// beside it as in 0.2.1, scaled with it. Drawing units of 10 mm, so the
+    /// mapping's scale shows too.
+    #[test]
+    fn labels_and_symbols_follow_the_layout_and_the_symbol_scale() {
+        use crate::app::secureplan::icons::tests::{b64, CIRCLE_SVG};
+        let mut value = sample_payload();
+        value["devices"] = serde_json::json!([]);
+        value["icons"] = serde_json::json!([{ "id": "c2", "mediaType": "image/svg+xml", "data": b64(CIRCLE_SVG.as_bytes()) }]);
+        let cases = [("camera", 0.5, 90.0, true), ("camera", 4.0, 0.0, true), ("equipment", 2.0, 90.0, true), ("asset", 1.0, 0.0, true), ("asset", 3.0, 0.0, false)];
+        for (i, (kind, scale, rotation, icon)) in cases.iter().enumerate() {
+            value["devices"].as_array_mut().unwrap().push(serde_json::json!({
+                "id": format!("d{i}"), "kind": kind, "name": "n", "iconKey": "generic", "customIcon": false, "color": "#336699",
+                "label": format!("D{i}"), "status": "Proposed", "position": [1000, 1000], "rotationDeg": rotation, "symbolScale": scale,
+                "iconId": if *icon { serde_json::json!("c2") } else { serde_json::Value::Null },
+                "badge": if *kind == "equipment" { serde_json::json!("SW") } else { serde_json::Value::Null },
+            }));
+        }
+        let payload = parse_payload(value.to_string().as_bytes()).unwrap();
+        let mapping = Mapping { scale_mm_per_cad_unit: 10.0, ..mapping() };
+        let mut base = testutil::synthetic_document();
+        let composition = compose(&mut base, &payload, &mapping);
+        let centre = world_to_cad(&mapping, [1000.0, 1000.0]);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        for choice in [DeviceSymbols::Icons, DeviceSymbols::Standard] {
+            let mut document = base.clone();
+            place_devices(&mut document, &composition, choice);
+            let on_secureplan = |e: &&EntityType| e.common().layer.starts_with("SECUREPLAN");
+            let inserts: Vec<&Insert> = document.entities().filter(on_secureplan).filter_map(|e| if let EntityType::Insert(i) = e { Some(i) } else { None }).collect();
+            for (i, (kind, scale, rotation, icon)) in cases.iter().enumerate() {
+                let label = document
+                    .entities()
+                    .filter(on_secureplan)
+                    .find_map(|e| match e {
+                        EntityType::Text(t) if t.value == format!("D{i}") => Some(t),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("D{i} has a label"));
+                let k = scale / 10.0; // drawing units per canvas mm
+                if choice == DeviceSymbols::Icons && *icon {
+                    let web = DeviceKind::parse(kind).unwrap().web();
+                    // Cameras stay upright; the others turn (90° in the world is 270° in CAD).
+                    let turn = if web.rotates && *rotation == 90.0 { 270f64.to_radians() } else { 0.0 };
+                    assert!(near(inserts[i].x_scale(), k) && near(inserts[i].rotation, turn), "D{i}: symbol");
+                    let down = (web.label_top + web.label_size / 2.0) * k;
+                    let expected = [centre[0] + down * turn.sin(), centre[1] - down * turn.cos()];
+                    assert_eq!(label.alignment_point, Some(label.insertion_point));
+                    assert!(near(label.insertion_point.x, expected[0]) && near(label.insertion_point.y, expected[1]), "D{i}: {:?} {expected:?}", label.insertion_point);
+                    assert!(near(label.height, web.label_size * 0.7 * k) && near(label.rotation, turn), "D{i}: label size and turn");
+                    // Below the circle and its ring, whatever the scale.
+                    assert!(down - web.label_size * 0.35 * k > (web.radius + web.ring_width / 2.0) * k);
+                } else {
+                    assert!(near(inserts[i].x_scale(), symbols::SYMBOL_RADIUS_MM * k), "D{i}: standard symbol at its scale");
+                    let height = TEXT_HEIGHT_MM * k;
+                    assert!(near(label.height, height) && near(label.rotation, 0.0));
+                    assert!(near(label.insertion_point.x, centre[0] + 2.2 * symbols::SYMBOL_RADIUS_MM * k) && near(label.insertion_point.y, centre[1] - height / 2.0), "D{i}: beside it");
+                }
+            }
+        }
+    }
+
+    /// Adversarial icons cannot make the export allocate without bound: an
+    /// icon block's linework is counted before anything is generated, an
+    /// icon over the per-icon or the export's budget keeps the standard
+    /// symbol (and the summary says so), and nothing is generated at all
+    /// for Standard symbols.
+    #[test]
+    fn icon_linework_is_budgeted_and_made_only_for_secureplan_icons() {
+        use crate::app::secureplan::icons::tests::b64;
+        let icon = |i: usize, d: &str| {
+            let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><title>{i}</title><path d="{d}" fill="none" stroke="#fbfaf4"/></svg>"##);
+            serde_json::json!({ "id": format!("i{i}"), "mediaType": "image/svg+xml", "data": b64(svg.as_bytes()) })
+        };
+        let payload_with = |icons: Vec<serde_json::Value>| {
+            let mut value = sample_payload();
+            let devices: Vec<serde_json::Value> = (0..icons.len())
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("d{i}"), "kind": "asset", "name": "n", "iconKey": "generic", "customIcon": false, "color": "#336699",
+                        "label": format!("D{i}"), "status": "Proposed", "position": [1000, 1000], "rotationDeg": 0, "symbolScale": 1,
+                        "iconId": format!("i{i}"), "badge": null,
+                    })
+                })
+                .collect();
+            value["devices"] = serde_json::json!(devices);
+            value["icons"] = serde_json::json!(icons);
+            parse_payload(value.to_string().as_bytes()).unwrap()
+        };
+        // The review's case: 25 icons of 10,000 cubics with absurd control
+        // points, each over the per-icon budget.
+        let absurd = format!("M0 0{}", "C1e9 0 0 1e9 0 0".repeat(10_000));
+        let payload = payload_with((0..25).map(|i| icon(i, &absurd)).collect());
+        let started = std::time::Instant::now();
+        let mut document = testutil::synthetic_document();
+        let composition = compose(&mut document, &payload, &mapping());
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "counting took {:?}", started.elapsed());
+        assert_eq!(composition.detailed_icons, 25);
+        assert!(composition.icon_sources.is_empty() && composition.placed.iter().all(|d| d.icon_block.is_none()));
+        let summary = composition.summary(DeviceSymbols::Icons);
+        assert!(summary.iter().any(|l| l.starts_with("25 device(s) have an icon too detailed to convert")), "{summary:?}");
+        let blocks = place_devices(&mut document.clone(), &composition, DeviceSymbols::Icons);
+        assert_eq!(blocks, ["SECUREPLAN-SYMBOL-ASSET"], "the standard symbol instead");
+        // Icons within the per-icon budget but over the export's together:
+        // the first ones that fit are kept, in device order.
+        let line = format!("M0 0{}", "h1".repeat(20_000));
+        let payload = payload_with((0..60).map(|i| icon(i, &line)).collect());
+        let mut document = testutil::synthetic_document();
+        let composition = compose(&mut document, &payload, &mapping());
+        let each = 20_001;
+        let kept = symbols::MAX_EXPORT_ICON_VERTICES / each;
+        assert_eq!(composition.icon_sources.len(), kept);
+        assert_eq!(composition.detailed_icons, 60 - kept);
+        assert!(composition.placed[..kept].iter().all(|d| d.icon_block.is_some()) && composition.placed[kept..].iter().all(|d| d.icon_block.is_none()));
+        // Standard symbols generate no icon linework; SecurePlan icons
+        // generate exactly what was counted.
+        let mut standard = document.clone();
+        assert_eq!(place_devices(&mut standard, &composition, DeviceSymbols::Standard), ["SECUREPLAN-SYMBOL-ASSET"]);
+        assert!(!standard.entities().any(|e| matches!(e, EntityType::LwPolyline(p) if p.vertices.len() > 100)));
+        let mut icons = document.clone();
+        place_devices(&mut icons, &composition, DeviceSymbols::Icons);
+        let generated: usize = icons.entities().map(|e| if let EntityType::LwPolyline(p) = e { p.vertices.len() } else { 0 }).filter(|n| *n > 100).sum();
+        assert_eq!(generated, kept * each);
+    }
+
+    #[test]
+    fn export_payloads_follow_the_icon_rules() {
+        for sample in vectors::json("payloads/invalid.json")["samples"].as_array().unwrap() {
+            if sample["schema"] == "export-payload.schema.json" {
+                assert!(parse_payload(sample["value"].to_string().as_bytes()).is_err(), "{}", sample["name"]);
+            }
+        }
+        let payload = parse_payload(sample_payload().to_string().as_bytes()).unwrap();
+        assert_eq!(payload.icons.len(), 1);
+        assert_eq!(payload.devices[1].badge.as_deref(), Some("NVR"));
+    }
+
+    #[test]
     fn the_default_is_the_applied_drawings_format_and_version() {
         assert_eq!(choice(default_choice(Format::Dxf, "AC1018")), (Format::Dxf, DxfVersion::AC1018));
         assert_eq!(choice(default_choice(Format::Dwg, "AC1032")), (Format::Dwg, DxfVersion::AC1032));
@@ -1020,7 +1501,9 @@ pub(crate) mod tests {
             };
             let user = own(&document);
             let composition = compose(&mut document, &payload, &mapping());
-            let bytes = write(&document, format, DxfVersion::AC1032).unwrap();
+            let choice = if format == Format::Dwg { DeviceSymbols::Icons } else { DeviceSymbols::Standard };
+            let bytes = write_export(&document, &composition, choice, format, DxfVersion::AC1032).unwrap();
+            let blocks = place_devices(&mut document.clone(), &composition, choice);
             let name = format!("export.{}", format.ext());
             let reread = crate::io::load_bytes(&name, bytes).expect("the export reopens");
             for (layer, count) in &composition.layers {
@@ -1030,8 +1513,14 @@ pub(crate) mod tests {
             }
             let cam = reread.entities().filter(|e| matches!(e, EntityType::Text(t) if t.value == "CAM-01")).count();
             assert_eq!(cam, 1, "{format:?}: the device label appears once");
-            for block in &composition.blocks {
+            for block in &blocks {
                 assert!(reread.block_records.get(block).is_some_and(|b| !b.entity_handles.is_empty()), "{format:?}: block {block}");
+            }
+            if choice == DeviceSymbols::Icons {
+                let icon = blocks.iter().find(|b| b.contains("-ICON-")).expect("an icon block");
+                let record = reread.block_records.get(icon).unwrap();
+                let hatches = record.entity_handles.iter().filter(|h| matches!(reread.get_entity(**h), Some(EntityType::Hatch(_)))).count();
+                assert!(hatches >= 1, "{format:?}: the filled circle survives");
             }
             assert_eq!(own(&reread), user, "{format:?}: the drawing's own entities");
         }

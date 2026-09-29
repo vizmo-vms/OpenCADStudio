@@ -460,7 +460,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e}", sample["name"]));
         }
         for sample in vectors::json("payloads/invalid.json")["samples"].as_array().unwrap() {
-            assert!(validate_payload(sample["schema"].as_str().unwrap(), &sample["value"]).is_err(), "{}", sample["name"]);
+            let result = validate_payload(sample["schema"].as_str().unwrap(), &sample["value"]);
+            match sample["layer"].as_str() {
+                // Semantic samples pass the schema and break the icon rules.
+                Some("semantic") => {
+                    assert!(result.is_ok(), "{}", sample["name"]);
+                    let value = &sample["value"];
+                    assert!(super::super::icons::parse_list(&value["icons"], &value["devices"]).is_err(), "{}", sample["name"]);
+                }
+                _ => assert!(result.is_err(), "{}", sample["name"]),
+            }
         }
     }
 

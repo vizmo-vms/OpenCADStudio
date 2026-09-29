@@ -21,6 +21,26 @@
     "cadUnits": { "enum": ["mm", "cm", "m", "in", "ft", "unitless"] },
     "wallMaterial": { "enum": ["solid", "glass", "fence", "opening"] },
     "status": { "enum": ["Proposed", "In Place", "To Be Replaced", "To Be Upgraded", "To Be Removed"] },
+    "iconId": { "type": "string", "pattern": "^[a-z0-9]{1,32}$" },
+    "icon": {
+      "description": "One device icon: the exact bytes the web canvas draws. data is standard padded base64 (RFC 4648 section 4, so its length is a multiple of 4) of 1 to 262144 bytes. The web sets id to the first 16 lowercase hex characters of SHA-256(UTF-8 mediaType || 0x00 || bytes); a receiver treats it as an opaque key.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "mediaType", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/iconId" },
+        "mediaType": { "enum": ["image/svg+xml", "image/png", "image/jpeg", "image/webp"] },
+        "data": { "type": "string", "maxLength": 349528, "pattern": "^[A-Za-z0-9+/]*={0,2}$" }
+      }
+    },
+    "icons": {
+      "description": "Semantic rules both sides enforce beyond this schema: icon ids are unique; every device iconId names an entry here; each data value is canonical padded base64 whose decoded bytes are non-empty and at most 262144.",
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/icon" }
+    },
+    "symbolScale": { "description": "The element's symbol scale (MIN_SYMBOL_SCALE..MAX_SYMBOL_SCALE in src/domain.ts), 1 when unset.", "type": "number", "minimum": 0.25, "maximum": 4 },
+    "badge": { "description": "The equipment text the web canvas draws under the icon: SW for a switch, NVR otherwise; null for cameras and assets.", "enum": [null, "SW", "NVR"] },
     "mapping": {
       "description": "CAD model to world mm. d = ((cx - ox) * s, -(cy - oy) * s); world = anchorMm + rot(quarterTurns, d).",
       "type": "object",

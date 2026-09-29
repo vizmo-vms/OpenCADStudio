@@ -86,7 +86,8 @@ pub enum BridgeEvent {
 /// What the application asks a session to send.
 enum Outbound {
     Message(Value),
-    Transfer { id: u32, name: String, media_type: String, bytes: Arc<Vec<u8>> },
+    /// `sent` counts the bytes handed to the socket, for Apply's progress.
+    Transfer { id: u32, name: String, media_type: String, bytes: Arc<Vec<u8>>, sent: Option<Arc<AtomicU64>> },
     Close(&'static str),
     Confirmed,
 }
@@ -235,10 +236,23 @@ impl Bridge {
     /// later message can reference: transfers and messages are sent in the
     /// order they are queued, so the transfer always precedes that message.
     pub fn send_transfer(&self, session: SessionId, name: &str, media_type: &str, bytes: Arc<Vec<u8>>) -> Option<u32> {
+        self.send_transfer_counted(session, name, media_type, bytes, None)
+    }
+
+    /// [`Self::send_transfer`], adding each chunk's payload bytes to `sent`
+    /// once it is handed to the socket.
+    pub fn send_transfer_counted(
+        &self,
+        session: SessionId,
+        name: &str,
+        media_type: &str,
+        bytes: Arc<Vec<u8>>,
+        sent: Option<Arc<AtomicU64>>,
+    ) -> Option<u32> {
         let mut sessions = lock(&self.shared.sessions);
         let entry = sessions.get_mut(&session)?;
         let id = entry.next_transfer;
-        let transfer = Outbound::Transfer { id, name: name.to_string(), media_type: media_type.to_string(), bytes };
+        let transfer = Outbound::Transfer { id, name: name.to_string(), media_type: media_type.to_string(), bytes, sent };
         entry.outbound.send(transfer).ok()?;
         entry.next_transfer = id.checked_add(1)?;
         Some(id)
@@ -492,12 +506,16 @@ fn run_session(shared: Arc<Shared>, mut socket: Socket, mut established: Establi
         while let Some(item) = queued.pop_front() {
             let result = match item {
                 Outbound::Message(message) => send_control(&mut socket, &mut established.sealer, &message),
-                Outbound::Transfer { id, name, media_type, bytes } => {
+                Outbound::Transfer { id, name, media_type, bytes, sent } => {
                     let start = protocol::transfer_start(&next_request_id(&mut established.request_ids), id, &name, &media_type, &bytes);
                     send_control(&mut socket, &mut established.sealer, &start).and_then(|()| {
-                        transfer::chunks(id, &bytes).try_for_each(|chunk| {
+                        transfer::chunks(id, &bytes).zip(bytes.chunks(transfer::MAX_CHUNK_PAYLOAD)).try_for_each(|(chunk, payload)| {
                             let sealed = established.sealer.seal(FrameKind::Chunk, &chunk).map_err(|_| ())?;
-                            socket.send(Message::binary(sealed)).map_err(|_| ())
+                            socket.send(Message::binary(sealed)).map_err(|_| ())?;
+                            if let Some(sent) = &sent {
+                                sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            }
+                            Ok(())
                         })
                     })
                 }
