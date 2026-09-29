@@ -224,6 +224,9 @@ impl Form {
     }
 }
 
+/// The title of the dialog shown while a drawing check runs.
+const CHECKING: &str = "Checking the drawing";
+
 /// A SecurePlan dialog. One shows at a time, above the editor.
 #[derive(Debug, Clone)]
 pub enum Dialog {
@@ -255,6 +258,23 @@ impl Dialog {
             started: std::time::Instant::now(),
             form: Form::new(Vec::new(), vec![("Cancel".to_string(), Action::CancelLoad(tab_id))], Action::CancelLoad(tab_id)),
         }
+    }
+
+    /// Waiting for the drawing check that opens Align or Apply for tab
+    /// `tab_id`; Cancel (or Escape) closes it and the check's result is dropped.
+    pub fn checking(tab_id: u64) -> Self {
+        Dialog::Progress {
+            tab_id,
+            title: CHECKING.to_string(),
+            text: "Checking the drawing…".to_string(),
+            started: std::time::Instant::now(),
+            form: Form::new(Vec::new(), vec![("Cancel".to_string(), Action::Dismiss)], Action::Dismiss),
+        }
+    }
+
+    /// Whether this is [`Self::checking`] for tab `tab_id`.
+    pub fn is_checking(&self, tab_id: u64) -> bool {
+        matches!(self, Dialog::Progress { tab_id: id, title, .. } if *id == tab_id && title == CHECKING)
     }
 
     pub fn form_mut(&mut self) -> &mut Form {

@@ -91,6 +91,8 @@ pub enum Msg {
     Loaded(super::import::LoadDone),
     /// Apply's outputs finished building on a worker.
     ApplyBuilt(super::session::ApplyBuilt),
+    /// The drawing check that opens Align or Apply finished on a worker.
+    Checked(super::session::Checked),
     /// Conversion candidates were assembled on a worker.
     Converted(super::convert::Done),
     /// An export's drawing was read and the design added, on a worker.
@@ -151,6 +153,8 @@ pub struct State {
     pub apply_progress: Option<Box<super::ui::apply_progress::ApplyProgress>>,
     /// The alignment dialog, hidden while a length is measured in the drawing.
     pub measuring: Option<super::ui::align_dialog::Measuring>,
+    /// The Align or Apply dialog waiting for its drawing check.
+    pub checking: Option<super::session::Checking>,
     pub recovery: super::recovery::Store,
     /// Whether the read-only design overlay is drawn (OVL-01).
     pub overlay_visible: bool,
@@ -213,6 +217,7 @@ impl Default for State {
             dialog: None,
             apply_progress: None,
             measuring: None,
+            checking: None,
             recovery: Default::default(),
             overlay_visible: true,
             next_job: 0,
@@ -538,6 +543,10 @@ impl OpenCADStudio {
             Msg::ApplyBuilt(built) => {
                 self.secureplan_worker_done();
                 self.secureplan_apply_built(built)
+            }
+            Msg::Checked(done) => {
+                self.secureplan_worker_done();
+                self.secureplan_checked(done)
             }
             Msg::Converted(done) => {
                 self.secureplan_worker_done();
@@ -1166,7 +1175,7 @@ impl OpenCADStudio {
                 self.secureplan.dialog = Some(Dialog::choice("SecurePlan", vec!["Choose a SecurePlan action.".to_string()], buttons));
             }
             "SECUREPLANIMPORT" => return Some(self.secureplan_start_import(self.tabs[self.active_tab].id)),
-            "SECUREPLANALIGN" => self.secureplan_open_align(false),
+            "SECUREPLANALIGN" => return Some(self.secureplan_open_align(false)),
             "SECUREPLANAPPLY" => return Some(self.secureplan_begin_apply()),
             "SECUREPLANCONVERT" => match argument.map(super::convert::Kind::parse) {
                 None => return Some(self.secureplan_open_convert(None)),

@@ -1340,17 +1340,41 @@ pub const MAX_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
 /// fraction of the extents' width (x) and height (y).
 pub const WINDOW_MARGIN: f64 = 0.02;
 
+/// What [`visible_extents`] reads from the scene the user sees: on model
+/// space, the model's plot wires as the view holds them (shared, not
+/// copied) and whether the edges of 3-D fills show; on a paper layout,
+/// nothing.
+#[derive(Clone)]
+pub struct ViewWires(Option<(std::sync::Arc<Vec<crate::scene::WireModel>>, bool)>);
+
+impl ViewWires {
+    pub fn of(scene: &crate::scene::Scene) -> Self {
+        if scene.current_layout != "Model" {
+            return Self(None);
+        }
+        let flags = crate::scene::view::render::render_mode_flags(scene.active_model_tile_render_mode());
+        Self(Some((scene.entity_wires(), flags.show_3d_edges)))
+    }
+}
+
 /// The extents of the model-space geometry the published view draws (what
 /// plots: off, frozen and non-plotting layers excluded; lines and fills), as
 /// `[x0, y0, x1, y1]`.
 pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
-    if scene.current_layout != "Model" {
-        let (min, max) = scene.model_space_extents()?;
+    visible_extents_of(&ViewWires::of(scene), scene)
+}
+
+/// [`visible_extents`] from the view's `wires`, with the fills (and, on a
+/// paper layout, the model's extents) read from `drawing`, a scene on model
+/// space holding the same drawing.
+pub fn visible_extents_of(wires: &ViewWires, drawing: &crate::scene::Scene) -> Option<[f64; 4]> {
+    let Some((wires, edges_3d)) = &wires.0 else {
+        let (min, max) = drawing.model_space_extents()?;
         return Some([min.x as f64, min.y as f64, max.x as f64, max.y as f64]);
-    }
-    let (wires, _) = scene.plot_wire_groups(None);
+    };
     let mut extents = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-    for wire in wires.iter().filter(|wire| wire.plot_visible) {
+    // The render mode hides the edges of 3-D fills when it does not show them.
+    for wire in wires.iter().filter(|wire| wire.plot_visible && (*edges_3d || !wire.fill_is_3d)) {
         for (index, [x, y, _]) in wire.points.iter().enumerate() {
             let [lx, ly, _] = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
             let (x, y) = (*x as f64 + lx as f64, *y as f64 + ly as f64);
@@ -1360,7 +1384,7 @@ pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
         }
     }
     // A solid fill has no lines.
-    for fill in scene.paper_plot_hatches().iter().chain(scene.paper_plot_wipeouts().iter()) {
+    for fill in drawing.paper_plot_hatches().iter().chain(drawing.paper_plot_wipeouts().iter()) {
         for [x, y] in fill.boundary.iter() {
             let (x, y) = (fill.world_origin[0] + *x as f64, fill.world_origin[1] + *y as f64);
             if x.is_finite() && y.is_finite() {
@@ -1369,6 +1393,24 @@ pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
         }
     }
     extents.iter().all(|v| v.is_finite()).then_some(extents)
+}
+
+/// A drawing's visible extents (if it shows anything) and its paper layouts.
+pub type DrawingCheck = (Option<[f64; 4]>, Vec<super::ui::apply_dialog::LayoutChoice>);
+
+/// What opens Align and Apply, checked off the UI thread on a copy of the
+/// drawing (`document`, taken when the user asked): its visible extents
+/// from the view's `wires` and, when `layouts`, its paper layouts that can
+/// be published. On a large drawing these take seconds (the fills and
+/// each layout's viewport are tessellated), so they never run in an update.
+pub fn check_drawing(document: acadrust::CadDocument, annotation_scale: f32, wires: &ViewWires, layouts: bool) -> DrawingCheck {
+    let mut scene = crate::scene::Scene::new();
+    scene.document = document;
+    scene.annotation_scale = annotation_scale;
+    scene.rebuild_derived_caches();
+    let extents = visible_extents_of(wires, &scene);
+    let layouts = if layouts { super::layout::references(&scene) } else { Vec::new() };
+    (extents, layouts)
 }
 
 /// The default published window: the visible extents with a 2% margin on
