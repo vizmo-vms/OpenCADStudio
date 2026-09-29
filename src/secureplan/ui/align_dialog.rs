@@ -55,6 +55,27 @@ pub struct AlignDialog {
     pub measure_problem: Option<String>,
 }
 
+/// The alignment dialog but for the drawing's extents, which are checked
+/// on a worker.
+#[derive(Debug)]
+pub struct AlignStart {
+    declared: Option<Units>,
+    before: Option<Alignment>,
+    empty_survey: bool,
+    then_apply: bool,
+    opened_for: (Option<crate::app::secureplan::bridge::SessionId>, u64),
+}
+
+impl AlignStart {
+    /// The dialog for tab `tab_id`, whose drawing has the visible `extents`.
+    pub fn dialog(self, tab_id: u64, extents: [f64; 4]) -> AlignDialog {
+        let window = crate::app::secureplan::publish::default_window(extents);
+        let mut dialog = AlignDialog::new(tab_id, self.declared, self.before, self.empty_survey, window, self.then_apply);
+        dialog.opened_for = self.opened_for;
+        dialog
+    }
+}
+
 fn unit_options() -> Vec<String> {
     let mut options = vec![CHOOSE.to_string()];
     options.extend(Units::CHOICES.iter().map(|u| u.as_str().to_string()));
@@ -344,26 +365,27 @@ impl OpenCADStudio {
         self.secureplan.sessions.by_tab(dialog.tab_id).is_some_and(|bound| (bound.session, bound.generation) == dialog.opened_for)
     }
 
-    /// Open the alignment dialog for the active bound document.
-    pub(crate) fn secureplan_open_align(&mut self, then_apply: bool) {
+    /// Open the alignment dialog once the drawing's extents are checked (on
+    /// a worker: see [`OpenCADStudio::secureplan_check_drawing`]).
+    pub(crate) fn secureplan_open_align(&mut self, then_apply: bool) -> iced::Task<Message> {
         if let Err(message) = self.secureplan_can_edit_survey() {
             self.command_line.push_error(&message);
-            return;
+            return iced::Task::none();
         }
         let index = self.active_tab;
-        let _ = self.cancel_active_command_for_space_change();
+        let cancelled = self.cancel_active_command_for_space_change();
         self.secureplan.measuring = None;
         let tab = &self.tabs[index];
-        let Some(bound) = self.secureplan.sessions.by_tab(tab.id) else { return };
-        let Some(extents) = crate::app::secureplan::publish::visible_extents(&tab.scene) else {
-            self.command_line.push_error("SecurePlan: the drawing has nothing to align.");
-            return;
+        let Some(bound) = self.secureplan.sessions.by_tab(tab.id) else { return cancelled };
+        let start = AlignStart {
+            declared: Units::declared(tab.scene.document.header.insertion_units),
+            before: bound.alignment,
+            empty_survey: crate::app::secureplan::session::survey_is_empty(bound),
+            then_apply,
+            opened_for: (bound.session, bound.generation),
         };
-        let declared = Units::declared(tab.scene.document.header.insertion_units);
-        let empty = crate::app::secureplan::session::survey_is_empty(bound);
-        let mut dialog = AlignDialog::new(tab.id, declared, bound.alignment, empty, crate::app::secureplan::publish::default_window(extents), then_apply);
-        dialog.opened_for = (bound.session, bound.generation);
-        self.secureplan.dialog = Some(Dialog::Align(Box::new(dialog)));
+        let check = self.secureplan_check_drawing(index, crate::app::secureplan::session::CheckThen::Align(start));
+        iced::Task::batch([cancelled, check])
     }
 
     /// The mapping the alignment dialog currently proposes, for the overlay.

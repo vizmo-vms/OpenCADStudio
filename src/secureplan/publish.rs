@@ -237,8 +237,8 @@ pub struct ViewLayer {
 pub struct ViewContext {
     /// The block drawn: model space, or a layout's paper space.
     pub model_block: acadrust::types::Handle,
-    pub frozen: rustc_hash::FxHashSet<acadrust::types::Handle>,
-    pub annotation_scale: Option<acadrust::types::Handle>,
+    pub frozen: rustc_hash::FxHashSet<acadrust::Handle>,
+    pub annotation_scale: Option<acadrust::Handle>,
     pub annotation_multiplier: f32,
     /// Annotative objects of other scales are shown (the layout's setting).
     pub all_visible: bool,
@@ -1101,7 +1101,7 @@ pub fn prepare_layout(source: &crate::scene::Scene, reference: &super::layout::L
 
     // Each viewport's outline on the page: its rectangle and any boundary
     // it is clipped to, cut within the tolerance and kept in f64.
-    let outline = |rect: [f64; 4], boundary: Option<acadrust::types::Handle>| -> Result<Vec<Vec<[f64; 2]>>, String> {
+    let outline = |rect: [f64; 4], boundary: Option<acadrust::Handle>| -> Result<Vec<Vec<[f64; 2]>>, String> {
         let [x0, y0, x1, y1] = rect;
         let mut clips = vec![[[x0, y0], [x1, y0], [x1, y1], [x0, y1]].iter().map(|p| page_point(&paper, *p)).collect()];
         if let Some(handle) = boundary {
@@ -1340,17 +1340,74 @@ pub const MAX_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
 /// fraction of the extents' width (x) and height (y).
 pub const WINDOW_MARGIN: f64 = 0.02;
 
-/// The extents of the model-space geometry the published view draws (what
-/// plots: off, frozen and non-plotting layers excluded; lines and fills), as
-/// `[x0, y0, x1, y1]`.
-pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
-    if scene.current_layout != "Model" {
-        let (min, max) = scene.model_space_extents()?;
-        return Some([min.x as f64, min.y as f64, max.x as f64, max.y as f64]);
+/// What the user sees of a drawing, taken from its scene for
+/// [`check_drawing`]: on model space the model's plot wires as the view
+/// holds them (shared, not copied) and whether the edges of 3-D fills show,
+/// and the view state that decides what else shows (the layout, objects
+/// hidden or isolated for now, a block being edited, the active viewport).
+/// The drawing itself (layers, their freezes and viewport overrides) is
+/// copied with the document.
+#[derive(Clone)]
+pub struct ViewState {
+    wires: Option<(std::sync::Arc<Vec<crate::scene::WireModel>>, bool)>,
+    layout: String,
+    isolation: crate::scene::ObjectIsolationState,
+    block_edit: Option<acadrust::Handle>,
+    active_viewport: Option<acadrust::Handle>,
+    annotation_scale: f32,
+}
+
+impl ViewState {
+    pub fn of(scene: &crate::scene::Scene) -> Self {
+        let wires = (scene.current_layout == "Model").then(|| {
+            let flags = crate::scene::view::render::render_mode_flags(scene.active_model_tile_render_mode());
+            (scene.entity_wires(), flags.show_3d_edges)
+        });
+        Self {
+            wires,
+            layout: scene.current_layout.clone(),
+            isolation: scene.object_isolation.clone(),
+            block_edit: scene.block_edit_block,
+            active_viewport: scene.active_viewport,
+            annotation_scale: scene.annotation_scale,
+        }
     }
-    let (wires, _) = scene.plot_wire_groups(None);
+
+    /// A scene of `document` in this view (nothing derived from the view is
+    /// warm yet).
+    fn scene(&self, document: acadrust::CadDocument) -> crate::scene::Scene {
+        let mut scene = crate::scene::Scene::new();
+        scene.document = document;
+        scene.annotation_scale = self.annotation_scale;
+        scene.rebuild_derived_caches();
+        if self.layout != scene.current_layout {
+            scene.set_current_layout(self.layout.clone());
+        }
+        scene.active_viewport = self.active_viewport;
+        scene.block_edit_block = self.block_edit;
+        scene.object_isolation = self.isolation.clone();
+        scene
+    }
+}
+
+/// The extents of the model-space geometry the published view draws (what
+/// plots: off, frozen and non-plotting layers and hidden objects excluded;
+/// lines and fills), as `[x0, y0, x1, y1]`.
+pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
+    visible_extents_of(&ViewState::of(scene), scene)
+}
+
+/// [`visible_extents`] from the `view`'s wires, with the fills (and, on a
+/// paper layout, the model's extents) read from `drawing`, a scene of the
+/// same drawing in that view.
+fn visible_extents_of(view: &ViewState, drawing: &crate::scene::Scene) -> Option<[f64; 4]> {
+    let Some((wires, edges_3d)) = &view.wires else {
+        let (min, max) = drawing.model_space_extents()?;
+        return Some([min.x as f64, min.y as f64, max.x as f64, max.y as f64]);
+    };
     let mut extents = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-    for wire in wires.iter().filter(|wire| wire.plot_visible) {
+    // The render mode hides the edges of 3-D fills when it does not show them.
+    for wire in wires.iter().filter(|wire| wire.plot_visible && (*edges_3d || !wire.fill_is_3d)) {
         for (index, [x, y, _]) in wire.points.iter().enumerate() {
             let [lx, ly, _] = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
             let (x, y) = (*x as f64 + lx as f64, *y as f64 + ly as f64);
@@ -1360,7 +1417,7 @@ pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
         }
     }
     // A solid fill has no lines.
-    for fill in scene.paper_plot_hatches().iter().chain(scene.paper_plot_wipeouts().iter()) {
+    for fill in drawing.paper_plot_hatches().iter().chain(drawing.paper_plot_wipeouts().iter()) {
         for [x, y] in fill.boundary.iter() {
             let (x, y) = (fill.world_origin[0] + *x as f64, fill.world_origin[1] + *y as f64);
             if x.is_finite() && y.is_finite() {
@@ -1369,6 +1426,21 @@ pub fn visible_extents(scene: &crate::scene::Scene) -> Option<[f64; 4]> {
         }
     }
     extents.iter().all(|v| v.is_finite()).then_some(extents)
+}
+
+/// A drawing's visible extents (if it shows anything) and its paper layouts.
+pub type DrawingCheck = (Option<[f64; 4]>, Vec<super::ui::apply_dialog::LayoutChoice>);
+
+/// What opens Align and Apply, checked off the UI thread on a copy of the
+/// drawing (`document`, taken when the user asked) as `view` shows it: its
+/// visible extents and, when `layouts`, its paper layouts that can be
+/// published. On a large drawing these take seconds (the fills and each
+/// layout's viewport are tessellated), so they never run in an update.
+pub fn check_drawing(document: acadrust::CadDocument, view: &ViewState, layouts: bool) -> DrawingCheck {
+    let scene = view.scene(document);
+    let extents = visible_extents_of(view, &scene);
+    let layouts = if layouts { super::layout::references(&scene) } else { Vec::new() };
+    (extents, layouts)
 }
 
 /// The default published window: the visible extents with a 2% margin on
@@ -2021,7 +2093,7 @@ pub(crate) mod tests {
     }
 
     /// The images a plain (not SecurePlan) scene of `doc` decodes.
-    pub(crate) fn scene_images(doc: CadDocument) -> Vec<acadrust::types::Handle> {
+    pub(crate) fn scene_images(doc: CadDocument) -> Vec<acadrust::Handle> {
         crate::app::secureplan::snap::tests::scene_of(doc).images.keys().copied().collect()
     }
 
@@ -2043,6 +2115,31 @@ pub(crate) mod tests {
         doc.add_entity(EntityType::Line(far)).unwrap();
         let hidden_extents = visible_extents(&crate::app::secureplan::snap::tests::scene_of(doc)).unwrap();
         assert!(hidden_extents[2] < 31000.0, "{hidden_extents:?}");
+    }
+
+    /// The drawing check runs on a fresh scene of a copy of the document:
+    /// objects hidden for now (HIDEOBJECTS) stay hidden there, so a hidden
+    /// solid fill far away does not widen the default window.
+    #[test]
+    fn the_drawing_check_keeps_objects_hidden_in_the_view() {
+        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        let mut doc = synthetic_dxf_scene().document.clone();
+        let (x, y) = (1.0e5, 1.0e5);
+        let mut path = BoundaryPath::new();
+        let corners = [[x, y], [x + 100.0, y], [x + 100.0, y + 100.0], [x, y + 100.0]];
+        path.add_edge(BoundaryEdge::Polyline(PolylineEdge { vertices: corners.iter().map(|[x, y]| Vector3::new(*x, *y, 0.0)).collect(), is_closed: true }));
+        let mut hatch = Hatch::new();
+        hatch.is_solid = true;
+        hatch.paths.push(path);
+        let handle = doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+        let mut scene = crate::app::secureplan::snap::tests::scene_of(doc);
+        let shown = check_drawing(scene.document.clone(), &ViewState::of(&scene), false).0.unwrap();
+        assert!(shown[2] > 1.0e5, "the fill counts while shown: {shown:?}");
+        scene.select_entity(handle, true);
+        scene.hide_selected();
+        let hidden = check_drawing(scene.document.clone(), &ViewState::of(&scene), false).0.unwrap();
+        assert!(hidden[2] < 31000.0, "{hidden:?}");
+        assert_eq!(Some(hidden), visible_extents(&scene), "the check sees what the view shows");
     }
 
     #[test]

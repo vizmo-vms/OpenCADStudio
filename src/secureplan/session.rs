@@ -1151,6 +1151,94 @@ pub struct ApplyBuilt {
     pub result: super::Carry<Result<super::publish::ApplyOutputs, super::publish::ApplyError>>,
 }
 
+/// The Apply dialog of tab `tab_id` from `start` and its drawing check.
+fn apply_dialog_from(
+    tab_id: u64,
+    start: ApplyStart,
+    extents: [f64; 4],
+    layouts: Vec<super::ui::apply_dialog::LayoutChoice>,
+) -> super::ui::apply_dialog::ApplyDialog {
+    let mut dialog = super::ui::apply_dialog::ApplyDialog::new(
+        tab_id,
+        start.snapshot,
+        start.revision,
+        extents,
+        start.alignment,
+        start.empty_survey,
+        start.realigned,
+        start.plan_version,
+        layouts,
+    );
+    dialog.origin = start.origin;
+    // A paper layout the user is on starts chosen when it can be published.
+    if dialog.layouts.iter().any(|(name, found)| *name == start.layout && found.is_ok()) {
+        dialog.select_view(Some(&start.layout));
+    }
+    dialog
+}
+
+/// A drawing check finished on a worker ([`super::publish::check_drawing`]):
+/// the visible extents and the paper layouts.
+#[derive(Debug, Clone)]
+pub struct Checked {
+    pub job: u64,
+    /// `None` when the worker failed.
+    pub result: super::Carry<Option<super::publish::DrawingCheck>>,
+}
+
+/// A dialog waiting for its drawing check, with everything else it shows,
+/// taken when the user asked.
+#[derive(Debug)]
+pub struct Checking {
+    pub job: u64,
+    pub tab_id: u64,
+    /// The session and document generation the user asked under.
+    pub opened_for: (Option<super::bridge::SessionId>, u64),
+    pub then: CheckThen,
+}
+
+/// A drawing check waiting for the running one to finish (checks run one at
+/// a time; only the latest waits, and it starts only if still wanted).
+pub struct PendingCheck {
+    job: u64,
+    drawing: CheckDrawing,
+    view: super::publish::ViewState,
+    layouts: bool,
+}
+
+impl std::fmt::Debug for PendingCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PendingCheck({})", self.job)
+    }
+}
+
+/// The copy of the drawing a check reads: Align's, taken when asked, or
+/// Apply's snapshot (copied again on the worker).
+enum CheckDrawing {
+    Copy(Box<acadrust::CadDocument>),
+    Snapshot(Arc<super::publish::Snapshot>),
+}
+
+#[derive(Debug)]
+pub enum CheckThen {
+    Align(super::ui::align_dialog::AlignStart),
+    Apply(Box<ApplyStart>),
+}
+
+/// The Apply dialog but for what the drawing check finds.
+#[derive(Debug)]
+pub struct ApplyStart {
+    snapshot: Arc<super::publish::Snapshot>,
+    revision: u64,
+    alignment: Alignment,
+    empty_survey: bool,
+    realigned: bool,
+    plan_version: Option<u64>,
+    origin: ApplyOrigin,
+    /// The layout the user is on.
+    layout: String,
+}
+
 impl OpenCADStudio {
     // ── Apply (PUB-03, PUB-04) ──────────────────────────────────────────────
 
@@ -1167,27 +1255,34 @@ impl OpenCADStudio {
         let tab_id = self.tabs[index].id;
         let bound = self.secureplan.sessions.by_tab(tab_id).expect("checked above");
         if bound.alignment.is_none() {
-            self.secureplan_open_align(true);
-            return Task::none();
+            return self.secureplan_open_align(true);
         }
         let cancelled = self.cancel_active_command_for_space_change();
-        let Some(dialog) = self.secureplan_apply_dialog(index) else {
-            self.command_line.push_error("SecurePlan: the drawing has nothing to publish.");
-            return cancelled;
-        };
-        self.secureplan.dialog = Some(super::ui::Dialog::Apply(Box::new(dialog)));
+        let Some(start) = self.secureplan_apply_start(index) else { return cancelled };
         // Apply supersedes a length being measured for Align: its hidden form
         // does not come back.
         self.secureplan.measuring = None;
-        cancelled
+        let check = self.secureplan_check_drawing(index, CheckThen::Apply(Box::new(start)));
+        Task::batch([cancelled, check])
     }
 
-    /// The Apply dialog over a snapshot of tab `index`, taken now.
+    /// The Apply dialog over a snapshot of tab `index`, taken and checked
+    /// now (the test driver's Apply, which has no dialog to wait in).
+    #[cfg(feature = "secureplan-test")]
     pub(crate) fn secureplan_apply_dialog(&self, index: usize) -> Option<super::ui::apply_dialog::ApplyDialog> {
         let tab = &self.tabs[index];
+        let start = self.secureplan_apply_start(index)?;
+        let view = super::publish::ViewState::of(&tab.scene);
+        let (extents, layouts) = super::publish::check_drawing(start.snapshot.document.clone(), &view, true);
+        Some(apply_dialog_from(tab.id, start, extents?, layouts))
+    }
+
+    /// Everything the Apply dialog of tab `index` shows but what the drawing
+    /// check finds: the snapshot, taken now. Cheap: the document is shared
+    /// by its entities, not re-read.
+    fn secureplan_apply_start(&self, index: usize) -> Option<ApplyStart> {
+        let tab = &self.tabs[index];
         let bound = self.secureplan.sessions.by_tab(tab.id)?;
-        let alignment = bound.alignment?;
-        let extents = super::publish::visible_extents(&tab.scene)?;
         let snapshot = super::publish::Snapshot {
             document: tab.scene.document.clone(),
             annotation_scale: tab.scene.annotation_scale,
@@ -1196,24 +1291,113 @@ impl OpenCADStudio {
             pending_original: bound.pending_original.clone(),
             lost_entities: bound.lost_entities,
         };
-        let mut dialog = super::ui::apply_dialog::ApplyDialog::new(
-            tab.id,
-            Arc::new(snapshot),
-            tab.edit_revision,
-            extents,
-            alignment,
-            survey_is_empty(bound),
-            bound.realigned,
-            bound.plan_version,
-            super::layout::references(&tab.scene),
-        );
-        dialog.origin = ApplyOrigin { session: bound.session, base_identity: bound.base_identity.clone(), generation: bound.generation };
-        // A paper layout the user is on starts chosen when it can be published.
-        let current = &tab.scene.current_layout;
-        if dialog.layouts.iter().any(|(name, found)| name == current && found.is_ok()) {
-            dialog.select_view(Some(current));
+        Some(ApplyStart {
+            snapshot: Arc::new(snapshot),
+            revision: tab.edit_revision,
+            alignment: bound.alignment?,
+            empty_survey: survey_is_empty(bound),
+            realigned: bound.realigned,
+            plan_version: bound.plan_version,
+            origin: ApplyOrigin { session: bound.session, base_identity: bound.base_identity.clone(), generation: bound.generation },
+            layout: tab.scene.current_layout.clone(),
+        })
+    }
+
+    /// Check tab `index`'s drawing on a worker, showing "Checking the
+    /// drawing" (with Cancel) until `then` opens. The check reads a copy of
+    /// the drawing taken now and the view as it is, so nothing changed later
+    /// reaches it and the editor never waits for it. One check runs at a
+    /// time: while one does, this one waits in its place (replacing any
+    /// other waiting check).
+    pub(crate) fn secureplan_check_drawing(&mut self, index: usize, then: CheckThen) -> Task<Message> {
+        let tab = &self.tabs[index];
+        let view = super::publish::ViewState::of(&tab.scene);
+        let (drawing, layouts) = match &then {
+            CheckThen::Align(_) => (CheckDrawing::Copy(Box::new(tab.scene.document.clone())), false),
+            CheckThen::Apply(start) => (CheckDrawing::Snapshot(Arc::clone(&start.snapshot)), true),
+        };
+        let tab_id = tab.id;
+        let opened_for = self.secureplan.sessions.by_tab(tab_id).map_or((None, 0), |b| (b.session, b.generation));
+        self.secureplan.next_job += 1;
+        let job = self.secureplan.next_job;
+        self.secureplan.checking = Some(Checking { job, tab_id, opened_for, then });
+        self.secureplan.dialog = Some(super::ui::Dialog::checking(tab_id));
+        let check = PendingCheck { job, drawing, view, layouts };
+        if self.secureplan.check_running {
+            self.secureplan.check_pending = Some(check);
+            return Task::none();
         }
-        Some(dialog)
+        self.secureplan_start_check(check)
+    }
+
+    fn secureplan_start_check(&mut self, check: PendingCheck) -> Task<Message> {
+        self.secureplan.check_running = true;
+        let PendingCheck { job, drawing, view, layouts } = check;
+        let failed = super::Msg::Checked(Checked { job, result: super::Carry::new(None) });
+        self.secureplan_run_job(
+            move || {
+                let document = match drawing {
+                    CheckDrawing::Copy(document) => *document,
+                    CheckDrawing::Snapshot(snapshot) => snapshot.document.clone(),
+                };
+                let result = super::publish::check_drawing(document, &view, layouts);
+                super::Msg::Checked(Checked { job, result: super::Carry::new(Some(result)) })
+            },
+            failed,
+        )
+    }
+
+    /// Whether the "Checking the drawing" dialog of check `job` still shows.
+    fn secureplan_check_wanted(&self, job: u64) -> bool {
+        self.secureplan.checking.as_ref().is_some_and(|c| {
+            c.job == job && matches!(&self.secureplan.dialog, Some(dialog) if dialog.is_checking(c.tab_id))
+        })
+    }
+
+    /// A drawing check finished: start the waiting one if it is still
+    /// wanted, and open what waited for this one unless its "Checking the
+    /// drawing" dialog was cancelled or replaced, or the survey changed (its
+    /// session, document or editing mode) meanwhile.
+    pub(crate) fn secureplan_checked(&mut self, done: Checked) -> Task<Message> {
+        self.secureplan.check_running = false;
+        let next = match self.secureplan.check_pending.take() {
+            Some(check) if self.secureplan_check_wanted(check.job) => self.secureplan_start_check(check),
+            // Cancelled while it waited: nothing of it is kept (its snapshot
+            // holds a copy of the drawing).
+            Some(check) => {
+                self.secureplan.checking.take_if(|c| c.job == check.job);
+                Task::none()
+            }
+            None => Task::none(),
+        };
+        let wanted = self.secureplan_check_wanted(done.job);
+        let checking = self.secureplan.checking.take_if(|c| c.job == done.job);
+        let (Some(result), true, Some(checking)) = (done.result.take(), wanted, checking) else { return next };
+        self.secureplan.dialog = None;
+        let current = self.secureplan.sessions.by_tab(checking.tab_id).is_some_and(|b| (b.session, b.generation) == checking.opened_for);
+        if !current {
+            self.command_line.push_error("SecurePlan: the survey changed while the drawing was being checked. Nothing was opened; try again.");
+            return next;
+        }
+        if let Err(message) = self.secureplan_can_edit_tab(checking.tab_id) {
+            self.command_line.push_error(&message);
+            return next;
+        }
+        let Some((extents, layouts)) = result else {
+            self.command_line.push_error("SecurePlan: the drawing could not be checked.");
+            return next;
+        };
+        match checking.then {
+            CheckThen::Align(start) => match extents {
+                Some(extents) => self.secureplan.dialog = Some(super::ui::Dialog::Align(Box::new(start.dialog(checking.tab_id, extents)))),
+                None => self.command_line.push_error("SecurePlan: the drawing has nothing to align."),
+            },
+            CheckThen::Apply(start) => match extents.map(|extents| apply_dialog_from(checking.tab_id, *start, extents, layouts)) {
+                Some(dialog) => self.secureplan.dialog = Some(super::ui::Dialog::Apply(Box::new(dialog))),
+                None => self.command_line.push_error("SecurePlan: the drawing has nothing to publish."),
+            },
+        }
+        next
     }
 
     /// Whether an Apply begun under `origin` still matches the document.
@@ -1629,10 +1813,16 @@ impl OpenCADStudio {
         let owner = match &self.secureplan.dialog {
             Some(super::ui::Dialog::Align(dialog)) => Some(dialog.tab_id),
             Some(super::ui::Dialog::Apply(dialog)) => Some(dialog.tab_id),
+            Some(dialog) if dialog.is_checking(tab_id) => Some(tab_id),
             _ => None,
         };
         if owner == Some(tab_id) {
             self.secureplan.dialog = None;
+        }
+        // A check for either form is dropped: a running one's result is
+        // ignored and a waiting one never starts.
+        if self.secureplan.checking.take_if(|checking| checking.tab_id == tab_id).is_some() {
+            self.secureplan.check_pending = None;
         }
         if self.secureplan.measuring.as_ref().is_some_and(|measuring| measuring.tab_id() == tab_id) {
             self.secureplan.measuring = None;
@@ -3533,13 +3723,130 @@ pub(crate) mod tests {
         assert!(h.app.secureplan_has_unapplied(index));
     }
 
+    /// While jobs are held, the drawing check that opens Align or Apply is
+    /// the last one held: let it finish.
+    fn finish_check(h: &mut Harness) {
+        let tab_id = h.tab_id();
+        if h.held() > 0 && h.app.secureplan.dialog.as_ref().is_some_and(|d| d.is_checking(tab_id)) {
+            h.release(h.held() - 1);
+        }
+    }
+
     /// Open Apply (aligning first when the drawing has no alignment yet).
     fn open_apply(h: &mut Harness) {
         let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        finish_check(h);
         if matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))) {
             h.key(DialogKey::Activate);
+            finish_check(h);
         }
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "the Apply dialog: {:?} {}", h.dialog_title(), last_error(&h.app));
+    }
+
+    /// Align and Apply never check the drawing in an update (on a large
+    /// drawing that took seconds, with the editor frozen): each waits in
+    /// "Checking the drawing" while a worker checks a copy taken when the
+    /// user asked, so a later edit does not reach it, and Cancel or Escape
+    /// drops the result.
+    #[test]
+    fn align_and_apply_check_the_drawing_on_a_worker() {
+        let mut h = Harness::new("check_on_worker");
+        h.open_dxf();
+        let tab_id = h.tab_id();
+        let checking = |h: &Harness| h.app.secureplan.dialog.as_ref().is_some_and(|d| d.is_checking(tab_id));
+        h.hold_jobs();
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(checking(&h) && h.held() == 1, "Align waits for its check on a worker");
+        h.release(0);
+        let expected = publish::default_window(publish::visible_extents(&h.app.tabs[h.app.active_tab].scene).unwrap());
+        let Some(Dialog::Align(align)) = &h.app.secureplan.dialog else { panic!("the alignment dialog: {}", last_error(&h.app)) };
+        assert_eq!(align.extents, expected, "the checked extents");
+        // Confirmed, Apply checks again: an edit made meanwhile is not in its snapshot.
+        h.key(DialogKey::Activate);
+        assert!(checking(&h) && h.held() == 1, "Apply waits for its check on a worker");
+        let index = h.app.active_tab;
+        let (revision, entities) = (h.app.tabs[index].edit_revision, h.app.tabs[index].scene.document.entities().count());
+        h.edit((100.0, 100.0), (900.0, 100.0));
+        h.release(0);
+        let Some(Dialog::Apply(apply)) = &h.app.secureplan.dialog else { panic!("the Apply dialog: {}", last_error(&h.app)) };
+        assert_eq!(apply.snapshot_revision, revision);
+        assert_eq!(apply.snapshot.document.entities().count(), entities, "the snapshot is the drawing when Apply was chosen");
+        assert!(apply.plan().is_ok(), "{:?}", apply.plan());
+        // Escape while checking: the result is dropped.
+        h.app.secureplan.dialog = None;
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(checking(&h));
+        h.key(DialogKey::Cancel);
+        assert!(h.app.secureplan.dialog.is_none());
+        h.release(0);
+        assert!(h.app.secureplan.dialog.is_none(), "a cancelled check opens nothing");
+    }
+
+    /// A check still running when the survey leaves edit mode, or when its
+    /// document is replaced, opens no form when it finishes: view mode closes
+    /// "Checking the drawing" at once, and a changed document is reported.
+    #[test]
+    fn a_check_finishing_after_view_mode_or_a_new_document_opens_nothing() {
+        let mut h = Harness::new("check_view_mode");
+        h.open_dxf();
+        let tab_id = h.tab_id();
+        let checking = |h: &Harness| h.app.secureplan.dialog.as_ref().is_some_and(|d| d.is_checking(tab_id));
+        h.hold_jobs();
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(checking(&h) && h.held() == 1);
+        h.send(json!({ "type": "sessionMode", "requestId": "m1", "mode": "view", "reason": "leaseLost" }));
+        assert!(h.app.secureplan.dialog.is_none(), "view mode closes the checking dialog");
+        h.release(0);
+        assert!(h.app.secureplan.dialog.is_none(), "a form opened in view mode: {:?}", h.dialog_title());
+        // Back in edit mode, the document changes while Apply is checked.
+        h.send(json!({ "type": "sessionMode", "requestId": "m2", "mode": "edit", "reason": "leaseAcquired" }));
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(checking(&h) && h.held() == 1);
+        h.app.secureplan.sessions.by_tab_mut(tab_id).unwrap().generation += 1;
+        h.release(0);
+        assert!(h.app.secureplan.dialog.is_none(), "a form opened for another document: {:?}", h.dialog_title());
+        assert!(last_error(&h.app).contains("changed while the drawing was being checked"), "{}", last_error(&h.app));
+    }
+
+    /// Cancelling and asking again never runs checks side by side: one runs,
+    /// the latest request waits for it, and a request cancelled while it
+    /// waits never starts.
+    #[test]
+    fn drawing_checks_run_one_at_a_time() {
+        let mut h = Harness::new("check_serial");
+        h.open_dxf();
+        let tab_id = h.tab_id();
+        let checking = |h: &Harness| h.app.secureplan.dialog.as_ref().is_some_and(|d| d.is_checking(tab_id));
+        h.hold_jobs();
+        for _ in 0..3 {
+            let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+            assert!(checking(&h));
+            assert_eq!(h.held(), 1, "a second check started while one runs");
+            h.key(DialogKey::Cancel);
+        }
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        // The first finishes: its result is dropped and the latest starts.
+        h.release(0);
+        assert!(checking(&h) && h.held() == 1, "the waiting check did not start");
+        h.release(0);
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "{:?} {}", h.dialog_title(), last_error(&h.app));
+        // Aligned, Apply checks with a snapshot of the drawing. A waiting
+        // check cancelled before it starts never runs, and nothing of either
+        // check (nor the snapshot) is kept.
+        h.key(DialogKey::Activate);
+        h.release(0);
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "{:?} {}", h.dialog_title(), last_error(&h.app));
+        h.app.secureplan.dialog = None;
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        h.key(DialogKey::Cancel);
+        let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(matches!(&h.app.secureplan.checking, Some(c) if matches!(c.then, CheckThen::Apply(_))));
+        h.key(DialogKey::Cancel);
+        h.release(0);
+        assert_eq!(h.held(), 0, "a cancelled check started");
+        assert!(h.app.secureplan.dialog.is_none());
+        assert!(h.app.secureplan.checking.is_none(), "a cancelled check is kept");
+        assert!(h.app.secureplan.check_pending.is_none() && !h.app.secureplan.check_running);
     }
 
     /// An Apply whose session was lost is cancelled; when its build finishes
