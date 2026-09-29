@@ -1361,7 +1361,13 @@ impl OpenCADStudio {
         self.secureplan.check_running = false;
         let next = match self.secureplan.check_pending.take() {
             Some(check) if self.secureplan_check_wanted(check.job) => self.secureplan_start_check(check),
-            _ => Task::none(),
+            // Cancelled while it waited: nothing of it is kept (its snapshot
+            // holds a copy of the drawing).
+            Some(check) => {
+                self.secureplan.checking.take_if(|c| c.job == check.job);
+                Task::none()
+            }
+            None => Task::none(),
         };
         let wanted = self.secureplan_check_wanted(done.job);
         let checking = self.secureplan.checking.take_if(|c| c.job == done.job);
@@ -3823,15 +3829,23 @@ pub(crate) mod tests {
         assert!(checking(&h) && h.held() == 1, "the waiting check did not start");
         h.release(0);
         assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Align(_))), "{:?} {}", h.dialog_title(), last_error(&h.app));
-        // A waiting check cancelled before it starts never runs.
+        // Aligned, Apply checks with a snapshot of the drawing. A waiting
+        // check cancelled before it starts never runs, and nothing of either
+        // check (nor the snapshot) is kept.
+        h.key(DialogKey::Activate);
+        h.release(0);
+        assert!(matches!(h.app.secureplan.dialog, Some(Dialog::Apply(_))), "{:?} {}", h.dialog_title(), last_error(&h.app));
         h.app.secureplan.dialog = None;
         let _ = h.app.dispatch_command("SECUREPLANAPPLY");
         h.key(DialogKey::Cancel);
         let _ = h.app.dispatch_command("SECUREPLANAPPLY");
+        assert!(matches!(&h.app.secureplan.checking, Some(c) if matches!(c.then, CheckThen::Apply(_))));
         h.key(DialogKey::Cancel);
         h.release(0);
         assert_eq!(h.held(), 0, "a cancelled check started");
         assert!(h.app.secureplan.dialog.is_none());
+        assert!(h.app.secureplan.checking.is_none(), "a cancelled check is kept");
+        assert!(h.app.secureplan.check_pending.is_none() && !h.app.secureplan.check_running);
     }
 
     /// An Apply whose session was lost is cancelled; when its build finishes
