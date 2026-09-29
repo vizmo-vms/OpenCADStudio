@@ -365,7 +365,6 @@ impl OpenCADStudio {
         self.secureplan.sessions.by_tab(dialog.tab_id).is_some_and(|bound| (bound.session, bound.generation) == dialog.opened_for)
     }
 
-    /// Open the alignment dialog for the active bound document.
     /// Open the alignment dialog once the drawing's extents are checked (on
     /// a worker: see [`OpenCADStudio::secureplan_check_drawing`]).
     pub(crate) fn secureplan_open_align(&mut self, then_apply: bool) -> iced::Task<Message> {

@@ -155,6 +155,10 @@ pub struct State {
     pub measuring: Option<super::ui::align_dialog::Measuring>,
     /// The Align or Apply dialog waiting for its drawing check.
     pub checking: Option<super::session::Checking>,
+    /// Whether a drawing check's worker is running, and the latest check
+    /// waiting for it (an older waiting one is dropped unstarted).
+    pub check_running: bool,
+    pub check_pending: Option<super::session::PendingCheck>,
     pub recovery: super::recovery::Store,
     /// Whether the read-only design overlay is drawn (OVL-01).
     pub overlay_visible: bool,
@@ -218,6 +222,8 @@ impl Default for State {
             apply_progress: None,
             measuring: None,
             checking: None,
+            check_running: false,
+            check_pending: None,
             recovery: Default::default(),
             overlay_visible: true,
             next_job: 0,
