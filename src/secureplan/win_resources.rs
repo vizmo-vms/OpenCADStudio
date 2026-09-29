@@ -31,7 +31,7 @@ mod tests {
         assert_eq!(value("FileDescription"), Some(super::super::APP_NAME));
         assert_eq!(value("ProductVersion"), Some(super::super::VERSION));
         assert_eq!(value("FileVersion"), Some(super::super::VERSION));
-        assert_eq!(numeric, 2 << 32 | 2 << 16, "0.2.2");
+        assert_eq!(numeric, 2 << 32 | 3 << 16, "0.2.3");
         assert!(strings.iter().all(|(_, v)| !v.contains("Open") && !v.contains("2026")));
     }
 }
