@@ -1268,6 +1268,7 @@ impl OpenCADStudio {
 
     /// The Apply dialog over a snapshot of tab `index`, taken and checked
     /// now (the test driver's Apply, which has no dialog to wait in).
+    #[cfg(feature = "secureplan-test")]
     pub(crate) fn secureplan_apply_dialog(&self, index: usize) -> Option<super::ui::apply_dialog::ApplyDialog> {
         let tab = &self.tabs[index];
         let start = self.secureplan_apply_start(index)?;
