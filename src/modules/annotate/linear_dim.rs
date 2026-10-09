@@ -1,7 +1,7 @@
-use acadrust::entities::{Dimension, DimensionLinear};
-use acadrust::types::Vector3;
-use acadrust::EntityType;
-use cadkernel::geom2d::{
+use codec::entities::{Dimension, DimensionLinear};
+use codec::types::Vector3;
+use codec::EntityType;
+use kernel::geom2d::{
     closest_point, Circle as KernelCircle, Curve, Line as KernelLine,
 };
 
@@ -15,7 +15,7 @@ use glam::DVec3;
 use crate::t;
 
 /// Select the measured axis from where the dimension line clears the points.
-fn measure_axis(first: DVec3, second: DVec3, def: DVec3) -> DVec3 {
+pub(crate) fn measure_axis(first: DVec3, second: DVec3, def: DVec3) -> DVec3 {
     let outside = |value: f64, a: f64, b: f64| {
         let (low, high) = if a <= b { (a, b) } else { (b, a) };
         (low - value).max(value - high).max(0.0)
@@ -87,7 +87,7 @@ pub struct LinearDimensionCommand {
     axis_mode: AxisMode,
     selecting_object: bool,
     picked_entity: Option<EntityType>,
-    source_handle: Option<acadrust::Handle>,
+    source_handle: Option<codec::Handle>,
     mtext_override: bool,
 }
 
@@ -113,24 +113,37 @@ impl LinearDimensionCommand {
         let first = self.plane.to_local(first);
         let second = self.plane.to_local(second);
         let point = self.plane.to_local(point);
-        let mut dim = DimensionLinear::new(v3(first), v3(second));
         let axis = self.axis_mode.axis(first, second, point);
-        dim.rotation = axis.y.atan2(axis.x);
-        dim.set_offset(dimension_line_offset(second, point, axis));
-        dim.base.definition_point = dim.definition_point;
-        dim.base.text_middle_point = v3(linear_text_pos(first, second, point, axis));
-        dim.base.insertion_point = dim.base.text_middle_point;
-        dim.base.actual_measurement = dim.measurement();
-        crate::entities::dimension::set_dimension_text_override(
-            &mut dim.base,
-            self.text_override.clone(),
-        );
+        let mut entity =
+            linear_dimension_entity(first, second, point, axis, self.text_override.clone());
         // An explicit text angle overrides the UCS-derived rotation.
-        if let Some(angle) = self.text_angle {
-            dim.base.text_rotation = angle;
+        if let (Some(angle), EntityType::Dimension(dimension)) = (self.text_angle, &mut entity) {
+            dimension.base_mut().text_rotation = angle;
         }
-        self.plane.place_entity(EntityType::Dimension(Dimension::Linear(dim)))
+        self.plane.place_entity(entity)
     }
+}
+
+/// A linear dimension between two points of the working plane, its
+/// dimension line through `point` along `axis` — what DIMLINEAR places and
+/// what a dynamic dimensional constraint draws.
+pub(crate) fn linear_dimension_entity(
+    first: DVec3,
+    second: DVec3,
+    point: DVec3,
+    axis: DVec3,
+    text_override: Option<String>,
+) -> EntityType {
+    let mut dim = DimensionLinear::new(v3(first), v3(second));
+    dim.rotation = axis.y.atan2(axis.x);
+    dim.set_offset(dimension_line_offset(second, point, axis));
+    dim.base.definition_point = dim.definition_point;
+    dim.base.text_middle_point = v3(linear_text_pos(first, second, point, axis));
+    dim.base.insertion_point = dim.base.text_middle_point;
+    crate::entities::dimension::reset_automatic_text_position(&mut dim.base);
+    dim.base.actual_measurement = dim.measurement();
+    crate::entities::dimension::set_dimension_text_override(&mut dim.base, text_override);
+    EntityType::Dimension(Dimension::Linear(dim))
 }
 
 impl CadCommand for LinearDimensionCommand {
@@ -356,7 +369,7 @@ impl CadCommand for LinearDimensionCommand {
         self.picked_entity = Some(entity);
     }
 
-    fn on_entity_pick(&mut self, handle: acadrust::Handle, point: DVec3) -> CmdResult {
+    fn on_entity_pick(&mut self, handle: codec::Handle, point: DVec3) -> CmdResult {
         let Some(entity) = self.picked_entity.take() else {
             return CmdResult::NeedPoint;
         };
@@ -548,6 +561,7 @@ fn preview_wire(points: Vec<DVec3>) -> WireModel {
         world_width: 0.0,
         depth_override: None,
         display_visible: true,
+        snap_only: false,
         plot_visible: true,
         fill_is_3d: false,
         fill_is_2d_solid: false,
@@ -576,7 +590,9 @@ fn preview_wire(points: Vec<DVec3>) -> WireModel {
         plinegen: true,
         fill_tris: vec![],
         fill_tris_low: Vec::new(),
-    }
+    
+            ..Default::default()
+}
 }
 
 /// Project the two extension origins onto the dimension line, which passes

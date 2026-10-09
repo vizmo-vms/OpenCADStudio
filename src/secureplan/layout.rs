@@ -21,8 +21,8 @@
 //! viewport. Paper-space entities (the title block) and any other viewports
 //! are drawn through the paper → world mapping; they contribute no snaps.
 
-use acadrust::types::Handle;
-use acadrust::EntityType;
+use codec::types::Handle;
+use codec::EntityType;
 
 use super::publish::{place_page, Mapping, PageTransform, PlacementError, MAX_AREA_PT2, MAX_SIDE_PT};
 
@@ -207,7 +207,7 @@ fn hex(handle: Handle) -> String {
     format!("{:X}", handle.value())
 }
 
-fn rect_of(viewport: &acadrust::entities::Viewport) -> [f64; 4] {
+fn rect_of(viewport: &codec::entities::Viewport) -> [f64; 4] {
     let (hw, hh) = (viewport.width.abs() / 2.0, viewport.height.abs() / 2.0);
     [viewport.center.x - hw, viewport.center.y - hh, viewport.center.x + hw, viewport.center.y + hh]
 }
@@ -237,7 +237,7 @@ fn crosses([x0, y0]: [f64; 2], [x1, y1]: [f64; 2], rect: [f64; 4]) -> bool {
 }
 
 /// Whether the viewport looks straight down on the plan (+Z).
-fn looks_down(viewport: &acadrust::entities::Viewport) -> bool {
+fn looks_down(viewport: &codec::entities::Viewport) -> bool {
     let direction = viewport.view_direction;
     let length = (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z).sqrt();
     length > 0.0 && direction.z > 0.0 && direction.x.abs() <= 1e-9 * length && direction.y.abs() <= 1e-9 * length
@@ -311,7 +311,7 @@ fn shows_geometry(
 /// A viewport's model → paper map as it saves it, exactly, when the renderer
 /// shows that saved view (it fits a stale view to the drawing instead):
 /// `(to_paper, model_per_paper, twist)`.
-fn saved_view(viewport: &acadrust::entities::Viewport, frame: &crate::scene::viewport_ref::ViewportFrame) -> Option<([f64; 6], f64, f64)> {
+fn saved_view(viewport: &codec::entities::Viewport, frame: &crate::scene::viewport_ref::ViewportFrame) -> Option<([f64; 6], f64, f64)> {
     use std::f64::consts::TAU;
     // The renderer turns the model by ±twist; take the sign it uses.
     let apart = |a: f64, b: f64| ((a - b).rem_euclid(TAU)).min((b - a).rem_euclid(TAU));
@@ -364,7 +364,7 @@ pub fn reference(paper: &crate::scene::Scene, model: &crate::scene::Scene, name:
     if name.chars().count() > MAX_NAME_CHARS {
         return Err(format!("Layout names longer than {MAX_NAME_CHARS} characters cannot be published."));
     }
-    let viewports: Vec<&acadrust::entities::Viewport> = paper
+    let viewports: Vec<&codec::entities::Viewport> = paper
         .layout_content_viewports()
         .iter()
         .filter_map(|handle| match paper.document.get_entity(*handle) {
@@ -538,8 +538,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::app::secureplan::publish::{self, Mapping};
     use crate::app::secureplan::snap::{self, SnapGeometry};
-    use acadrust::entities::{Line, Viewport};
-    use acadrust::types::Vector3;
+    use codec::entities::{Line, Viewport};
+    use codec::types::Vector3;
     use crate::scene::Scene;
 
     use crate::app::secureplan::testutil::{self, plan_viewport, LAYOUT};
@@ -708,8 +708,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_viewport_showing_only_a_solid_fill_shows_the_drawing() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
-        use acadrust::types::Vector2;
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use codec::types::Vector2;
         // A 1:10 viewport onto a solid hatch far from everything else.
         let mut viewport = plan_viewport((420.0, 300.0), 0.0);
         viewport.view_target = Vector3::new(61000.0, 1000.0, 0.0);
@@ -732,7 +732,7 @@ pub(crate) mod tests {
     fn a_sheet_beyond_the_page_limits_is_refused() {
         let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
         for object in scene.document.objects.values_mut() {
-            if let acadrust::objects::ObjectType::Layout(layout) = object {
+            if let codec::objects::ObjectType::Layout(layout) = object {
                 if layout.name == LAYOUT {
                     layout.paper_width = 6000.0;
                 }
@@ -762,7 +762,7 @@ pub(crate) mod tests {
     fn a_layout_publishes_its_sheet_and_snaps_only_to_model_geometry_in_its_viewport() {
         let mut viewport = plan_viewport((420.0, 300.0), 0.0);
         // Furniture is frozen in this viewport only.
-        let mut furniture = acadrust::tables::Layer::new("FURNITURE");
+        let mut furniture = codec::tables::Layer::new("FURNITURE");
         furniture.handle = Handle::new(0x9000);
         viewport.frozen_layers = vec![furniture.handle];
         let (mut scene, _) = layout_scene(vec![viewport]);
@@ -899,7 +899,7 @@ pub(crate) mod tests {
     fn paper_space_drawn_last_is_outside_the_viewport_clip() {
         let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
         for object in scene.document.objects.values_mut() {
-            if let acadrust::objects::ObjectType::Layout(layout) = object {
+            if let codec::objects::ObjectType::Layout(layout) = object {
                 if layout.name == LAYOUT {
                     layout.plot_flags.draw_viewports_first = true;
                 }
@@ -919,8 +919,8 @@ pub(crate) mod tests {
 
     #[test]
     fn the_viewport_annotation_scale_places_annotative_blocks() {
-        use acadrust::entities::Insert;
-        use acadrust::xdata::ExtendedDataRecord;
+        use codec::entities::Insert;
+        use codec::xdata::ExtendedDataRecord;
         let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
         // The drawing's own annotation scale is 1:1; the 1:100 viewport's is 1:100.
         scene.set_annotation_scale_named("1:100").unwrap();
@@ -952,9 +952,9 @@ pub(crate) mod tests {
 
     #[test]
     fn annotative_fills_follow_the_viewport_annotation_scale() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, Insert, PolylineEdge, Wipeout};
-        use acadrust::types::Vector2;
-        use acadrust::xdata::ExtendedDataRecord;
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, Insert, PolylineEdge, Wipeout};
+        use codec::types::Vector2;
+        use codec::xdata::ExtendedDataRecord;
         let mut scene = annotation_scene();
         // A symbol: a line, a 10 × 10 solid hatch and a 10 × 10 wipeout below it.
         let mut path = BoundaryPath::new();
@@ -984,7 +984,7 @@ pub(crate) mod tests {
 
     #[test]
     fn objects_of_other_annotation_scales_are_tessellated_and_snapped_as_drawn() {
-        use acadrust::entities::{Circle, Insert};
+        use codec::entities::{Circle, Insert};
         let mut scene = annotation_scene();
         // A block of the 1:50 scale only, with a circle: the layout shows
         // every scale's objects, so it is drawn through the 1:100 viewport.
@@ -1013,8 +1013,8 @@ pub(crate) mod tests {
 
     #[test]
     fn paper_space_is_tessellated_at_its_own_annotation_scale() {
-        use acadrust::entities::{Circle, Insert};
-        use acadrust::xdata::ExtendedDataRecord;
+        use codec::entities::{Circle, Insert};
+        use codec::xdata::ExtendedDataRecord;
         let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
         // The drawing's scale is 10:1, but paper space draws at 1:1: an
         // annotative paper symbol keeps its size.
@@ -1047,7 +1047,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_viewport_render_mode_decides_whether_3d_faces_are_filled() {
-        use acadrust::entities::{Face3D, ViewportRenderMode};
+        use codec::entities::{Face3D, ViewportRenderMode};
         let publish_with = |face: bool, mode: ViewportRenderMode| {
             let mut viewport = plan_viewport((420.0, 300.0), 0.0);
             viewport.render_mode = mode;
@@ -1068,13 +1068,13 @@ pub(crate) mod tests {
 
     #[test]
     fn psltscale_keeps_dashes_the_same_on_paper_in_every_viewport() {
-        use acadrust::tables::LineType;
+        use codec::tables::LineType;
         let dashes = |psltscale: bool| {
             let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
             scene.document.line_types.add(LineType::dashed()).unwrap();
             // PSLTSCALE is the layout's own setting.
             for object in scene.document.objects.values_mut() {
-                if let acadrust::objects::ObjectType::Layout(layout) = object {
+                if let codec::objects::ObjectType::Layout(layout) = object {
                     if layout.name == LAYOUT {
                         layout.flags = if psltscale { layout.flags | 1 } else { layout.flags & !1 };
                     }
@@ -1120,7 +1120,7 @@ pub(crate) mod tests {
     /// `view_height` model units across its 200 mm height.
     fn detail_at(scene: &mut Scene, target: (f64, f64), view_height: f64) -> Handle {
         scene.set_current_layout(LAYOUT.into());
-        let mut outline = acadrust::entities::Circle::new();
+        let mut outline = codec::entities::Circle::new();
         outline.center = Vector3::new(720.0, 470.0, 0.0);
         outline.radius = 100.0;
         let outline = scene.add_entity(EntityType::Circle(outline));
@@ -1137,10 +1137,10 @@ pub(crate) mod tests {
 
     /// A circular solid hatch of `radius` about `(x, y)` in model space.
     fn round_fill(scene: &mut Scene, (x, y): (f64, f64), radius: f64) {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
         let mut path = BoundaryPath::new();
         path.add_edge(BoundaryEdge::CircularArc(CircularArcEdge {
-            center: acadrust::types::Vector2::new(x, y),
+            center: codec::types::Vector2::new(x, y),
             radius,
             start_angle: 0.0,
             end_angle: std::f64::consts::TAU,
@@ -1234,7 +1234,7 @@ pub(crate) mod tests {
             .entities()
             .find_map(|entity| match entity {
                 EntityType::Hatch(hatch) => Some(hatch.paths[0].edges.iter().flat_map(|edge| match edge {
-                    acadrust::entities::BoundaryEdge::Polyline(p) => p.vertices.iter().map(|v| [v.x, v.y]).collect(),
+                    codec::entities::BoundaryEdge::Polyline(p) => p.vertices.iter().map(|v| [v.x, v.y]).collect(),
                     _ => Vec::new(),
                 }).collect()),
                 _ => None,
@@ -1264,8 +1264,8 @@ pub(crate) mod tests {
 
     #[test]
     fn fill_vertices_far_from_the_fills_centre_stay_exact() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch, PolylineEdge};
-        use acadrust::types::Vector2;
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch, PolylineEdge};
+        use codec::types::Vector2;
         let (mut scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 0.0)]);
         // A slab over the whole plan with a round hole (radius 100) at
         // (5000, 5000): the hole is ~10 m from the fill's centre, where an
@@ -1361,7 +1361,7 @@ pub(crate) mod tests {
         let (scene, _) = layout_scene(vec![plan_viewport((420.0, 300.0), 90.0)]);
         let expected = found(&scene).unwrap();
         for format in ["dxf", "dwg"] {
-            let bytes = crate::io::save_to_bytes(&scene.document, format, acadrust::DxfVersion::AC1032).unwrap();
+            let bytes = crate::io::save_to_bytes(&scene.document, format, codec::DxfVersion::AC1032).unwrap();
             let mut loaded = Scene::new();
             loaded.document = crate::io::load_bytes(&format!("layout.{format}"), bytes).unwrap();
             loaded.rebuild_derived_caches();

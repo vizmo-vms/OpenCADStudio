@@ -1,5 +1,6 @@
-//! SecurePlan CAD runs no automation listener (DSK-02): `--serve` and `--mcp`
-//! exit before binding anything, and the plugin runner mode is refused. Its
+//! SecurePlan CAD runs no automation listener (DSK-02): `--serve`, `--http`,
+//! `--mcp` and `--sync-mcp-schemas` exit before binding or writing anything,
+//! and the plugin runner mode is refused. Its
 //! command-line diagnostics never print file paths.
 #![cfg(feature = "secureplan")]
 
@@ -27,6 +28,28 @@ fn secureplan_serve_mode_is_refused_and_binds_nothing() {
     assert!(output.stdout.is_empty(), "--serve answered: {output:?}");
     // Nothing is left listening on the requested port.
     assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+}
+
+#[test]
+fn secureplan_http_mode_is_refused_and_binds_nothing() {
+    let port = free_port();
+    // Headless, and with a drawing (the GUI-hosted REST channel).
+    let dir = sentinel_dir("http");
+    let drawing = dir.join("synthetic.dxf");
+    for args in [vec!["--http".to_string(), port.to_string()], vec![drawing.to_string_lossy().into_owned(), "--http".to_string(), port.to_string()]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_OpenCADStudio")).args(&args).stdin(Stdio::null()).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "--http answered: {output:?}");
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn secureplan_mcp_schema_sync_is_refused() {
+    let output = run(&["--sync-mcp-schemas"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "--sync-mcp-schemas answered: {output:?}");
 }
 
 #[test]
@@ -64,7 +87,7 @@ fn secureplan_export_diagnostics_never_print_paths() {
     assert_ne!(missing.status.code(), Some(0));
     assert_no_sentinel(&missing, &sentinel);
     let input = dir.join("synthetic.dxf");
-    let doc = acadrust::CadDocument::new();
+    let doc = codec::CadDocument::new();
     std::fs::write(&input, OpenCADStudio::io::save_to_bytes(&doc, "dxf", doc.version).unwrap()).unwrap();
     let exported = run(&["--export", &input.to_string_lossy(), &dir.join("copy.dxf").to_string_lossy()]);
     assert_eq!(exported.status.code(), Some(0), "{exported:?}");
@@ -144,7 +167,7 @@ fn secureplan_link_from_an_ineligible_website_opens_nothing() {
 fn secureplan_release_builds_refuse_the_headless_drawing_modes() {
     let dir = sentinel_dir("release");
     let input = dir.join("synthetic.dxf");
-    let doc = acadrust::CadDocument::new();
+    let doc = codec::CadDocument::new();
     std::fs::write(&input, OpenCADStudio::io::save_to_bytes(&doc, "dxf", doc.version).unwrap()).unwrap();
     let script = dir.join("script.scr");
     std::fs::write(&script, "LINE 0,0 1,1\n").unwrap();

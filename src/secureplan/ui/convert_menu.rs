@@ -319,7 +319,7 @@ mod tests {
             .document
             .entities()
             .filter(|entity| match entity {
-                acadrust::EntityType::Line(line) => {
+                codec::EntityType::Line(line) => {
                     (line.start.y == 0.0 && line.end.y == 0.0) || (line.start.x == 30000.0 && line.end.x == 30000.0)
                 }
                 _ => false,
@@ -540,7 +540,7 @@ mod tests {
         let handles: Vec<_> = scene
             .document
             .entities()
-            .filter(|e| matches!(e, acadrust::EntityType::Line(l) if (l.start.y == 0.0 && l.end.y == 0.0) || l.start.x == 12345.6))
+            .filter(|e| matches!(e, codec::EntityType::Line(l) if (l.start.y == 0.0 && l.end.y == 0.0) || l.start.x == 12345.6))
             .map(|e| e.common().handle)
             .collect();
         scene.select_entities(&handles);

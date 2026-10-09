@@ -61,6 +61,7 @@ pub static CLOSE: &[u8] = include_bytes!("../../assets/icons/ui/close.svg");
 pub static PLUS: &[u8] = include_bytes!("../../assets/icons/ui/plus.svg");
 pub static MINUS: &[u8] = include_bytes!("../../assets/icons/ui/minus.svg");
 pub static TRASH: &[u8] = include_bytes!("../../assets/icons/ui/trash.svg");
+pub static NODE_GRAPH: &[u8] = include_bytes!("../../assets/icons/ui/node_graph.svg");
 pub static COPY: &[u8] = include_bytes!("../../assets/icons/ui/copy.svg");
 pub static MENU: &[u8] = include_bytes!("../../assets/icons/ui/menu.svg");
 pub static MOVE: &[u8] = include_bytes!("../../assets/icons/ui/move.svg");
@@ -311,6 +312,15 @@ pub fn semantic<'a, M: 'a>(bytes: &'static [u8], size: f32) -> Element<'a, M> {
         bytes,
         size,
         opacity: 1.0,
+    })
+}
+
+/// [`semantic`] faded like disabled menu text.
+pub fn semantic_disabled<'a, M: 'a>(bytes: &'static [u8], size: f32) -> Element<'a, M> {
+    Element::new(SemanticIcon {
+        bytes,
+        size,
+        opacity: 0.42,
     })
 }
 
@@ -654,6 +664,14 @@ pub fn zoom_icon() -> &'static [u8] {
     NAV_ZOOM
 }
 
+pub fn undo_icon() -> &'static [u8] {
+    UNDO
+}
+
+pub fn redo_icon() -> &'static [u8] {
+    REDO
+}
+
 /// Layer visibility icon bytes (on / off).
 pub fn layer_visible(visible: bool) -> &'static [u8] {
     if visible {
@@ -707,6 +725,10 @@ pub fn themed_secondary_arrow_down<'a, M: 'a>(size: f32) -> Element<'a, M> {
 
 pub fn themed_disabled_arrow_down<'a, M: 'a>(size: f32) -> Element<'a, M> {
     themed_disabled(TRI_DOWN, size)
+}
+
+pub fn themed_disabled_arrow_right<'a, M: 'a>(size: f32) -> Element<'a, M> {
+    themed_disabled(TRI_RIGHT, size)
 }
 
 pub fn themed_home<'a, M: 'a>(size: f32) -> Element<'a, M> {
@@ -1008,8 +1030,13 @@ mod themed_cache_tests {
     /// on a different static.
     ///
     /// Run with `--nocapture` to see the numbers:
-    /// `cargo test --lib themed_cache_speedup_over_uncached_handle_creation -- --nocapture`.
+    /// `cargo test --lib themed_cache_speedup_over_uncached_handle_creation -- --ignored --nocapture`.
+    ///
+    /// Ignored by default: it compares wall-clock times, and under the
+    /// parallel suite's load the uncached loop can finish first. The cache's
+    /// behaviour is pinned by the entry-count tests above.
     #[test]
+    #[ignore = "wall-clock benchmark; run with --ignored"]
     fn themed_cache_speedup_over_uncached_handle_creation() {
         use std::time::Instant;
 

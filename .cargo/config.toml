@@ -1,4 +1,4 @@
-# getrandom 0.3 (pulled by ahash via acadrust) needs this cfg to select its
+# getrandom 0.3 (pulled by ahash via opencadcodec) needs this cfg to select its
 # browser backend on wasm32-unknown-unknown, alongside its `wasm_js` feature
 # (enabled in Cargo.toml for the wasm target). Without it the web build fails
 # with "wasm32-unknown-unknown targets are not supported by default".
@@ -34,5 +34,9 @@ rustflags = [
 # its own wgpu instance, and test threads starting the Vulkan loader at the
 # same moment crash the test binary (SIGSEGV inside
 # vkEnumerateInstanceExtensionProperties). Only iced_test reads this variable.
+#
+# RUST_MIN_STACK also sizes rustc's own threads: rustc 1.99 overflows the
+# default 8 MB compiling this crate in release on Windows/macOS.
 [env]
 ICED_TEST_BACKEND = "tiny-skia"
+RUST_MIN_STACK = "67108864"

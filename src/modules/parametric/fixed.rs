@@ -4,7 +4,7 @@
 //! click, the driver maps it to a `ParametricRef` and re-prompts on a miss,
 //! the way the reference does.
 
-use acadrust::{EntityType, Handle};
+use codec::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, CoincidentPick};
@@ -102,6 +102,10 @@ impl CadCommand for FixConstraintCommand {
 
     fn entity_pick_accepts_points(&self) -> bool {
         true
+    }
+
+    fn typed_point_picks_entity(&self) -> bool {
+        matches!(self.step, Step::Object)
     }
 
     fn entity_pick_highlights_hover(&self) -> bool {

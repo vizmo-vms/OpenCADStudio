@@ -52,10 +52,10 @@
 
 use std::sync::Arc;
 
-use acadrust::entities::{Block, BlockEnd, Circle, Ellipse, Insert, LwPolyline, MText, Text};
-use acadrust::tables::{BlockRecord, Layer};
-use acadrust::types::{Color, Vector2, Vector3};
-use acadrust::{CadDocument, DxfVersion, EntityType};
+use codec::entities::{Block, BlockEnd, Circle, Ellipse, Insert, LwPolyline, MText, Text};
+use codec::tables::{BlockRecord, Layer};
+use codec::types::{Color, Vector2, Vector3};
+use codec::{CadDocument, DxfVersion, EntityType};
 use serde::Deserialize;
 
 use super::align::world_to_cad;
@@ -260,8 +260,8 @@ impl PlacedDevice {
         // Below the centre in the symbol's frame (y up in CAD).
         let at = Vector3::new(self.at.x + down * rotation.sin(), self.at.y - down * rotation.cos(), 0.0);
         let mut text = Text::with_value(&self.caption, at).with_height(web.label_size * symbols::CAP_HEIGHT * k).with_rotation(rotation);
-        text.horizontal_alignment = acadrust::entities::TextHorizontalAlignment::Center;
-        text.vertical_alignment = acadrust::entities::TextVerticalAlignment::Middle;
+        text.horizontal_alignment = codec::entities::TextHorizontalAlignment::Center;
+        text.vertical_alignment = codec::entities::TextVerticalAlignment::Middle;
         text.alignment_point = Some(at);
         EntityType::Text(text)
     }
@@ -1060,7 +1060,7 @@ pub(crate) mod tests {
         let blocks = place_devices(&mut document, &composition, DeviceSymbols::Standard);
         // Nothing the drawing had changed.
         for (handle, debug) in &before {
-            let entity = document.get_entity(acadrust::types::Handle::new(*handle)).expect("still there");
+            let entity = document.get_entity(codec::types::Handle::new(*handle)).expect("still there");
             assert_eq!(&format!("{entity:?}"), debug, "entity {handle:X} changed");
         }
         assert_eq!(document.layers.iter().count(), layers_before + composition.layers.len());

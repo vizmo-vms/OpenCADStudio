@@ -10,7 +10,7 @@ impl Scene {
         only_vp: Option<Handle>,
         exclude_vp: Option<Handle>,
     ) -> Vec<WireModel> {
-        use acadrust::entities::Viewport;
+        use codec::entities::Viewport;
 
         let (_, _, viewport_handles) = self.paper_viewport_handles();
         let viewports: Vec<&Viewport> = viewport_handles
@@ -321,6 +321,22 @@ impl Scene {
                 }
                 let mut out = wire.clone();
                 out.points = clipped;
+                // A wide polyline's band width is a geometric width in model
+                // units; the points were just projected into paper units, so
+                // the band (and any per-point taper) must follow the same
+                // scale or the PDF / print exporter strokes a 15-unit bus bar
+                // as 15 mm of paper. Negative values are fixed pixel widths
+                // and zero means "use the lineweight" — both stay as they are.
+                if out.world_width > 0.0 {
+                    out.world_width = wire.world_width * scale;
+                    if wire.taper_widths.len() == out.points.len() {
+                        out.taper_widths = wire.taper_widths.iter().map(|w| w * scale).collect();
+                    } else {
+                        // Clipping changed the vertex count, so the per-point
+                        // widths no longer line up; fall back to a constant band.
+                        out.taper_widths.clear();
+                    }
+                }
                 if let Some(source_length) = source_length {
                     for station in &mut clipped_stations {
                         *station *= scale;
@@ -331,6 +347,29 @@ impl Scene {
                     out.pattern_stations.clear();
                 }
                 out.text_verts = projected_text;
+                // Searchable runs ride the same projection through the shared
+                // helper (origin map + height/advance scale), then cull by
+                // run-rect overlap — a run straddling the viewport edge is
+                // kept, where origin-only culling would drop visible text.
+                out.searchable_text = wire.searchable_text.clone();
+                out.map_searchable_runs(
+                    &|p| {
+                        let q = proj_abs(p[0], p[1], p[2]);
+                        [q[0] as f64, q[1] as f64, q[2] as f64]
+                    },
+                    scale as f64,
+                    0.0,
+                );
+                out.searchable_text.retain(|run| {
+                    run.origin.iter().all(|v| v.is_finite())
+                        && crate::scene::model::wire_model::run_rect_overlap(
+                            [run.origin[0], run.origin[1]],
+                            run.rotation,
+                            run.adv_width as f64,
+                            run.height as f64,
+                            [vp_x0 as f64, vp_y0 as f64, vp_x1 as f64, vp_y1 as f64],
+                        )
+                });
                 // Paper coordinates are small sheet units — no relative-to-eye
                 // residual is needed, and keeping the model wire's points_low
                 // here would add a model-scale offset to the paper points.
@@ -387,7 +426,7 @@ impl Scene {
     pub fn viewport_plot_fills(
         &self,
     ) -> (Vec<(WireModel, f32)>, Vec<HatchModel>, Vec<HatchModel>, Vec<crate::io::pdf_export::PlotImage>) {
-        use acadrust::entities::Viewport;
+        use codec::entities::Viewport;
         use model::hatch_model::HatchPattern;
 
         if self.current_layout == "Model" {
@@ -611,7 +650,7 @@ impl Scene {
         us: f32,
         vs: f32,
     ) -> Vec<[f32; 2]> {
-        use acadrust::entities::Viewport;
+        use codec::entities::Viewport;
         let Some(EntityType::Viewport(vp)) = self.document.get_entity(vp_handle) else {
             return vec![];
         };
@@ -863,7 +902,7 @@ where
         output.extend(clipped);
     };
     if let (Some(plane), Some(boundary)) = (fill.fill_plane, fill.fill_plane_boundary.as_deref()) {
-        let plane = cadkernel::space::Plane::from_axes(
+        let plane = kernel::space::Plane::from_axes(
             plane.origin,
             plane.x_axis,
             plane.y_axis,

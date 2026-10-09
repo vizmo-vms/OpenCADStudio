@@ -1,13 +1,14 @@
 //! Maps parametric constraints to the drawing format's associative object graph.
 
-use acadrust::objects::{
+use codec::objects::{
     Assoc2dConstraintGroup, AssocAction, AssocActionDependency, AssocConstraintNode,
-    AssocConstraintNodeData, AssocDependency, AssocEvalValue, AssocEvalVariant,
+    AssocConstraintNodeData, AssocDependency, AssocDimDependencyBody, AssocEvalValue,
+    AssocEvalVariant,
     AssocGeomDependency, AssocNetwork, AssocPersistentSubentId, AssocValueDependency,
     AssocVariable, AssociativeData, AssociativeObject, ObjectType,
 };
-use acadrust::types::{Handle, Vector3};
-use acadrust::{CadDocument, EntityType};
+use codec::types::{Handle, Vector3};
+use codec::{CadDocument, EntityType};
 use rustc_hash::FxHashMap;
 
 use super::named_parameters::{DrivingValue, ParameterTable};
@@ -624,7 +625,7 @@ impl<'a> GroupBuilder<'a> {
                 },
             );
         } else {
-            let arc = cadkernel::geom2d::BulgeArc::from_bulge(
+            let arc = kernel::geom2d::BulgeArc::from_bulge(
                 [start.x, start.y],
                 [end.x, end.y],
                 bulge,
@@ -1216,6 +1217,7 @@ impl Allocator<'_> {
         name: &str,
         formula: &str,
         resolved: f64,
+        description: &str,
     ) -> Handle {
         if let Some(&handle) = self.variables.get(name) {
             if let Some(ObjectType::Associative(object)) = self.document.objects.get_mut(&handle) {
@@ -1243,7 +1245,7 @@ impl Allocator<'_> {
                 name: name.to_string(),
                 expression: formula.to_string(),
                 evaluator: "AcDbCalc:1.0".to_string(),
-                description: String::new(),
+                description: description.to_string(),
                 value: Self::numeric_eval(resolved),
                 has_cached_value: false,
                 cached_value: String::new(),
@@ -1288,6 +1290,67 @@ impl Allocator<'_> {
             self.document.objects.get_mut(&variable_handle)
         {
             variable.reactors.push(handle);
+        }
+        handle
+    }
+
+    /// The `AcDbAssocDependency` + `AcDbAssocDimDependencyBody` pair that
+    /// ties a dimensional constraint to the dynamic dimension showing it.
+    fn dimension_dependency(
+        &mut self,
+        group_handle: Handle,
+        dimension: Handle,
+        name: &str,
+        dependency_id: i32,
+    ) -> Handle {
+        let handle = self.document.allocate_handle();
+        let body = self.insert_associative(
+            handle,
+            "ACDBASSOCDIMDEPENDENCYBODY",
+            "AcDbAssocDimDependencyBody",
+            AssociativeData::DimDependencyBody(AssocDimDependencyBody {
+                dependency_body_version: 1,
+                base_version: 1,
+                name: name.to_string(),
+                class_version: 1,
+            }),
+        );
+        self.insert_associative_at(
+            handle,
+            group_handle,
+            "ACDBASSOCDEPENDENCY",
+            "AcDbAssocDependency",
+            AssociativeData::Dependency(AssocDependency {
+                class_version: 2,
+                is_read_dependency: true,
+                is_write_dependency: true,
+                is_attached_to_object: true,
+                is_delegating_to_owning_action: true,
+                dependent_on: dimension,
+                dependency_body: body,
+                dependency_body_id: dependency_id,
+                ..Default::default()
+            }),
+        );
+        // Earlier materializations' dependencies are gone by now; drop
+        // their reactor entries before adding this one.
+        let live: Vec<Handle> = self
+            .document
+            .get_entity(dimension)
+            .map(|entity| {
+                entity
+                    .common()
+                    .reactors
+                    .iter()
+                    .copied()
+                    .filter(|reactor| self.document.objects.contains_key(reactor))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(entity) = self.document.get_entity_mut(dimension) {
+            let reactors = &mut entity.common_mut().reactors;
+            *reactors = live;
+            reactors.push(handle);
         }
         handle
     }
@@ -1355,6 +1418,27 @@ fn set_value_dependency(data: &mut AssocConstraintNodeData, handle: Handle) {
     }
 }
 
+/// Patches a dimensional-constraint node's `dimension_dependency` field.
+fn set_dimension_dependency(data: &mut AssocConstraintNodeData, handle: Handle) {
+    match data {
+        AssocConstraintNodeData::Distance {
+            dimension_dependency,
+            ..
+        }
+        | AssocConstraintNodeData::Angle {
+            dimension_dependency,
+            ..
+        }
+        | AssocConstraintNodeData::RadiusDiameter {
+            dimension_dependency,
+            ..
+        } => {
+            *dimension_dependency = handle;
+        }
+        _ => {}
+    }
+}
+
 /// Associative classes that must have real class numbers in DWG/DXF.
 const ASSOC_CLASSES: &[(&str, &str, i32)] = &[
     (
@@ -1366,6 +1450,8 @@ const ASSOC_CLASSES: &[(&str, &str, i32)] = &[
     ("ACDBASSOCVARIABLE", "AcDbAssocVariable", 45),
     ("ACDBASSOCGEOMDEPENDENCY", "AcDbAssocGeomDependency", 29),
     ("ACDBASSOCVALUEDEPENDENCY", "AcDbAssocValueDependency", 29),
+    ("ACDBASSOCDEPENDENCY", "AcDbAssocDependency", 29),
+    ("ACDBASSOCDIMDEPENDENCYBODY", "AcDbAssocDimDependencyBody", 45),
 ];
 
 fn ensure_associative_classes_registered(document: &mut CadDocument) {
@@ -1373,14 +1459,14 @@ fn ensure_associative_classes_registered(document: &mut CadDocument) {
         if document.classes.get_by_name(dxf_name).is_some() {
             continue;
         }
-        document.classes.add_or_update(acadrust::classes::DxfClass {
+        document.classes.add_or_update(codec::classes::DxfClass {
             dxf_name: dxf_name.to_string(),
             cpp_class_name: cpp_class_name.to_string(),
             application_name: "ObjectDBX Classes".to_string(),
-            proxy_flags: acadrust::classes::ProxyFlags(
-                acadrust::classes::ProxyFlags::ERASE_ALLOWED.0
-                    | acadrust::classes::ProxyFlags::CLONING_ALLOWED.0
-                    | acadrust::classes::ProxyFlags::DISABLES_PROXY_WARNING_DIALOG.0,
+            proxy_flags: codec::classes::ProxyFlags(
+                codec::classes::ProxyFlags::ERASE_ALLOWED.0
+                    | codec::classes::ProxyFlags::CLONING_ALLOWED.0
+                    | codec::classes::ProxyFlags::DISABLES_PROXY_WARNING_DIALOG.0,
             ),
             instance_count: 0,
             was_zombie: false,
@@ -1453,7 +1539,7 @@ fn ensure_global_network_dictionary(document: &mut CadDocument) -> Handle {
 
     remove_dictionary_entry(document, root_handle, NETWORK_DICTIONARY_KEY);
     let dictionary_handle = document.allocate_handle();
-    let mut dictionary = acadrust::objects::Dictionary::new();
+    let mut dictionary = codec::objects::Dictionary::new();
     dictionary.handle = dictionary_handle;
     dictionary.owner = root_handle;
     dictionary.reactors.push(root_handle);
@@ -1652,14 +1738,14 @@ fn group_requires_preservation(document: &CadDocument, group: &Assoc2dConstraint
 
 fn work_plane_vector(work_plane: &[Vector3; 3], local: Vector3) -> Option<Vector3> {
     let [origin, axis_x, axis_y] = *work_plane;
-    let plane = cadkernel::space::Plane::from_axes(
+    let plane = kernel::space::Plane::from_axes(
         [origin.x, origin.y, origin.z],
         [axis_x.x, axis_x.y, axis_x.z],
         [axis_y.x, axis_y.y, axis_y.z],
     );
-    let mut world = cadkernel::space::Vec3::from(plane.vector_at([local.x, local.y]));
+    let mut world = kernel::space::Vec3::from(plane.vector_at([local.x, local.y]));
     if local.z != 0.0 {
-        world = world + cadkernel::space::Vec3::from(plane.normal()?) * local.z;
+        world = world + kernel::space::Vec3::from(plane.normal()?) * local.z;
     }
     let world = world.normalize()?;
     Some(Vector3::new(world.x, world.y, world.z))
@@ -1798,12 +1884,26 @@ fn driving_value(
         variable.expression.clone()
     };
     if parameters.set(&variable.name, &source).is_ok() {
+        parameters.set_description(&variable.name, &variable.description);
         Some(DrivingValue::Named(variable.name.clone()))
     } else {
         literal
             .or_else(|| numeric_value(&variable.value))
             .map(DrivingValue::Literal)
     }
+}
+
+/// The dynamic dimension an `AcDbAssocDependency` ties to a dimensional
+/// constraint node.
+fn dependency_dimension(document: &CadDocument, dependency: Handle) -> Option<Handle> {
+    let ObjectType::Associative(object) = document.objects.get(&dependency)? else {
+        return None;
+    };
+    let AssociativeData::Dependency(dependency) = &object.data else {
+        return None;
+    };
+    let target = dependency.dependent_on;
+    matches!(document.get_entity(target)?, EntityType::Dimension(_)).then_some(target)
 }
 
 fn owning_composite(data: &AssocConstraintNodeData) -> Option<i32> {
@@ -2250,7 +2350,25 @@ pub(super) fn native_constraint_set(
             {
                 continue;
             }
-            set.add(kind, targets, driving);
+            let dimension = match &node.data {
+                AssocConstraintNodeData::Angle {
+                    dimension_dependency,
+                    ..
+                }
+                | AssocConstraintNodeData::Distance {
+                    dimension_dependency,
+                    ..
+                }
+                | AssocConstraintNodeData::RadiusDiameter {
+                    dimension_dependency,
+                    ..
+                } => dependency_dimension(document, *dimension_dependency),
+                _ => None,
+            };
+            let id = set.add(kind, targets, driving);
+            if let Some(dimension) = dimension {
+                set.dimensions.insert(id, dimension);
+            }
             if let Some(constraint) = set.constraints.last_mut() {
                 constraint.enabled = enabled;
                 constraint.rigid_points = rigid_points;
@@ -2429,15 +2547,21 @@ fn materialize_scope(
 
     // Pass 1 (read-only): constraint-node shapes.
     let mut needs_value_dependency = Vec::new();
+    let mut dimension_links = Vec::new();
     let (mut nodes, entities, referenced_entities) = {
         let mut builder = GroupBuilder::new(document);
         for constraint in &set.constraints {
-            constraint_node(
+            let node_id = constraint_node(
                 &mut builder,
                 document,
                 constraint,
                 &mut needs_value_dependency,
             );
+            if let Some((node_id, dimension)) = node_id.zip(set.dimensions.get(&constraint.id)) {
+                if document.get_entity(*dimension).is_some() {
+                    dimension_links.push((node_id, *dimension));
+                }
+            }
         }
         let GroupBuilder {
             nodes,
@@ -2488,6 +2612,7 @@ fn materialize_scope(
                 variable.action.action_index = index as i32 + 1;
                 if let Some(parameter) = parameters.get(&variable.name) {
                     variable.expression = parameter.source.clone();
+                    variable.description = parameters.description(&parameter.name).to_string();
                     if let Ok(resolved) = parameters.resolve(&parameter.name) {
                         variable.value = Allocator::numeric_eval(resolved);
                     }
@@ -2499,7 +2624,13 @@ fn materialize_scope(
     if materialize_all_parameters {
         for parameter in parameters.iter() {
             let resolved = parameters.resolve(&parameter.name).unwrap_or(0.0);
-            allocator.variable(network_handle, &parameter.name, &parameter.source, resolved);
+            allocator.variable(
+                network_handle,
+                &parameter.name,
+                &parameter.source,
+                resolved,
+                parameters.description(&parameter.name),
+            );
         }
     }
 
@@ -2527,6 +2658,7 @@ fn materialize_scope(
     }
 
     let mut group_dependencies = geometry_dependencies;
+    let mut node_names: FxHashMap<i32, String> = FxHashMap::default();
     for (node_id, driving) in needs_value_dependency {
         let Some(driving) = driving else { continue };
         let Ok(resolved) = driving.resolve(parameters) else {
@@ -2542,13 +2674,32 @@ fn materialize_scope(
             }
             DrivingValue::Literal(_) => (format!("d{node_id}"), resolved.to_string()),
         };
-        let variable_handle = allocator.variable(network_handle, &name, &formula, resolved);
+        node_names.insert(node_id, name.clone());
+        let variable_handle = allocator.variable(
+            network_handle,
+            &name,
+            &formula,
+            resolved,
+            parameters.description(&name),
+        );
         let dependency_id = group_dependencies.len() as i32 + 1;
         let dep_handle =
             allocator.value_dependency(group_handle?, variable_handle, resolved, dependency_id);
         group_dependencies.push(dep_handle);
         if let Some(node) = nodes.iter_mut().find(|n| n.node_id == node_id) {
             set_value_dependency(&mut node.data, dep_handle);
+        }
+    }
+    for (node_id, dimension) in dimension_links {
+        let Some(name) = node_names.get(&node_id) else {
+            continue;
+        };
+        let dependency_id = group_dependencies.len() as i32 + 1;
+        let dep_handle =
+            allocator.dimension_dependency(group_handle?, dimension, name, dependency_id);
+        group_dependencies.push(dep_handle);
+        if let Some(node) = nodes.iter_mut().find(|n| n.node_id == node_id) {
+            set_dimension_dependency(&mut node.data, dep_handle);
         }
     }
 
@@ -2674,6 +2825,9 @@ impl Scene {
 
     pub(crate) fn load_parametric_constraints_from_document(&mut self) {
         self.parametric_constraints.clear();
+        // Dynamic dimensions read from the file get their screen size on the
+        // first tick after the view is known.
+        self.dynamic_dimension_camera_gen = None;
         let owners: Vec<_> = self
             .document
             .block_records
@@ -2687,6 +2841,10 @@ impl Scene {
                 self.parametric_constraints.push(set);
             }
         }
+        // Whole-set replace (file open / reload): covers the DWG-import
+        // `enabled` / `axis_direction` / `distance_direction` / `angle_sector`
+        // writes, which happen on the local set during decode.
+        self.bump_constraints_epoch();
     }
 
     /// Makes the standard associative graph match the live command model.
@@ -2830,9 +2988,9 @@ mod tests {
     };
     use super::*;
     use crate::scene::ChangeKind;
-    use acadrust::entities::{Arc, Circle, Insert, Line, LwPolyline, Ray, Spline, XLine};
-    use acadrust::tables::BlockRecord;
-    use acadrust::types::Vector2;
+    use codec::entities::{Arc, Circle, Insert, Line, LwPolyline, Ray, Spline, XLine};
+    use codec::tables::BlockRecord;
+    use codec::types::Vector2;
 
     fn line_entity(scene: &mut Scene, start: (f64, f64), end: (f64, f64)) -> Handle {
         scene.add_entity(EntityType::Line(Line::from_points(
@@ -3430,7 +3588,7 @@ mod tests {
         let mut block = BlockRecord::new("fixture");
         block.handle = scene.document.allocate_handle();
         scene.document.block_records.add(block).unwrap();
-        let point = scene.add_entity(EntityType::Point(acadrust::entities::Point::at(
+        let point = scene.add_entity(EntityType::Point(codec::entities::Point::at(
             Vector3::new(1.0, 2.0, 0.0),
         )));
         let insert = scene.add_entity(EntityType::Insert(Insert::new(
@@ -4111,7 +4269,7 @@ mod tests {
         for ext in ["dxf", "dwg"] {
             let mut scene = Scene::new();
             let ellipse = scene.add_entity(EntityType::Ellipse(
-                acadrust::entities::Ellipse::from_center_axes(
+                codec::entities::Ellipse::from_center_axes(
                     Vector3::new(0.0, 0.0, 0.0),
                     Vector3::new(4.0, 0.0, 0.0),
                     0.5,

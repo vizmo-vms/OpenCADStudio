@@ -10,6 +10,19 @@ use std::path::PathBuf;
 /// file name onto it and `create_dir_all` its parent before writing.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn config_dir() -> Option<PathBuf> {
+    // Tests must never read or write the person's real settings: a test run
+    // once raced dozens of tests through an alias-table migration and left the
+    // user's alias file holding a single line. Every store routes through here,
+    // so one per-process scratch folder isolates them all.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("ocs-test-config-{}", std::process::id())));
+    }
+    user_config_dir()
+}
+
+/// The person's real config directory (what [`config_dir`] is outside tests).
+#[cfg(not(target_arch = "wasm32"))]
+fn user_config_dir() -> Option<PathBuf> {
     let base: PathBuf = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(PathBuf::from)?
     } else if cfg!(target_os = "macos") {
@@ -39,7 +52,7 @@ pub fn config_dir() -> Option<PathBuf> {
 mod secureplan_tests {
     #[test]
     fn config_dir_differs_from_upstream() {
-        let dir = super::config_dir().expect("config dir");
+        let dir = super::user_config_dir().expect("config dir");
         assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("SecurePlanCAD"));
         assert!(!dir.ends_with("OpenCADStudio"));
     }

@@ -16,9 +16,9 @@
 //! flattened to within [`ICON_TOLERANCE_MM`]. Raster icons have no linework,
 //! so their devices keep the standard symbol, which the summary discloses.
 
-use acadrust::entities::{Arc, BoundaryEdge, BoundaryPath, Circle, Hatch, Line, LwPolyline, PolylineEdge, Text, TextHorizontalAlignment, TextVerticalAlignment};
-use acadrust::types::{Color, Vector2, Vector3};
-use acadrust::EntityType;
+use codec::entities::{Arc, BoundaryEdge, BoundaryPath, Circle, Hatch, Line, LwPolyline, PolylineEdge, Text, TextHorizontalAlignment, TextVerticalAlignment};
+use codec::types::{Color, Vector2, Vector3};
+use codec::EntityType;
 use resvg::usvg;
 
 /// A device kind (`devices[].kind`).

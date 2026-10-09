@@ -11,7 +11,7 @@ use crate::ui::popup::context_menu::{
     build_context_menu, ContextMenu, GripMenuCmd, GripMenuContext, MenuAction, MenuContext,
     SubmenuId,
 };
-use acadrust::Handle;
+use codec::Handle;
 use iced::Task;
 
 impl OpenCADStudio {
@@ -389,7 +389,7 @@ impl OpenCADStudio {
 mod tests {
     use super::*;
     use crate::app::settings::RightClickMode;
-    use crate::command::{CadCommand, StepInput};
+    use crate::command::StepInput;
     use crate::ui::popup::context_menu::MenuAction;
     use glam::DVec3;
     use iced::Point;
@@ -522,7 +522,7 @@ mod tests {
                     .scene
                     .document
                     .entities()
-                    .filter(|e| matches!(e, acadrust::EntityType::Line(_)))
+                    .filter(|e| matches!(e, codec::EntityType::Line(_)))
                     .count();
                 assert_eq!(lines, 3, "{mode:?}");
             }
@@ -540,7 +540,7 @@ mod tests {
             assert!(!menu_open(&app));
             assert_eq!(active(&app), None);
             let closed = app.tabs[0].scene.document.entities().any(|e| {
-                matches!(e, acadrust::EntityType::LwPolyline(p) if p.is_closed && p.vertices.len() == 3)
+                matches!(e, codec::EntityType::LwPolyline(p) if p.is_closed && p.vertices.len() == 3)
             });
             assert!(closed, "PLINE should have been closed by the menu pick");
         });
@@ -602,7 +602,7 @@ mod tests {
             assert!(!menu_open(&app));
             assert_eq!(active(&app), None);
             let closed = app.tabs[0].scene.document.entities().any(
-                |e| matches!(e, acadrust::EntityType::LwPolyline(p) if p.is_closed),
+                |e| matches!(e, codec::EntityType::LwPolyline(p) if p.is_closed),
             );
             assert!(closed);
         });
@@ -641,7 +641,7 @@ mod tests {
                 .scene
                 .document
                 .entities()
-                .filter(|e| matches!(e, acadrust::EntityType::Line(_)))
+                .filter(|e| matches!(e, codec::EntityType::Line(_)))
                 .count();
             assert_eq!(lines, 3);
         });
@@ -658,7 +658,7 @@ mod tests {
                 .document
                 .entities()
                 .find_map(|e| match e {
-                    acadrust::EntityType::Line(l) => Some(l.common.handle),
+                    codec::EntityType::Line(l) => Some(l.common.handle),
                     _ => None,
                 })
                 .expect("a line");
@@ -673,7 +673,7 @@ mod tests {
                 .scene
                 .document
                 .entities()
-                .filter(|e| matches!(e, acadrust::EntityType::Line(_)))
+                .filter(|e| matches!(e, codec::EntityType::Line(_)))
                 .count();
             assert_eq!(lines, 0);
         });
@@ -683,7 +683,7 @@ mod tests {
 
     /// A drawing with one line, selected, its start grip hot at the origin.
     fn grip_app() -> (OpenCADStudio, Handle) {
-        use acadrust::{entities::Line, types::Vector3, EntityType};
+        use codec::{entities::Line, types::Vector3, EntityType};
         let mut app = app();
         app.snapper.snap_enabled = false;
         app.snapper.grid_snap_on = false;
@@ -717,7 +717,7 @@ mod tests {
 
     fn line_start(app: &OpenCADStudio, handle: Handle) -> (f64, f64) {
         match app.tabs[0].scene.document.get_entity(handle) {
-            Some(acadrust::EntityType::Line(l)) => (l.start.x, l.start.y),
+            Some(codec::EntityType::Line(l)) => (l.start.x, l.start.y),
             other => panic!("{other:?}"),
         }
     }
@@ -795,7 +795,7 @@ mod tests {
                 .document
                 .entities()
                 .filter_map(|e| match e {
-                    acadrust::EntityType::Line(l) => Some((l.start.x, l.start.y)),
+                    codec::EntityType::Line(l) => Some((l.start.x, l.start.y)),
                     _ => None,
                 })
                 .collect();
@@ -810,7 +810,7 @@ mod tests {
                 .scene
                 .document
                 .entities()
-                .filter(|e| matches!(e, acadrust::EntityType::Line(_)))
+                .filter(|e| matches!(e, codec::EntityType::Line(_)))
                 .count();
             assert_eq!(count, 1);
         });
@@ -895,7 +895,7 @@ mod transparent_tests {
                 .scene
                 .document
                 .entities()
-                .filter(|e| matches!(e, acadrust::EntityType::Line(_)))
+                .filter(|e| matches!(e, codec::EntityType::Line(_)))
                 .count();
             assert_eq!(lines, 1);
         });
@@ -938,6 +938,75 @@ mod transparent_tests {
             assert!(!app.snapper.snap_enabled);
             app.snapper.clear_override();
             assert!(app.snapper.snap_enabled);
+        });
+    }
+
+    #[test]
+    fn test_direct_distance_entry_dyn_off() {
+        with_stack(|| {
+            let mut app = line_app();
+            app.dyn_input = false;
+            assert_eq!(active(&app), Some("LINE"));
+
+            // Point cursor in +X direction from origin
+            app.tabs[0].last_cursor_world = glam::DVec3::new(10.0, 0.0, 0.0);
+
+            // Type "50" into command line and submit
+            app.command_line.input = "50".to_string();
+            let _ = app.on_command_submit();
+
+            // Line segment should be created from (0,0) to (50,0)
+            let lines: Vec<_> = app.tabs[0]
+                .scene
+                .document
+                .entities()
+                .filter_map(|e| match e {
+                    codec::EntityType::Line(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 1);
+            assert!((lines[0].start.x - 0.0).abs() < 1e-6 && (lines[0].start.y - 0.0).abs() < 1e-6);
+            assert!((lines[0].end.x - 50.0).abs() < 1e-6 && (lines[0].end.y - 0.0).abs() < 1e-6);
+
+            // Command should still be active for the next line segment
+            assert_eq!(active(&app), Some("LINE"));
+
+            // Point cursor in +Y direction from (50, 0)
+            app.tabs[0].last_cursor_world = glam::DVec3::new(50.0, 20.0, 0.0);
+
+            // Type "25" and submit
+            app.command_line.input = "25".to_string();
+            let _ = app.on_command_submit();
+
+            let lines: Vec<_> = app.tabs[0]
+                .scene
+                .document
+                .entities()
+                .filter_map(|e| match e {
+                    codec::EntityType::Line(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 2);
+            assert!((lines[1].start.x - 50.0).abs() < 1e-6 && (lines[1].start.y - 0.0).abs() < 1e-6);
+            assert!((lines[1].end.x - 50.0).abs() < 1e-6 && (lines[1].end.y - 25.0).abs() < 1e-6);
+
+            // Point cursor in -X direction from (50, 25) using feed_active_cmd
+            app.tabs[0].last_cursor_world = glam::DVec3::new(0.0, 25.0, 0.0);
+            let _ = app.feed_active_cmd("50");
+            let lines: Vec<_> = app.tabs[0]
+                .scene
+                .document
+                .entities()
+                .filter_map(|e| match e {
+                    codec::EntityType::Line(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 3);
+            assert!((lines[2].start.x - 50.0).abs() < 1e-6 && (lines[2].start.y - 25.0).abs() < 1e-6);
+            assert!((lines[2].end.x - 0.0).abs() < 1e-6 && (lines[2].end.y - 25.0).abs() < 1e-6);
         });
     }
 }

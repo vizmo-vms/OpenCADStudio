@@ -31,10 +31,11 @@ use crate::app::{Message, OpenCADStudio};
 pub const REFUSED_COMMANDS: &[&str] = &[
     "SAVE", "QSAVE", "SAVEAS", "SAVEALL", "PLOT", "PRINT", "QPRINT", "QUICKPRINT", "PUBLISH", "PLOTTOFILE",
     "EXPORTPDF", "EXPORTDWF", "EXPORTDWFX", "EXPORTLAYOUT", "EXPORT", "WBLOCK", "DXFOUT", "STLOUT", "STLEXPORT",
-    "STEPOUT", "STEPEXPORT", "OBJEXPORT", "JPGOUT", "PNGOUT", "BMPOUT", "TIFOUT", "WMFOUT", "PSOUT", "SVGOUT",
+    "STEPOUT", "STEPEXPORT", "OBJEXPORT", "WB", "JPGOUT", "PNGOUT", "BMPOUT", "TIFOUT", "WMFOUT", "PSOUT", "SVGOUT",
     "ACISOUT", "DATAEXTRACTION", "ETRANSMIT", "ARCHIVE", "XATTACH", "XREF", "XOPEN", "XRELOAD", "XBIND",
     "IMAGEATTACH", "ATTACH", "PDFATTACH", "DWFATTACH", "DGNATTACH", "EXTERNALREFERENCES", "EATTEXT", "ATTEXT",
-    "DATALINKUPDATE",
+    "DATALINKUPDATE", "POINTCLOUDATTACH", "PDFIMPORT", "PDFIMPORTFILE", "XREFSHOW", "XREFATTACHFILE",
+    "XREFOVERLAYFILE",
 ];
 
 /// The mode the web grants (BRG-08). Only `Edit` may Apply.
@@ -138,7 +139,7 @@ impl std::fmt::Debug for Drawing {
 
 impl Drawing {
     /// Describe `bytes` read as `document`.
-    pub fn describe(bytes: Arc<Vec<u8>>, name: &str, format: Format, document: &acadrust::CadDocument) -> Self {
+    pub fn describe(bytes: Arc<Vec<u8>>, name: &str, format: Format, document: &codec::CadDocument) -> Self {
         let format_version = match format {
             Format::Dwg => String::from_utf8_lossy(&bytes[..6.min(bytes.len())]).into_owned(),
             Format::Dxf => document.version.as_str().to_string(),
@@ -146,8 +147,8 @@ impl Drawing {
         Self { bytes, name: file_name(name).into(), format, format_version }
     }
 
-    pub fn version(&self) -> acadrust::DxfVersion {
-        acadrust::DxfVersion::parse(&self.format_version).unwrap_or(acadrust::DxfVersion::AC1032)
+    pub fn version(&self) -> codec::DxfVersion {
+        codec::DxfVersion::parse(&self.format_version).unwrap_or(codec::DxfVersion::AC1032)
     }
 
     /// The file name stem, for naming the outputs derived from it.
@@ -939,7 +940,7 @@ impl OpenCADStudio {
             }
             // No CAD drawing (a new survey, or the CAD link was removed).
             None => {
-                self.secureplan_install(index, acadrust::CadDocument::new(), None);
+                self.secureplan_install(index, codec::CadDocument::new(), None);
                 if let Some(bound) = self.secureplan.sessions.by_tab_mut(tab_id) {
                     bound.adopt(meta);
                     bound.pending_original = None;
@@ -999,7 +1000,7 @@ impl OpenCADStudio {
 
     /// Put `document` into tab `index` as a freshly opened drawing, loaded
     /// from `loaded` (verbatim bytes) or new when `None`.
-    pub(crate) fn secureplan_install(&mut self, index: usize, document: acadrust::CadDocument, loaded: Option<Drawing>) {
+    pub(crate) fn secureplan_install(&mut self, index: usize, document: codec::CadDocument, loaded: Option<Drawing>) {
         {
             let tab = &mut self.tabs[index];
             tab.scene.clear();
@@ -1215,7 +1216,7 @@ impl std::fmt::Debug for PendingCheck {
 /// The copy of the drawing a check reads: Align's, taken when asked, or
 /// Apply's snapshot (copied again on the worker).
 enum CheckDrawing {
-    Copy(Box<acadrust::CadDocument>),
+    Copy(Box<codec::CadDocument>),
     Snapshot(Arc<super::publish::Snapshot>),
 }
 
@@ -1283,8 +1284,11 @@ impl OpenCADStudio {
     fn secureplan_apply_start(&self, index: usize) -> Option<ApplyStart> {
         let tab = &self.tabs[index];
         let bound = self.secureplan.sessions.by_tab(tab.id)?;
+        // As a file stores it: no dynamic dimension's screen-size overrides.
+        let mut document = tab.scene.document.clone();
+        tab.scene.strip_dynamic_dimension_overrides(&mut document);
         let snapshot = super::publish::Snapshot {
-            document: tab.scene.document.clone(),
+            document,
             annotation_scale: tab.scene.annotation_scale,
             loaded: bound.loaded.clone(),
             modified: self.secureplan_modified(index),
@@ -2192,11 +2196,11 @@ pub(crate) mod tests {
 
         /// Add a line to the drawing as an edit would.
         pub(crate) fn edit(&mut self, from: (f64, f64), to: (f64, f64)) {
-            use acadrust::entities::Line;
-            use acadrust::types::Vector3;
+            use codec::entities::Line;
+            use codec::types::Vector3;
             let index = self.app.active_tab;
             let tab = &mut self.app.tabs[index];
-            tab.scene.document.add_entity(acadrust::EntityType::Line(Line::from_points(Vector3::new(from.0, from.1, 0.0), Vector3::new(to.0, to.1, 0.0)))).unwrap();
+            tab.scene.document.add_entity(codec::EntityType::Line(Line::from_points(Vector3::new(from.0, from.1, 0.0), Vector3::new(to.0, to.1, 0.0)))).unwrap();
             tab.scene.rebuild_derived_caches();
             tab.dirty = true;
             tab.edit_revision += 1;
@@ -2234,7 +2238,7 @@ pub(crate) mod tests {
         use crate::app::secureplan::guards::{external_resource_allowed, ExternalResource};
         assert!(!external_resource_allowed(ExternalResource::Xref) && !external_resource_allowed(ExternalResource::Image));
         let index = h.app.active_tab;
-        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::TabClose(h.app.tabs[index].id));
         assert!(external_resource_allowed(ExternalResource::Xref));
         let (close, _) = h.receive("close");
         assert_eq!(close["reason"], "documentClosed");
@@ -2261,13 +2265,24 @@ pub(crate) mod tests {
         h.open_dxf();
         let index = h.app.active_tab;
         h.edit((1.0, 1.0), (2.0, 2.0));
-        for message in [Message::SaveFile, Message::SaveAs, Message::PlotDialogOpen, Message::PrintAllOpen, Message::PrintToPrinter] {
+        for message in [
+            Message::SaveFile,
+            Message::SaveAs,
+            Message::PlotDialogOpen,
+            Message::PrintAllOpen,
+            Message::PrintToPrinter,
+            Message::WblockApply,
+            Message::Graph(crate::ui::node_graph::GraphMsg::Save),
+        ] {
             let label = format!("{message:?}");
             h.app.command_line.last_error = None;
             let _ = h.app.update(message);
             assert!(last_error(&h.app).contains("Use Apply"), "{label} was not refused");
         }
-        for command in ["PLOT", "WBLOCK", "_saveas", "QSAVE", "XATTACH", "XRELOAD", "EXPORTPDF", "DXFOUT"] {
+        for command in [
+            "PLOT", "WBLOCK", "WB", "_saveas", "QSAVE", "XATTACH", "XRELOAD", "EXPORTPDF", "DXFOUT", "XREFSHOW",
+            "XREFATTACHFILE inner.dwg", "-POINTCLOUDATTACH", "PDFIMPORT", "_PDFIMPORTFILE plan.pdf",
+        ] {
             h.app.command_line.last_error = None;
             let _ = h.app.dispatch_command(command);
             assert!(h.app.tabs[index].active_cmd.is_none(), "{command} started");
@@ -2277,13 +2292,13 @@ pub(crate) mod tests {
         let _ = h.app.save_with_default_format(index);
         assert!(h.app.active_save_jobs.is_empty());
         let target = h.dir().join("escape.dxf");
-        let _ = h.app.queue_native_save(index, target.clone(), acadrust::DxfVersion::AC1032, crate::app::SavePurpose::Manual, crate::app::SaveContinuation::None, true, false);
+        let _ = h.app.queue_native_save(index, target.clone(), codec::DxfVersion::AC1032, crate::app::SavePurpose::Manual, crate::app::SaveContinuation::None, true, false);
         assert!(!target.exists() && h.app.active_save_jobs.is_empty());
         // Xrefs are never read from disk for it.
         let inner = h.dir().join("inner.dwg");
-        std::fs::write(&inner, crate::io::save_to_bytes(&acadrust::CadDocument::new(), "dwg", acadrust::DxfVersion::AC1032).unwrap()).unwrap();
-        let mut host = acadrust::CadDocument::new();
-        let mut record = acadrust::tables::BlockRecord::new("INNER");
+        std::fs::write(&inner, crate::io::save_to_bytes(&codec::CadDocument::new(), "dwg", codec::DxfVersion::AC1032).unwrap()).unwrap();
+        let mut host = codec::CadDocument::new();
+        let mut record = codec::tables::BlockRecord::new("INNER");
         record.flags.is_xref = true;
         record.xref_path = inner.to_string_lossy().into_owned();
         host.block_records.add(record).unwrap();
@@ -2291,9 +2306,52 @@ pub(crate) mod tests {
         assert!(infos.iter().all(|info| matches!(info.status, crate::io::xref::XrefStatus::NotFound)));
     }
 
+    /// A dynamic dimension's screen-size overrides follow the zoom: Apply
+    /// and the recovery copy store the drawing as a file does, without them.
+    #[test]
+    fn apply_and_recovery_leave_out_dynamic_dimension_screen_overrides() {
+        use crate::entities::dim_override as ov;
+        use crate::scene::parametric_constraints::{ParametricScope, DYNAMIC_DIMENSION_LAYER};
+        use codec::types::Vector3;
+        let mut h = Harness::new("dynamic-dimension");
+        h.open(Some(("synthetic.dxf", Format::Dxf, testutil::synthetic_dxf())), overlay::tests::overlay_bytes(&[]), "edit", sample("openSession-edit")["cadPlan"].clone(), BASE, "edit");
+        h.edit((1.0, 1.0), (2.0, 2.0));
+        let index = h.app.active_tab;
+        let scene = &mut h.app.tabs[index].scene;
+        let mut dimension = codec::entities::DimensionAligned::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(100.0, 0.0, 0.0));
+        dimension.base.common.layer = DYNAMIC_DIMENSION_LAYER.to_string();
+        let handle = scene.document.add_entity(codec::EntityType::Dimension(codec::entities::Dimension::Aligned(dimension))).unwrap();
+        ov::set(&mut scene.document, handle, ov::DIMSCALE, Some(codec::xdata::XDataValue::Real(42.0)));
+        scene.parametric_constraint_set_mut(ParametricScope::ModelSpace).dimensions.insert(1, handle);
+        let dimscale = |doc: &codec::CadDocument| doc.get_entity(handle).and_then(|e| ov::real(&e.common().extended_data, ov::DIMSCALE));
+        assert_eq!(dimscale(&h.app.tabs[index].scene.document), Some(42.0), "the scene keeps its screen size");
+        let start = h.app.secureplan_apply_start(index).expect("an Apply start");
+        assert_eq!(dimscale(&start.snapshot.document), None, "Apply stored the screen size");
+        let entry = h.app.secureplan_recovery_entry(index, "none").expect("a recovery entry");
+        let recovered = crate::io::load_bytes(&format!("recovered.{}", entry.drawing.format.ext()), entry.drawing.bytes.to_vec()).unwrap();
+        let recovered_handle = recovered.entities().find_map(|e| match e {
+            codec::EntityType::Dimension(_) if e.common().layer.eq_ignore_ascii_case(DYNAMIC_DIMENSION_LAYER) => Some(e.common().handle),
+            _ => None,
+        });
+        let recovered_handle = recovered_handle.expect("the dimension was kept");
+        assert_eq!(recovered.get_entity(recovered_handle).and_then(|e| ov::real(&e.common().extended_data, ov::DIMSCALE)), None, "recovery stored the screen size");
+    }
+
+    #[test]
+    fn a_bound_drawings_blocks_stay_out_of_the_saved_block_lists() {
+        use crate::ui::window::block_palette::{BlockPaletteMsg, Item, MenuAction};
+        let mut h = Harness::new("block-lists");
+        h.open_dxf();
+        let (recent, favorites) = (h.app.block_palette.recent.len(), h.app.block_palette.favorites.len());
+        h.app.note_recent_block("DOOR");
+        let _ = h.app.update(Message::BlockPalette(BlockPaletteMsg::Menu(Item::Current("DOOR".into()), MenuAction::Favorite)));
+        assert_eq!(h.app.block_palette.recent.len(), recent, "a bound block entered Recent");
+        assert_eq!(h.app.block_palette.favorites.len(), favorites, "a bound block entered Favorites");
+    }
+
     #[test]
     fn data_links_of_a_bound_document_are_never_read_or_written() {
-        use acadrust::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
+        use codec::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
         let mut h = Harness::new("datalink");
         h.open_dxf();
         let csv = h.dir().join("linked.csv");
@@ -2308,9 +2366,9 @@ pub(crate) mod tests {
             let mut object = ClassObject::new(ClassObjectData::DataLink(link));
             object.handle = handle;
             doc.objects.insert(handle, ObjectType::ClassObject(object));
-            let mut table = acadrust::entities::Table::new(acadrust::types::Vector3::ZERO, 1, 1);
+            let mut table = codec::entities::Table::new(codec::types::Vector3::ZERO, 1, 1);
             table.rows[0].cells[0].data_link_handle = Some(handle);
-            doc.add_entity(acadrust::EntityType::Table(table)).unwrap();
+            doc.add_entity(codec::EntityType::Table(Box::new(table))).unwrap();
             assert!(crate::app::annotation_data::read_data_link(doc, handle).is_err(), "the link was read");
         }
         for command in ["DATALINKUPDATE", "DATALINKUPDATE WRITE"] {
@@ -2449,7 +2507,7 @@ pub(crate) mod tests {
             h.edit((1.0, 1.0), (5.0, 5.0));
             let index = h.app.active_tab;
             let tab_id = h.tab_id();
-            let _ = h.app.update(Message::TabClose(index));
+            let _ = h.app.update(Message::TabClose(h.app.tabs[index].id));
             let Some(Dialog::Choice { form, .. }) = &h.app.secureplan.dialog else { panic!("no close prompt") };
             let labels: Vec<&str> = form.buttons.iter().map(|(l, _)| l.as_str()).collect();
             assert_eq!(labels, ["Apply first", "Discard edits", "Keep a recovery copy", "Cancel"]);
@@ -2500,7 +2558,7 @@ pub(crate) mod tests {
 
     #[test]
     fn import_keeps_the_original_byte_for_byte_and_reads_no_references() {
-        use acadrust::objects::{ImageDefinition, ObjectType};
+        use codec::objects::{ImageDefinition, ObjectType};
         let mut h = Harness::new("import");
         // A drawing referencing a local image, a remote one and an Xref.
         let dir = h.dir().to_path_buf();
@@ -2512,11 +2570,11 @@ pub(crate) mod tests {
             let mut definition = ImageDefinition::with_dimensions(&reference, 1, 1);
             definition.handle = handle;
             doc.objects.insert(handle, ObjectType::ImageDefinition(definition));
-            let mut image = acadrust::entities::RasterImage::new(&reference, acadrust::types::Vector3::ZERO, 1.0, 1.0);
+            let mut image = codec::entities::RasterImage::new(&reference, codec::types::Vector3::ZERO, 1.0, 1.0);
             image.definition_handle = Some(handle);
-            doc.add_entity(acadrust::EntityType::RasterImage(image)).unwrap();
+            doc.add_entity(codec::EntityType::RasterImage(image)).unwrap();
         }
-        let mut record = acadrust::tables::BlockRecord::new("OUTSIDE");
+        let mut record = codec::tables::BlockRecord::new("OUTSIDE");
         record.flags.is_xref = true;
         record.xref_path = dir.join("outside.dwg").to_string_lossy().into_owned();
         doc.block_records.add(record).unwrap();
@@ -2524,7 +2582,7 @@ pub(crate) mod tests {
         assert!(!publish::tests::scene_images(doc.clone()).is_empty(), "the fixture image resolves");
         h.open(None, overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "import");
         let file = dir.join("referencing.dxf");
-        let bytes = crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let bytes = crate::io::save_to_bytes(&doc, "dxf", codec::DxfVersion::AC1032).unwrap();
         std::fs::write(&file, &bytes).unwrap();
 
         let tab_id = h.tab_id();
@@ -2615,7 +2673,7 @@ pub(crate) mod tests {
     /// the survey reloads the stored drawing, which applies byte for byte.
     #[test]
     fn an_r13_edit_undone_is_still_refused_and_discard_and_reopen_applies_it() {
-        let r13 = crate::io::save_to_bytes(&testutil::synthetic_document(), "dwg", acadrust::DxfVersion::AC1012).unwrap();
+        let r13 = crate::io::save_to_bytes(&testutil::synthetic_document(), "dwg", codec::DxfVersion::AC1012).unwrap();
         assert_eq!(&r13[..6], b"AC1012");
         // R13 headers declare no units ($INSUNITS came with R2000): choose mm.
         let align_mm_and_open_apply = |h: &mut Harness| {
@@ -2646,7 +2704,7 @@ pub(crate) mod tests {
         // The advice: close, Discard edits, open the survey again.
         let tab_id = h.tab_id();
         let index = h.app.active_tab;
-        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::TabClose(h.app.tabs[index].id));
         let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::CloseDiscard(tab_id))));
         assert!(h.app.secureplan_tab_index(tab_id).is_none(), "closed");
         let old = h.session;
@@ -2791,10 +2849,10 @@ pub(crate) mod tests {
         let handle = lossy.document.allocate_handle();
         lossy.document.objects.insert(
             handle,
-            acadrust::objects::ObjectType::Unknown {
+            codec::objects::ObjectType::Unknown {
                 type_name: "SYNTHETIC_UNKNOWN".into(),
                 handle,
-                owner: acadrust::Handle::NULL,
+                owner: codec::Handle::NULL,
                 raw_dxf_codes: None,
                 raw_dwg_data: None,
                 raw_dwg_handle_bits: 0,
@@ -2919,20 +2977,20 @@ pub(crate) mod tests {
     #[test]
     fn a_plan_update_whose_drawing_does_not_open_changes_nothing_and_blocks_apply() {
         let deep = {
-            use acadrust::entities::Insert;
-            use acadrust::types::Vector3;
+            use codec::entities::Insert;
+            use codec::types::Vector3;
             let mut doc = testutil::synthetic_document();
             for level in (1..=33).rev() {
                 let mut members = vec![];
                 if level < 33 {
-                    members.push(acadrust::EntityType::Insert(Insert::new(format!("B{}", level + 1), Vector3::ZERO)));
+                    members.push(codec::EntityType::Insert(Insert::new(format!("B{}", level + 1), Vector3::ZERO)));
                 } else {
-                    members.push(acadrust::EntityType::Line(acadrust::entities::Line::from_points(Vector3::ZERO, Vector3::new(1.0, 1.0, 0.0))));
+                    members.push(codec::EntityType::Line(codec::entities::Line::from_points(Vector3::ZERO, Vector3::new(1.0, 1.0, 0.0))));
                 }
                 crate::app::secureplan::snap::tests::block(&mut doc, &format!("B{level}"), members);
             }
-            doc.add_entity(acadrust::EntityType::Insert(Insert::new("B1", Vector3::ZERO))).unwrap();
-            crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap()
+            doc.add_entity(codec::EntityType::Insert(Insert::new("B1", Vector3::ZERO))).unwrap();
+            crate::io::save_to_bytes(&doc, "dxf", codec::DxfVersion::AC1032).unwrap()
         };
         for (case, bytes) in [("malformed", b"AC1032 not a drawing".to_vec()), ("over the limit", deep)] {
             let mut h = Harness::new(&format!("badupdate_{}", case.len()));
@@ -3014,7 +3072,7 @@ pub(crate) mod tests {
     fn a_restored_copy_applies_in_its_own_format_and_version() {
         for (bytes, format, version) in [
             (testutil::synthetic_dwg(), Format::Dwg, "AC1032"),
-            (crate::io::save_to_bytes(&testutil::synthetic_document(), "dxf", acadrust::DxfVersion::AC1015).unwrap(), Format::Dxf, "AC1015"),
+            (crate::io::save_to_bytes(&testutil::synthetic_document(), "dxf", codec::DxfVersion::AC1015).unwrap(), Format::Dxf, "AC1015"),
         ] {
             let mut h = Harness::new(&format!("restore_{version}_{}", format.ext()));
             let drawing = Drawing { bytes: Arc::new(bytes.clone()), name: format!("kept.{}", format.ext()).into(), format, format_version: version.into() };
@@ -3173,12 +3231,12 @@ pub(crate) mod tests {
 
     /// The synthetic plan with one damaged polyline the reader drops.
     pub(crate) fn damaged_dxf() -> Vec<u8> {
-        use acadrust::types::Vector2;
+        use codec::types::Vector2;
         let mut doc = testutil::synthetic_document();
-        let mut damaged = acadrust::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);
+        let mut damaged = codec::entities::LwPolyline::from_points(vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 1.0)]);
         damaged.elevation = 1.0e11;
-        doc.add_entity(acadrust::EntityType::LwPolyline(damaged)).unwrap();
-        crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap()
+        doc.add_entity(codec::EntityType::LwPolyline(damaged)).unwrap();
+        crate::io::save_to_bytes(&doc, "dxf", codec::DxfVersion::AC1032).unwrap()
     }
 
     #[cfg(feature = "secureplan-test")]
@@ -3258,7 +3316,7 @@ pub(crate) mod tests {
             return;
         }
         TEST_PROCESS_WIDE.store(true, std::sync::atomic::Ordering::SeqCst);
-        use acadrust::objects::{ImageDefinition, ObjectType};
+        use codec::objects::{ImageDefinition, ObjectType};
         let mut h = Harness::new("worker_guard");
         let png = h.dir().join("worker.png");
         image::RgbaImage::new(1, 1).save(&png).unwrap();
@@ -3268,10 +3326,10 @@ pub(crate) mod tests {
         let mut definition = ImageDefinition::with_dimensions(&reference, 1, 1);
         definition.handle = handle;
         doc.objects.insert(handle, ObjectType::ImageDefinition(definition));
-        let mut raster = acadrust::entities::RasterImage::new(&reference, acadrust::types::Vector3::new(100.0, 100.0, 0.0), 1.0, 1.0);
+        let mut raster = codec::entities::RasterImage::new(&reference, codec::types::Vector3::new(100.0, 100.0, 0.0), 1.0, 1.0);
         raster.definition_handle = Some(handle);
-        doc.add_entity(acadrust::EntityType::RasterImage(raster)).unwrap();
-        let bytes = crate::io::save_to_bytes(&doc, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        doc.add_entity(codec::EntityType::RasterImage(raster)).unwrap();
+        let bytes = crate::io::save_to_bytes(&doc, "dxf", codec::DxfVersion::AC1032).unwrap();
         h.open(Some(("images.dxf", Format::Dxf, bytes)), overlay::tests::overlay_bytes(&[]), "edit", Value::Null, "none", "edit");
         assert!(!crate::scene::model::image_model::tests::cached(&reference), "read on open");
         align_and_open_apply(&mut h);
@@ -3280,7 +3338,7 @@ pub(crate) mod tests {
         assert_eq!(h.held(), 1);
         // The last SecurePlan drawing closes while its Apply build runs.
         let index = h.app.active_tab;
-        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::TabClose(h.app.tabs[index].id));
         assert!(h.app.secureplan.sessions.bound.is_empty());
         assert!(!external_resource_allowed(ExternalResource::Image), "references allowed while the worker runs");
         h.release(0);
@@ -3626,7 +3684,7 @@ pub(crate) mod tests {
         let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::Dismiss)));
         // Later, just the SecurePlan tab is closed and kept.
         let index = h.app.secureplan_tab_index(a).unwrap();
-        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::TabClose(h.app.tabs[index].id));
         let _ = h.app.update(Message::SecurePlan(Msg::Action(Action::CloseKeep(a))));
         assert!(h.app.secureplan_tab_index(a).is_none());
         assert!(h.app.tabs.iter().any(|t| t.id == other), "the abandoned Close All closed another tab");

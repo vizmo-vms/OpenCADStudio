@@ -169,6 +169,43 @@ pub fn clamp_right_click_hold_ms(v: i32) -> i32 {
     v.clamp(100, 1000)
 }
 
+/// ZOOMFACTOR bounds.
+///
+/// `ZOOM_FACTOR_SYSVAR_MAX` is the range the system variable has: `SETVAR
+/// ZOOMFACTOR` accepts 3 to 100 and nothing else, so a drawing session set
+/// up on the command line stays within the range the variable has everywhere
+/// else. The Options window is the app's own surface and reaches
+/// `ZOOM_FACTOR_MAX` for anyone who wants a faster wheel than the variable
+/// can express; that value lives only in this application's own
+/// configuration file, so it is nobody else's to read.
+pub const ZOOM_FACTOR_MIN: i32 = 3;
+pub const ZOOM_FACTOR_SYSVAR_MAX: i32 = 100;
+pub const ZOOM_FACTOR_MAX: i32 = 500;
+
+/// Hold a ZOOMFACTOR inside the range the application can store, wherever it
+/// arrives from — the slider, the Options field, or a configuration file
+/// written by hand or by an older build.
+pub fn clamp_zoom_factor(v: i32) -> i32 {
+    v.clamp(ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX)
+}
+
+/// The `Camera::zoom` step one wheel notch means at `factor`. The default 60
+/// is one whole step, which is what makes 60 the setting that leaves the
+/// camera's own `ZOOM_STEP` untouched.
+pub fn zoom_notch_steps(factor: i32) -> f32 {
+    factor as f32 / 60.0
+}
+
+/// How much nearer one wheel notch brings the view at `factor`, as a
+/// percentage — the number the Options window shows, so that what the slider
+/// and the field are setting is readable instead of implied. Derived from the
+/// camera's own law, never from a second copy of it.
+pub fn zoom_notch_percent(factor: i32) -> f32 {
+    let ratio = crate::scene::view::camera::Camera::ZOOM_STEP
+        .powf(zoom_notch_steps(clamp_zoom_factor(factor)));
+    (1.0 - ratio) * 100.0
+}
+
 /// Active pair of axes while isometric drafting is enabled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsoPlane {
@@ -329,6 +366,15 @@ pub fn format_snap_angle(deg: f32) -> String {
 /// GRIPOBJLIMIT default: past this many selected objects, no grips are drawn.
 pub const DEFAULT_GRIP_OBJECT_LIMIT: i32 = 100;
 
+/// GRIPVERTLIMIT default: cap on TOTAL selection grips across all selected
+/// objects. `grip_object_limit` gates object count, but one dense polyline
+/// can emit ~2 grips/vertex past it — this caps the vertex blowup. Mid-segment
+/// grips are dropped first; vertex grips are kept.
+///
+/// `pub` so the `cargo bench` harness (external crate) measures the real
+/// constant alongside [`crate::app::apply_grip_budget`] as `ui_grip_budget`.
+pub const MAX_SELECTED_GRIPS: usize = 4096;
+
 /// The "settings" section of the consolidated config ([`crate::app::config`]).
 /// Field defaults mirror the app's in-code defaults so a missing key restores
 /// the value the app boots with.
@@ -337,6 +383,7 @@ pub const DEFAULT_GRIP_OBJECT_LIMIT: i32 = 100;
 pub struct UserSettings {
     pub spacemouse: crate::input::spacemouse::Preferences,
     pub dyn_input: bool,
+    pub dyn_mode: i16,
     pub polar: bool,
     pub polar_increment_deg: f32,
     pub zoom_wheel_reversed: bool,
@@ -357,6 +404,13 @@ pub struct UserSettings {
     /// GRIPOBJLIMIT: past this many selected objects, no grips are drawn at
     /// all. 0 means no limit. The drawing header carries no slot for it.
     pub grip_object_limit: i32,
+    /// IMAGEFRAME of the profile: used by new drawings and by drawings that
+    /// carry no image variables of their own.
+    pub image_frame: i16,
+    /// The Attribute Definition dialog's "Specify on-screen" choice.
+    pub attdef_on_screen: bool,
+    /// FIELDDISPLAY: fields show on a gray background.
+    pub field_display: bool,
     /// Nested-copy symbol handling: false inserts, true binds.
     pub ncopy_bind: bool,
     /// Last Options page; unknown saved names fall back without rejecting the config.
@@ -476,6 +530,10 @@ pub struct UserSettings {
     /// Minutes between autosaves to a `.sv$` recovery file (SAVETIME command).
     /// 0 disables autosave.
     pub savetime_min: i32,
+    /// SCRIPTCOMMANDS: whether a script (the Python plugin) may run OCS commands
+    /// through the host. On by default; a user turns it off with the
+    /// `SCRIPTCOMMANDS 0` command, and a script cannot change it.
+    pub script_commands: bool,
     /// File type and version used when a new/unsaved drawing is first saved.
     /// Existing drawings keep their own type and version.
     pub default_save_format: String,
@@ -530,6 +588,96 @@ pub struct UserSettings {
     /// Insertion frequency per block name (uppercase key → count).
     #[serde(default)]
     pub block_freq: std::collections::HashMap<String, u32>,
+    /// Blocks palette: the recent list (newest first, BLOCKMRULIST long).
+    #[serde(default)]
+    pub block_recent: Vec<PaletteBlockRef>,
+    /// Blocks palette: favorites, kept locally.
+    #[serde(default)]
+    pub block_favorites: Vec<PaletteBlockRef>,
+    /// Blocks palette: library folders or drawings, last used first.
+    #[serde(default)]
+    pub block_libraries: Vec<String>,
+    /// Blocks palette view: 0 extra large, 1 large, 2 medium, 3 small icons,
+    /// 4 details, 5 list.
+    #[serde(default = "default_block_view")]
+    pub block_palette_view: u8,
+    /// Blocks palette insertion options.
+    #[serde(default)]
+    pub block_insert: BlockInsertOptions,
+    /// BLOCKMRULIST (0–100, default 50).
+    #[serde(default = "default_block_mru_list")]
+    pub block_mru_list: u8,
+    /// BLOCKREDEFINEMODE (0–2, default 1).
+    #[serde(default = "default_one_u8")]
+    pub block_redefine_mode: u8,
+    /// BLOCKNAVIGATE (default ".").
+    #[serde(default = "default_block_navigate")]
+    pub block_navigate: String,
+}
+
+/// A block the Blocks palette lists from outside the current drawing (a
+/// recent or favorite entry): its name, the drawing it came from (empty for
+/// an unsaved drawing), when it was last used (Unix seconds), and whether it
+/// stands for a whole drawing inserted as a block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaletteBlockRef {
+    pub name: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub time: u64,
+    #[serde(default)]
+    pub drawing: bool,
+}
+
+/// The Blocks palette's insertion options.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlockInsertOptions {
+    pub insertion_point: bool,
+    pub scale: bool,
+    pub uniform: bool,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub rotation: bool,
+    pub angle: f64,
+    pub auto_placement: bool,
+    pub repeat: bool,
+    pub explode: bool,
+}
+
+impl Default for BlockInsertOptions {
+    fn default() -> Self {
+        Self {
+            insertion_point: true,
+            scale: false,
+            uniform: false,
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+            rotation: false,
+            angle: 0.0,
+            auto_placement: true,
+            repeat: false,
+            explode: false,
+        }
+    }
+}
+
+fn default_block_view() -> u8 {
+    1
+}
+
+fn default_block_mru_list() -> u8 {
+    50
+}
+
+fn default_one_u8() -> u8 {
+    1
+}
+
+fn default_block_navigate() -> String {
+    ".".to_string()
 }
 
 fn default_clipromptlines() -> i32 {
@@ -624,6 +772,7 @@ impl Default for UserSettings {
         Self {
             spacemouse: crate::input::spacemouse::Preferences::default(),
             dyn_input: true,
+            dyn_mode: 3,
             polar: false,
             polar_increment_deg: 45.0,
             zoom_wheel_reversed: false,
@@ -640,6 +789,9 @@ impl Default for UserSettings {
             right_click_mode: RightClickMode::ShortcutMenu,
             right_click_hold_ms: 250,
             grip_object_limit: DEFAULT_GRIP_OBJECT_LIMIT,
+            image_frame: 1,
+            attdef_on_screen: true,
+            field_display: true,
             ncopy_bind: false,
             cursor_type: CursorType::Crosshair,
             crosshair_color: None,
@@ -676,6 +828,7 @@ impl Default for UserSettings {
             constraint_bar_display: 3,
             constraint_bar_mode: 4095,
             savetime_min: 10,
+            script_commands: true,
             default_save_format: crate::io::DEFAULT_SAVE_FORMAT.to_string(),
             pick_add: true,
             pick_drag_rect: false,
@@ -692,6 +845,14 @@ impl Default for UserSettings {
             grid_beyond_limits: true,
             block_mru: Vec::new(),
             block_freq: std::collections::HashMap::new(),
+            block_recent: Vec::new(),
+            block_favorites: Vec::new(),
+            block_libraries: Vec::new(),
+            block_palette_view: 1,
+            block_insert: BlockInsertOptions::default(),
+            block_mru_list: 50,
+            block_redefine_mode: 1,
+            block_navigate: ".".to_string(),
         }
     }
 }
@@ -699,6 +860,33 @@ impl Default for UserSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Options read-out has to say what a notch really does, or it is
+    /// worse than no read-out. These are the percentages of the law in
+    /// `Camera::zoom`, which is where the number comes from: the default a
+    /// tenth of the distance, the top of the system variable's range a
+    /// sixth, and the top of the application's range a little over half.
+    #[test]
+    fn the_zoom_read_out_says_what_a_notch_does() {
+        for (factor, percent) in [(3, 0.53_f32), (60, 10.0), (100, 16.1), (500, 58.4)] {
+            let shown = zoom_notch_percent(factor);
+            assert!(
+                (shown - percent).abs() < 0.05,
+                "ZOOMFACTOR {factor} reads {shown}%, not {percent}%"
+            );
+        }
+        // A value from outside the range reads as the one that will be used.
+        assert_eq!(zoom_notch_percent(900), zoom_notch_percent(ZOOM_FACTOR_MAX));
+        assert_eq!(zoom_notch_percent(0), zoom_notch_percent(ZOOM_FACTOR_MIN));
+    }
+
+    /// The default is one whole step, which is the whole reason the camera's
+    /// base is the per-notch ratio and not something scaled.
+    #[test]
+    fn the_default_zoom_factor_is_one_step() {
+        assert_eq!(zoom_notch_steps(60), 1.0);
+        assert_eq!(UserSettings::default().zoom_factor, 60);
+    }
 
     /// Object snap ships live. The modes were always pre-selected; only the
     /// master switch was off, so a new user got a configured snap set that
@@ -787,6 +975,19 @@ mod tests {
         );
         assert!(!cfg.settings.pick_add, "the rest of the file must survive");
         assert_eq!(cfg.settings.savetime_min, 42);
+    }
+
+    #[test]
+    fn script_commands_default_on_and_survive_a_round_trip() {
+        let missing: crate::app::config::AppConfig =
+            serde_json::from_str(r#"{"settings": {"pick_add": false}}"#).unwrap();
+        assert!(missing.settings.script_commands, "an old config keeps scripts allowed");
+        let off: crate::app::config::AppConfig =
+            serde_json::from_str(r#"{"settings": {"script_commands": false}}"#).unwrap();
+        assert!(!off.settings.script_commands);
+        let text = serde_json::to_string(&off).unwrap();
+        let back: crate::app::config::AppConfig = serde_json::from_str(&text).unwrap();
+        assert!(!back.settings.script_commands);
     }
 
     #[test]

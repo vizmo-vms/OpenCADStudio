@@ -19,8 +19,8 @@
 
 use std::io::Write;
 
-use acadrust::types::{Transform, Vector3};
-use acadrust::EntityType;
+use codec::types::{Transform, Vector3};
+use codec::EntityType;
 
 use super::publish::{PageTransform, Publication};
 
@@ -182,7 +182,7 @@ pub fn write(geometry: &SnapGeometry, width_pt: u32, height_pt: u32) -> Vec<u8> 
 pub(crate) mod tests {
     use super::*;
     use crate::app::secureplan::publish::tests::{empty_survey_transform, synthetic_dxf_scene};
-    use acadrust::CadDocument;
+    use codec::CadDocument;
     use crate::app::secureplan::vectors;
     use std::io::Read;
 
@@ -329,11 +329,11 @@ pub(crate) mod tests {
     }
 
     fn line(x0: f64, y0: f64, x1: f64, y1: f64) -> EntityType {
-        EntityType::Line(acadrust::entities::Line::from_points(Vector3::new(x0, y0, 0.0), Vector3::new(x1, y1, 0.0)))
+        EntityType::Line(codec::entities::Line::from_points(Vector3::new(x0, y0, 0.0), Vector3::new(x1, y1, 0.0)))
     }
 
     pub(crate) fn block(doc: &mut CadDocument, name: &str, members: Vec<EntityType>) {
-        let mut record = acadrust::tables::BlockRecord::new(name);
+        let mut record = codec::tables::BlockRecord::new(name);
         record.handle = doc.allocate_handle();
         let owner = record.handle;
         doc.block_records.add(record).unwrap();
@@ -345,7 +345,7 @@ pub(crate) mod tests {
 
     #[test]
     fn negative_z_normals_are_mirrored_like_the_renderer_draws_them() {
-        use acadrust::entities::{Arc, Circle, Insert};
+        use codec::entities::{Arc, Circle, Insert};
         let down = Vector3::new(0.0, 0.0, -1.0);
         let mut doc = CadDocument::new();
         let mut circle = Circle::new();
@@ -383,13 +383,13 @@ pub(crate) mod tests {
 
     #[test]
     fn invisible_members_and_non_plotting_layers_contribute_no_snaps() {
-        use acadrust::entities::Insert;
+        use codec::entities::Insert;
         let mut doc = CadDocument::new();
         let mut hidden = line(0.0, 0.0, 0.0, 50.0);
         hidden.common_mut().invisible = true;
         block(&mut doc, "PARTLY_HIDDEN", vec![line(0.0, 0.0, 50.0, 0.0), hidden]);
         doc.add_entity(EntityType::Insert(Insert::new("PARTLY_HIDDEN", Vector3::new(0.0, 0.0, 0.0)))).unwrap();
-        let mut no_plot = acadrust::tables::Layer::new("NO_PLOT");
+        let mut no_plot = codec::tables::Layer::new("NO_PLOT");
         no_plot.is_plottable = false;
         doc.layers.add(no_plot).unwrap();
         let mut guide = line(-100.0, 100.0, 100.0, 100.0);
@@ -409,7 +409,7 @@ pub(crate) mod tests {
     fn segments_are_clipped_to_the_page_and_hidden_layers_are_skipped() {
         let mut doc = CadDocument::new();
         doc.add_entity(line(-9000.0, 9000.0, 39000.0, 9000.0)).unwrap();
-        let mut hidden = acadrust::tables::Layer::new("HIDDEN");
+        let mut hidden = codec::tables::Layer::new("HIDDEN");
         hidden.flags.off = true;
         doc.layers.add(hidden).unwrap();
         let mut off = line(0.0, 0.0, 30000.0, 18000.0);

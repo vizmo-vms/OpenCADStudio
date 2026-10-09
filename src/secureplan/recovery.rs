@@ -316,9 +316,12 @@ impl crate::app::OpenCADStudio {
             _ => {
                 let (format, version, name) = match &bound.loaded {
                     Some(loaded) => (loaded.format, loaded.version(), loaded.name.expose().clone()),
-                    None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
+                    None => (Format::Dxf, codec::DxfVersion::AC1032, "drawing.dxf".to_string()),
                 };
-                let document = &tab.scene.document;
+                // As a file stores it: no dynamic dimension's screen-size overrides.
+                let mut document = tab.scene.document.clone();
+                tab.scene.strip_dynamic_dimension_overrides(&mut document);
+                let document = &document;
                 // A copy that would drop content is no copy: the caller
                 // reports the preservation as failed.
                 let lossless = |format: Format, version| crate::io::dropped_on_save_count(document, version, format == Format::Dxf) == 0;
@@ -327,8 +330,8 @@ impl crate::app::OpenCADStudio {
                 let written = lossless(format, version).then(|| crate::io::save_to_bytes(document, format.ext(), version).ok()).flatten();
                 let (format, bytes) = match written {
                     Some(bytes) => (format, bytes),
-                    None if lossless(Format::Dxf, acadrust::DxfVersion::AC1032) => {
-                        (Format::Dxf, crate::io::save_to_bytes(document, "dxf", acadrust::DxfVersion::AC1032).ok()?)
+                    None if lossless(Format::Dxf, codec::DxfVersion::AC1032) => {
+                        (Format::Dxf, crate::io::save_to_bytes(document, "dxf", codec::DxfVersion::AC1032).ok()?)
                     }
                     None => return None,
                 };

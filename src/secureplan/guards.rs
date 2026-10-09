@@ -228,9 +228,9 @@ pub(crate) mod tests {
     }
 
     /// A drawing whose table links to `path`, as the link manager stores it.
-    fn data_link_drawing(path: &std::path::Path, writable: bool) -> (acadrust::CadDocument, acadrust::Handle) {
-        use acadrust::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
-        let mut doc = acadrust::CadDocument::new();
+    fn data_link_drawing(path: &std::path::Path, writable: bool) -> (codec::CadDocument, codec::Handle) {
+        use codec::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
+        let mut doc = codec::CadDocument::new();
         let handle = doc.allocate_handle();
         let link = DataLink { connection_string: path.to_string_lossy().into_owned(), option: i32::from(writable), path_option: 1, ..Default::default() };
         let mut object = ClassObject::new(ClassObjectData::DataLink(link));
@@ -268,7 +268,7 @@ pub(crate) mod tests {
         let dir = temp_dir("texture");
         let path = dir.join("brick.png");
         image::RgbaImage::new(2, 2).save(&path).unwrap();
-        let map = acadrust::objects::MaterialMap {
+        let map = codec::objects::MaterialMap {
             source: 1,
             file_name: path.to_string_lossy().into_owned(),
             ..Default::default()
@@ -286,12 +286,12 @@ pub(crate) mod tests {
         let _lock = RESOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("xref");
         let target = dir.join("inner.dwg");
-        let inner = acadrust::CadDocument::new();
+        let inner = codec::CadDocument::new();
         let bytes = crate::io::save_to_bytes(&inner, "dwg", inner.version).unwrap();
         std::fs::write(&target, bytes).unwrap();
         let host = || {
-            let mut doc = acadrust::CadDocument::new();
-            let mut record = acadrust::tables::BlockRecord::new("INNER");
+            let mut doc = codec::CadDocument::new();
+            let mut record = codec::tables::BlockRecord::new("INNER");
             record.flags.is_xref = true;
             record.xref_path = target.to_string_lossy().into_owned();
             doc.block_records.add(record).unwrap();
@@ -343,10 +343,10 @@ pub(crate) mod tests {
         assert!(crate::scene::model::pdf_raster::rasterize_page(&pdf.to_string_lossy(), "1").is_some());
 
         let target = dir.join("inner.dwg");
-        let inner = acadrust::CadDocument::new();
+        let inner = codec::CadDocument::new();
         std::fs::write(&target, crate::io::save_to_bytes(&inner, "dwg", inner.version).unwrap()).unwrap();
-        let mut host = acadrust::CadDocument::new();
-        let mut record = acadrust::tables::BlockRecord::new("INNER");
+        let mut host = codec::CadDocument::new();
+        let mut record = codec::tables::BlockRecord::new("INNER");
         record.flags.is_xref = true;
         record.xref_path = unc(&target);
         host.block_records.add(record).unwrap();
@@ -357,12 +357,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_drawing_with_a_pdf_underlay_loads_without_reading_it_while_refused() {
-        use acadrust::entities::{Underlay, UnderlayDefinition, UnderlayType};
-        use acadrust::objects::ObjectType;
+        use codec::entities::{Underlay, UnderlayDefinition, UnderlayType};
+        use codec::objects::ObjectType;
         let _lock = RESOURCE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("underlay");
         write_pdf(&dir.join("plan.pdf"));
-        let mut doc = acadrust::CadDocument::new();
+        let mut doc = codec::CadDocument::new();
         let mut definition = UnderlayDefinition::new(UnderlayType::Pdf);
         definition.handle = doc.allocate_handle();
         definition.file_path = "plan.pdf".into();
@@ -372,7 +372,7 @@ pub(crate) mod tests {
         doc.objects.insert(definition_handle, ObjectType::UnderlayDefinition(definition));
         let mut underlay = Underlay::new(UnderlayType::Pdf);
         underlay.definition_handle = definition_handle;
-        doc.add_entity(acadrust::EntityType::Underlay(underlay)).unwrap();
+        doc.add_entity(codec::EntityType::Underlay(underlay)).unwrap();
         let drawing = dir.join("synthetic.dwg");
         std::fs::write(&drawing, crate::io::save_to_bytes(&doc, "dwg", doc.version).unwrap()).unwrap();
 
@@ -382,14 +382,14 @@ pub(crate) mod tests {
             let (underlay, definition) = doc
                 .entities()
                 .find_map(|entity| match entity {
-                    acadrust::EntityType::Underlay(u) => match doc.objects.get(&u.definition_handle) {
+                    codec::EntityType::Underlay(u) => match doc.objects.get(&u.definition_handle) {
                         Some(ObjectType::UnderlayDefinition(def)) => Some((u.clone(), def.clone())),
                         _ => None,
                     },
                     _ => None,
                 })
                 .expect("the underlay survives the round trip");
-            let image = crate::scene::model::image_model::ImageModel::from_underlay(&underlay, &definition);
+            let image = crate::scene::model::image_model::ImageModel::from_underlay(&underlay, &definition, [1.0, 1.0, 1.0, 1.0], None);
             (definition.file_path, image.is_some())
         };
         set_external_resource_refused(ExternalResource::Image, true);
@@ -429,11 +429,11 @@ pub(crate) mod tests {
         // and a UNC path on Windows, so it must never be stat'ed or read.
         let remote = format!("/{local}");
         for style in [remote.clone(), "\\\\attacker\\share\\font.shx".to_string()] {
-            let mut doc = acadrust::CadDocument::new();
-            let mut text = acadrust::entities::Text::new();
+            let mut doc = codec::CadDocument::new();
+            let mut text = codec::entities::Text::new();
             text.value = "SYNTHETIC".into();
             text.style = style.clone();
-            doc.add_entity(acadrust::EntityType::Text(text)).unwrap();
+            doc.add_entity(codec::EntityType::Text(text)).unwrap();
             let resolved = crate::entities::text_support::resolve_text_style(&style, &doc);
             assert!(!matches!(Face::resolve(&resolved.font_name), Face::Shx { .. }), "{style} resolved to an SHX file");
             let mut scene = crate::scene::Scene::new();
@@ -442,8 +442,8 @@ pub(crate) mod tests {
         }
         assert!(crate::scene::text::shx::font_metrics(&remote).is_none(), "a remote SHX was read");
         // A style that names a remote font file is refused the same way.
-        let mut doc = acadrust::CadDocument::new();
-        let mut style = acadrust::tables::TextStyle::new("REMOTE");
+        let mut doc = codec::CadDocument::new();
+        let mut style = codec::tables::TextStyle::new("REMOTE");
         style.font_file = remote.clone();
         doc.text_styles.add(style).unwrap();
         let resolved = crate::entities::text_support::resolve_text_style("REMOTE", &doc);

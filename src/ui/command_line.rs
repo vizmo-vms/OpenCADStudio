@@ -51,11 +51,20 @@ fn cmd_input_id() -> iced::widget::Id {
     iced::widget::Id::new(CMD_INPUT_ID)
 }
 
-fn mcp_status(enabled: bool, busy: bool) -> (&'static str, Color) {
+/// Footer pill state for the automation channel. `waiting` — a client
+/// `user_select` / `getpoint` is parked and the person at the screen must
+/// answer — outranks `busy`: the screen has to say "act now", not just
+/// "something is running".
+fn mcp_status(enabled: bool, busy: bool, waiting: bool) -> (&'static str, Color) {
     if !enabled {
         (
             "MCP control is off",
             Color::from_rgb(0.90, 0.35, 0.35),
+        )
+    } else if waiting {
+        (
+            "MCP is waiting for you to pick — Enter confirms, Esc cancels",
+            Color::from_rgb(0.30, 0.55, 0.98),
         )
     } else if busy {
         (
@@ -129,6 +138,13 @@ pub struct CommandLine {
     pub history: Vec<HistoryEntry>,
     pub error_revision: u64,
     pub last_error: Option<String>,
+    /// Tokens from the last multi-token command line that no prompt ever
+    /// consumed — e.g. a trailing word after an in-place text step, or a typo'd
+    /// extra argument (`CIRCLE 0,0 5 9`). The headless automation feeder reports
+    /// them so a caller can tell "part of my line was silently dropped" from
+    /// "the command ran exactly as typed". Cleared at the start of every
+    /// `run_command_line`, not persisted.
+    pub unconsumed: Vec<String>,
     /// Successfully dispatched commands used for ↑/↓ recall, newest last.
     /// Stored separately because recall also maintains its own cursor and draft.
     pub cmd_recall: Vec<String>,
@@ -148,8 +164,9 @@ pub struct CommandLine {
     pub history_open: bool,
     /// Persisted height of the full-history editor in logical pixels.
     pub history_height: f32,
-    /// Index of the currently-highlighted autocomplete suggestion, or
-    /// `None` before keyboard navigation begins. Reset when input changes.
+    /// Index of the currently-highlighted autocomplete suggestion. `None`
+    /// means the first match is pre-selected (highlighted) before keyboard
+    /// navigation begins. Reset when input changes.
     pub autocomplete_cursor: Option<usize>,
     /// Command names contributed by loaded plugins, refreshed whenever the
     /// enabled-plugin set changes. Merged into autocomplete alongside the
@@ -186,6 +203,7 @@ impl Default for CommandLine {
             history: Vec::new(),
             error_revision: 0,
             last_error: None,
+            unconsumed: Vec::new(),
             cmd_recall: Vec::new(),
             recent_commands: Vec::new(),
             recent_inputs: Vec::new(),
@@ -605,11 +623,20 @@ impl CommandLine {
         true
     }
 
-    /// The command name explicitly highlighted in the autocomplete popup.
+    /// The command name highlighted in the autocomplete popup. Before any
+    /// arrow-key navigation the first match is pre-selected (the popup renders
+    /// `autocomplete_cursor.unwrap_or(0)` as highlighted), so Enter runs that
+    /// entry — never a different command resolved through another path.
     pub fn selected_suggestion(&self) -> Option<String> {
         let matches = self.autocomplete_matches();
-        self.autocomplete_cursor
-            .and_then(|index| matches.get(index).cloned())
+        if matches.is_empty() {
+            return None;
+        }
+        let index = self
+            .autocomplete_cursor
+            .unwrap_or(0)
+            .min(matches.len() - 1);
+        matches.get(index).cloned()
     }
 
     /// Autocomplete suggestions for the current input — see
@@ -630,6 +657,8 @@ impl CommandLine {
         window_height: f32,
         control_enabled: bool,
         control_busy: bool,
+        pick_pending: bool,
+        graph_open: bool,
     ) -> Element<'a, Message> {
         // Only the most recent entries pushed within COMMANDLINEFADETIME
         // show on the overlay (0 skips transient lines). The dropdown button
@@ -785,7 +814,16 @@ impl CommandLine {
                 let mut col = column![].spacing(0).width(Length::Fill);
                 for (idx, cmd) in matches.iter().enumerate() {
                     let is_selected = idx == cursor;
-                    let row = button(text(cmd.clone()).size(11))
+                    // Every row keeps the icon's width so names line up.
+                    let icon: Element<'_, Message> =
+                        match crate::modules::registry::command_icon(cmd) {
+                            Some(bytes) => crate::ui::icons::semantic(bytes, 14.0),
+                            None => Space::new().width(14.0).into(),
+                        };
+                    let label = row![icon, text(cmd.clone()).size(11)]
+                        .spacing(6)
+                        .align_y(iced::Center);
+                    let row = button(label)
                         .on_press(Message::CommandSuggestionPick(cmd.clone()))
                         .width(Length::Fill)
                         .padding([2, 8])
@@ -841,7 +879,7 @@ impl CommandLine {
                 .align_y(iced::alignment::Vertical::Center),
         ]
         .width(Length::Fill);
-        let (mcp_tooltip, mcp_color) = mcp_status(control_enabled, control_busy);
+        let (mcp_tooltip, mcp_color) = mcp_status(control_enabled, control_busy, pick_pending);
         let mcp_btn = button(text("MCP").size(11))
             .on_press(Message::ControlToggle)
             .style(move |theme: &Theme, status| {
@@ -863,7 +901,21 @@ impl CommandLine {
                 bottom: 0.0,
                 left: 0.0,
             });
-        let input_row = row![prompt, literal_btn, input_with_history, mcp_btn]
+        let graph_btn = button(crate::ui::icons::themed(crate::ui::icons::NODE_GRAPH, 13.0))
+            .on_press(Message::Graph(crate::ui::node_graph::GraphMsg::Toggle))
+            .style(move |theme: &Theme, status| {
+                if graph_open {
+                    button::primary(theme, status)
+                } else {
+                    button::subtle(theme, status)
+                }
+            })
+            .padding([2, 6]);
+        let graph_tip = container(text(t!("Node graph")).size(11))
+            .padding([3, 6])
+            .style(container::bordered_box);
+        let graph_btn = tooltip(graph_btn, graph_tip, tooltip::Position::Top).gap(4);
+        let input_row = row![prompt, literal_btn, input_with_history, graph_btn, mcp_btn]
             .spacing(4)
             .align_y(iced::Center);
 
@@ -1154,9 +1206,14 @@ mod tests {
 
     #[test]
     fn mcp_status_distinguishes_off_ready_and_busy() {
-        assert_eq!(mcp_status(false, false).0, "MCP control is off");
-        assert_eq!(mcp_status(true, false).0, "MCP control is ready");
-        assert_eq!(mcp_status(true, true).0, "MCP is handling a request");
+        assert_eq!(mcp_status(false, false, false).0, "MCP control is off");
+        assert_eq!(mcp_status(true, false, false).0, "MCP control is ready");
+        assert_eq!(mcp_status(true, true, false).0, "MCP is handling a request");
+        // A parked pick outranks the plain busy state: the person must act.
+        assert_eq!(
+            mcp_status(true, true, true).0,
+            "MCP is waiting for you to pick — Enter confirms, Esc cancels"
+        );
     }
 
     #[test]
@@ -1201,6 +1258,59 @@ mod tests {
         assert_eq!(m.first().map(String::as_str), Some("AREA"), "got {m:?}");
         let m = ranked_matches("L", &[], &a);
         assert_eq!(m.first().map(String::as_str), Some("LINE"), "got {m:?}");
+    }
+
+    #[test]
+    fn preselected_top_suggestion_is_returned_without_navigation() {
+        // The popup highlights the first match before any arrow-key navigation
+        // (`unwrap_or(0)` in `view`); Enter must run that same entry. Typing
+        // `LT` with no alias table highlights `LTSCALE`, so the pre-selection
+        // must be `LTSCALE` — not `None` (which would fall through to alias /
+        // closest-match resolution and could run a different command).
+        let mut line = CommandLine::new();
+        line.clear_history();
+        line.command_aliases = FxHashMap::default();
+        line.input = "LT".to_string();
+        line.autocomplete_cursor = None;
+        let matches = line.autocomplete_matches();
+        assert_eq!(
+            matches.first().map(String::as_str),
+            Some("LTSCALE"),
+            "got {matches:?}"
+        );
+        assert_eq!(
+            line.selected_suggestion().as_deref(),
+            Some("LTSCALE"),
+            "Enter must run the highlighted pre-selection"
+        );
+    }
+
+    #[test]
+    fn preselected_alias_target_is_returned_without_navigation() {
+        // With the `LT` → `LINETYPE` alias, the forced top entry is `LINETYPE`
+        // and Enter must run it without requiring arrow-key navigation.
+        let mut line = CommandLine::new();
+        line.clear_history();
+        line.command_aliases = aliases(&[("LT", "LINETYPE"), ("LTS", "LTSCALE")]);
+        line.input = "LT".to_string();
+        line.autocomplete_cursor = None;
+        assert_eq!(
+            line.selected_suggestion().as_deref(),
+            Some("LINETYPE"),
+            "got {:?}",
+            line.autocomplete_matches()
+        );
+    }
+
+    #[test]
+    fn no_preselection_without_matches_or_input() {
+        let mut line = CommandLine::new();
+        line.clear_history();
+        line.input = String::new();
+        line.autocomplete_cursor = None;
+        assert_eq!(line.selected_suggestion(), None);
+        line.input = "ZZZ_NO_SUCH_COMMAND".to_string();
+        assert_eq!(line.selected_suggestion(), None);
     }
 
     #[test]
