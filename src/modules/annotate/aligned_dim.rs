@@ -1,8 +1,8 @@
 // DIMALIGNED command — aligned dimension (measures true distance between two points).
 
-use acadrust::entities::{Dimension, DimensionAligned};
-use acadrust::types::{Handle, Vector3};
-use acadrust::EntityType;
+use codec::entities::{Dimension, DimensionAligned};
+use codec::types::{Handle, Vector3};
+use codec::EntityType;
 use glam::DVec3;
 
 use crate::command::{
@@ -67,24 +67,35 @@ impl AlignedDimensionCommand {
         let first = self.plane.to_local(first);
         let second = self.plane.to_local(second);
         let point = self.plane.to_local(point);
-        let mut dim = DimensionAligned::new(v3(first), v3(second));
-        // The placement point is stored so commit matches the preview.
-        dim.definition_point = v3(point);
-        dim.base.definition_point = v3(point);
-        let (d1, d2) = dim_line_endpoints(first, second, point);
-        dim.base.text_middle_point = v3((d1 + d2) * 0.5);
-        dim.base.insertion_point = dim.base.text_middle_point;
-        dim.base.actual_measurement = dim.measurement();
-        crate::entities::dimension::set_dimension_text_override(
-            &mut dim.base,
-            self.text_override.clone(),
-        );
+        let mut entity = aligned_dimension_entity(first, second, point, self.text_override.clone());
         // An explicit text angle overrides the default rotation.
-        if let Some(angle) = self.text_angle {
-            dim.base.text_rotation = angle;
+        if let (Some(angle), EntityType::Dimension(dimension)) = (self.text_angle, &mut entity) {
+            dimension.base_mut().text_rotation = angle;
         }
-        self.plane.place_entity(EntityType::Dimension(Dimension::Aligned(dim)))
+        self.plane.place_entity(entity)
     }
+}
+
+/// An aligned dimension between two points of the working plane, its
+/// dimension line through `point` — what DIMALIGNED places and what an
+/// aligned dimensional constraint draws.
+pub(crate) fn aligned_dimension_entity(
+    first: DVec3,
+    second: DVec3,
+    point: DVec3,
+    text_override: Option<String>,
+) -> EntityType {
+    let mut dim = DimensionAligned::new(v3(first), v3(second));
+    // The placement point is stored so commit matches the preview.
+    dim.definition_point = v3(point);
+    dim.base.definition_point = v3(point);
+    let (d1, d2) = dim_line_endpoints(first, second, point);
+    dim.base.text_middle_point = v3((d1 + d2) * 0.5);
+    dim.base.insertion_point = dim.base.text_middle_point;
+    crate::entities::dimension::reset_automatic_text_position(&mut dim.base);
+    dim.base.actual_measurement = dim.measurement();
+    crate::entities::dimension::set_dimension_text_override(&mut dim.base, text_override);
+    EntityType::Dimension(Dimension::Aligned(dim))
 }
 
 impl CadCommand for AlignedDimensionCommand {
@@ -329,6 +340,7 @@ impl CadCommand for AlignedDimensionCommand {
             world_width: 0.0,
             depth_override: None,
             display_visible: true,
+            snap_only: false,
             plot_visible: true,
             fill_is_3d: false,
             fill_is_2d_solid: false,
@@ -354,7 +366,9 @@ impl CadCommand for AlignedDimensionCommand {
             plinegen: true,
             fill_tris: vec![],
             fill_tris_low: Vec::new(),
-        })
+        
+            ..Default::default()
+})
     }
 
     fn dyn_spec(&self) -> Option<crate::command::DynSpec> {
@@ -421,6 +435,7 @@ fn preview_aligned(p1: DVec3, p2: DVec3, dim_pt: DVec3) -> WireModel {
         world_width: 0.0,
         depth_override: None,
         display_visible: true,
+        snap_only: false,
         plot_visible: true,
         fill_is_3d: false,
         fill_is_2d_solid: false,
@@ -469,7 +484,9 @@ fn preview_aligned(p1: DVec3, p2: DVec3, dim_pt: DVec3) -> WireModel {
         plinegen: true,
         fill_tris: vec![],
         fill_tris_low: Vec::new(),
-    }
+    
+        ..Default::default()
+}
 }
 
 

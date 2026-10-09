@@ -1,7 +1,9 @@
 pub(crate) mod spacemouse;
 use crate::app::config::UiThemeConfig;
+use crate::app::settings;
 use crate::app::settings::{CursorType, RightClickMode};
 use crate::app::Message;
+use crate::ui::style::form::{dialog_button, dialog_button_styled_opt};
 use iced::widget::{
     button, column, container, row, scrollable, slider, text, text_input, Space,
 };
@@ -54,7 +56,8 @@ pub struct AppPrefs {
     pub commandline_fade_ms: i32,
     /// ZOOMWHEEL: reverse the mouse-wheel zoom direction.
     pub zoom_wheel_reversed: bool,
-    /// ZOOMFACTOR, 3..=100.
+    /// ZOOMFACTOR. The slider sets the range the system variable has; the
+    /// field beside it reaches `settings::ZOOM_FACTOR_MAX`.
     pub zoom_factor: i32,
     /// TEXTEDITMODE: TEXTEDIT keeps prompting for the next object.
     pub texteditmode: bool,
@@ -199,6 +202,7 @@ pub fn view_window<'a>(
     prefs: AppPrefs,
     spacemouse: Element<'a, Message>,
     snap_angle_input: &'a str,
+    zoom_factor_input: &'a str,
     drawing_prefs: DrawingPrefs,
     folders: Folders,
     double_click_block_refedit: bool,
@@ -315,18 +319,17 @@ pub fn view_window<'a>(
 
     // Changes show at once but are committed by OK / Apply; Close puts them
     // back (asking first when there is something to lose).
-    let ok = button(text(crate::t!("OK")).size(12))
-        .on_press(Message::OptionsOk)
-        .padding([6, 18])
-        .style(button::primary);
-    let apply = button(text(crate::t!("Apply")).size(12))
-        .on_press_maybe(dirty.then_some(Message::OptionsApply))
-        .padding([6, 18])
-        .style(if dirty { button::secondary } else { button::text });
-    let close = button(text(crate::tr!("action", "close")).size(12))
-        .on_press(Message::OptionsClose)
-        .padding([6, 18])
-        .style(button::secondary);
+    let ok = dialog_button(crate::t!("OK"), Message::OptionsOk, true);
+    let apply = dialog_button_styled_opt(
+        crate::t!("Apply"),
+        dirty.then_some(Message::OptionsApply),
+        if dirty {
+            button::secondary
+        } else {
+            button::text
+        },
+    );
+    let close = dialog_button(crate::tr!("action", "close"), Message::OptionsClose, false);
 
     let general = column![
         text(crate::tr!("options", "language-section")).size(15),
@@ -1191,10 +1194,24 @@ pub fn view_window<'a>(
         Space::new().height(12),
         row![
             text(crate::t!("Zoom factor")).size(12).width(150),
-            slider(3..=100, prefs.zoom_factor.clamp(3, 100), Message::ZoomFactorChanged)
-                .step(1)
-                .width(Fill),
-            text(prefs.zoom_factor.clamp(3, 100).to_string()).size(11).width(44),
+            slider(
+                settings::ZOOM_FACTOR_MIN..=settings::ZOOM_FACTOR_SYSVAR_MAX,
+                prefs
+                    .zoom_factor
+                    .clamp(settings::ZOOM_FACTOR_MIN, settings::ZOOM_FACTOR_SYSVAR_MAX),
+                Message::ZoomFactorChanged,
+            )
+            .step(1)
+            .width(Fill),
+            text_input("60", zoom_factor_input)
+                .on_input(Message::ZoomFactorInputChanged)
+                .width(52),
+            text(crate::tf!(
+                "{:.1}% a notch",
+                settings::zoom_notch_percent(prefs.zoom_factor)
+            ))
+            .size(11)
+            .width(76),
         ]
         .spacing(10)
         .align_y(iced::Center),
@@ -1202,6 +1219,15 @@ pub fn view_window<'a>(
         text(crate::t!("How far one wheel notch zooms (ZOOMFACTOR)."))
             .size(11)
             .width(sizing.width),
+        Space::new().height(4),
+        text(crate::tf!(
+            "The slider covers the system variable's {} to {}; the field takes up to {} for a faster wheel.",
+            settings::ZOOM_FACTOR_MIN,
+            settings::ZOOM_FACTOR_SYSVAR_MAX,
+            settings::ZOOM_FACTOR_MAX
+        ))
+        .size(11)
+        .width(sizing.width),
         Space::new().height(24),
         text(crate::t!("Text and Dimensions")).size(15),
         Space::new().height(10),

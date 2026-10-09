@@ -89,6 +89,8 @@ cp "target/$TARGET/release/OpenCADStudio" "$APP/Contents/MacOS/OpenCADStudio-App
 chmod +x "$APP/Contents/MacOS/OpenCADStudio" "$APP/Contents/MacOS/OpenCADStudio-App"
 cp "$DIST/AppIcon.icns" "$DIST/DWG.icns" "$DIST/DXF.icns" "$APP/Contents/Resources/"
 cp -R "$EXT" "$APP/Contents/PlugIns/"
+bash plugins/opencad-python/tools/stage-bundled.sh \
+    "$APP/Contents/Resources/plugins/opencad.python" --target "$TARGET"
 sed "s/__VERSION__/$VERSION/g" packaging/Info.plist > "$APP/Contents/Info.plist"
 
 echo "==> codesign"
@@ -97,6 +99,8 @@ if [ "$DEVELOPER_ID" = "-" ]; then
     # Ad-hoc signing cannot be notarized.
     codesign --force --sign - --timestamp=none \
         "$APP/Contents/MacOS/OpenCADStudio-App"
+    codesign --force --sign - --timestamp=none \
+        "$APP/Contents/Resources/plugins/opencad.python/libopencad_python.dylib"
     codesign --force --sign - --timestamp=none \
         --entitlements crates/dwg-thumbnailer/macos/entitlements.plist \
         "$APP/Contents/PlugIns/DWGThumbnail.appex"
@@ -107,6 +111,9 @@ else
     # and a secure timestamp on every layer for notarization.
     codesign --force --timestamp --options runtime \
         -s "$DEVELOPER_ID" "$APP/Contents/MacOS/OpenCADStudio-App"
+    codesign --force --timestamp --options runtime \
+        -s "$DEVELOPER_ID" \
+        "$APP/Contents/Resources/plugins/opencad.python/libopencad_python.dylib"
     codesign --force --timestamp --options runtime \
         --entitlements crates/dwg-thumbnailer/macos/entitlements.plist \
         -s "$DEVELOPER_ID" "$APP/Contents/PlugIns/DWGThumbnail.appex"

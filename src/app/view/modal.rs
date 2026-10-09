@@ -23,7 +23,24 @@ impl OpenCADStudio {
             Some(K::LayerStateManager) => crate::tr!("modal", "layer-state-manager"),
             Some(K::LayerTranslator) => crate::t!("Layer Translator").into_owned(),
             Some(K::DrawingUnits) => crate::t!("Drawing Units").into_owned(),
+            Some(K::BlockDefinition) => crate::t!("Block Definition").into_owned(),
+            Some(K::PdfAttach) => match self.pdf_attach.as_ref().map(|s| s.kind) {
+                Some(codec::entities::UnderlayType::Dwf) => crate::t!("Attach DWF Underlay").into_owned(),
+                Some(codec::entities::UnderlayType::Dgn) => crate::t!("Attach DGN Underlay").into_owned(),
+                _ => crate::t!("Attach PDF Underlay").into_owned(),
+            },
+            Some(K::PointCloudAttach) => crate::t!("Attach Point Cloud").into_owned(),
+            Some(K::PointCloudColorMap) => crate::t!("Point Cloud Color Map").into_owned(),
+            Some(K::PcSection) => crate::t!("Extract Section Lines from Point Cloud").into_owned(),
+            Some(K::UnderlayLayers) => crate::t!("Underlay Layers").into_owned(),
+            Some(K::PdfImportSettings) => crate::t!("PDF Import Settings").into_owned(),
+            Some(K::PdfImportFile) => crate::t!("Import PDF").into_owned(),
+            Some(K::XrefAttach) => crate::t!("Attach External Reference").into_owned(),
+            Some(K::WriteBlock) => crate::t!("Write Block").into_owned(),
             Some(K::GeometricTolerance) => crate::t!("Geometric Tolerance").into_owned(),
+            Some(K::AttDef) => crate::t!("Attribute Definition").into_owned(),
+            Some(K::AttDefEdit) => crate::t!("Edit Attribute Definition").into_owned(),
+            Some(K::Field) => crate::t!("Field").into_owned(),
             Some(K::DraftingSettings) => crate::t!("Drafting Settings").into_owned(),
             Some(K::AutoConstrainSettings) => crate::t!("Constraint Settings").into_owned(),
             Some(K::LayerStateEditor) => crate::tr!("modal", "edit-layer-state"),
@@ -314,6 +331,7 @@ impl OpenCADStudio {
                             self.spacemouse_paused, self.spacemouse_details,
                         ),
                         &self.snap_angle_input,
+                        &self.zoom_factor_input,
                         {
                             let header = self
                                 .tabs
@@ -499,6 +517,77 @@ impl OpenCADStudio {
                     crate::ui::window::drawing_units::view_window(state, flow)
                 })
             }
+            super::super::ModalKind::BlockDefinition => {
+                let state = self.block_definition.as_ref()?;
+                sized_flow(ex, 580, 390, |flow| {
+                    crate::ui::window::block_definition::view_window(state, flow)
+                })
+            }
+            super::super::ModalKind::PdfAttach => {
+                let state = self.pdf_attach.as_ref()?;
+                sized_flow(ex, 880, 540, |flow| {
+                    crate::ui::window::pdf_dialogs::view_attach(state, flow)
+                })
+            }
+            super::super::ModalKind::PointCloudAttach => {
+                let state = self.point_cloud_attach.as_ref()?;
+                sized_flow(ex, 880, 560, |flow| {
+                    crate::ui::window::pdf_dialogs::view_point_cloud_attach(state, flow)
+                })
+            }
+            super::super::ModalKind::PointCloudColorMap => {
+                let state = self.point_cloud_color_map.as_ref()?;
+                sized_flow(ex, 760, 560, |flow| {
+                    crate::ui::window::pdf_dialogs::view_point_cloud_color_map(state, flow)
+                })
+            }
+            super::super::ModalKind::PcSection => {
+                let state = self.pc_section.as_ref()?;
+                sized_flow(ex, 760, 470, |flow| crate::ui::window::pdf_dialogs::view_pc_section(state, flow))
+            }
+            super::super::ModalKind::UnderlayLayers => {
+                let state = self.underlay_layers.as_ref()?;
+                sized_flow(ex, 460, 520, |flow| {
+                    crate::ui::window::pdf_dialogs::view_layers(state, flow)
+                })
+            }
+            super::super::ModalKind::PdfImportSettings => {
+                let settings = self.pdf_import_settings.as_ref()?;
+                sized_flow(ex, 640, 380, |flow| {
+                    crate::ui::window::pdf_dialogs::view_import_settings(settings, flow)
+                })
+            }
+            super::super::ModalKind::PdfImportFile => {
+                let state = self.pdf_import_file.as_ref()?;
+                sized_flow(ex, 960, 560, |flow| {
+                    crate::ui::window::pdf_dialogs::view_import_file(state, flow)
+                })
+            }
+            super::super::ModalKind::XrefAttach => {
+                let state = self.xref_attach.as_ref()?;
+                let height = if state.details { 520 } else { 450 };
+                sized_flow(ex, 740, height, |flow| {
+                    crate::ui::window::xref_attach::view_window(state, flow)
+                })
+            }
+            super::super::ModalKind::WriteBlock => {
+                let state = self.wblock.as_ref()?;
+                sized_flow(ex, 440, 395, |flow| {
+                    crate::ui::window::wblock::view_window(state, flow)
+                })
+            }
+            super::super::ModalKind::AttDef => {
+                let state = self.attdef_dialog.as_ref()?;
+                sized_flow(ex, 720, 520, |flow| crate::ui::window::attdef_dialog::view(state, flow))
+            }
+            super::super::ModalKind::Field => {
+                let state = self.field_dialog.as_ref()?;
+                sized_flow(ex, 760, 660, |flow| crate::ui::window::field_dialog::view(state, flow))
+            }
+            super::super::ModalKind::AttDefEdit => {
+                let state = self.attdef_edit.as_ref()?;
+                sized_flow(ex, 460, 220, |flow| crate::ui::window::attdef_dialog::view_edit(state, flow))
+            }
             super::super::ModalKind::GeometricTolerance => {
                 let state = self.geometric_tolerance.as_ref()?;
                 sized_flow(ex, 670, 530, |flow| {
@@ -637,7 +726,7 @@ impl OpenCADStudio {
                 let tab = &self.tabs[self.active_tab];
                 let entity = self.anno_object_scale_target;
                 // Which scales the object currently has a representation for.
-                let members: Vec<acadrust::types::Handle> = entity
+                let members: Vec<codec::types::Handle> = entity
                     .map(|h| {
                         crate::scene::annotative::object_scale_memberships(
                             &tab.scene.document,
@@ -651,10 +740,10 @@ impl OpenCADStudio {
                 let label = entity
                     .and_then(|h| tab.scene.document.get_entity(h))
                     .map(|e| match e {
-                        acadrust::EntityType::Text(_) => "TEXT",
-                        acadrust::EntityType::MText(_) => "MTEXT",
-                        acadrust::EntityType::Insert(_) => "BLOCK",
-                        acadrust::EntityType::MultiLeader(_) => "MULTILEADER",
+                        codec::EntityType::Text(_) => "TEXT",
+                        codec::EntityType::MText(_) => "MTEXT",
+                        codec::EntityType::Insert(_) => "BLOCK",
+                        codec::EntityType::MultiLeader(_) => "MULTILEADER",
                         _ => "OBJECT",
                     })
                     .unwrap_or("—");
@@ -820,7 +909,7 @@ impl OpenCADStudio {
                 )
             }
             super::super::ModalKind::MlStyle => {
-                use acadrust::objects::ObjectType;
+                use codec::objects::ObjectType;
                 let tab = &self.tabs[self.active_tab];
                 let styles: Vec<String> = tab
                     .scene
@@ -896,7 +985,7 @@ impl OpenCADStudio {
                 )
             }
             super::super::ModalKind::TableStyle => {
-                use acadrust::objects::ObjectType;
+                use codec::objects::ObjectType;
                 let tab = &self.tabs[self.active_tab];
                 let styles: Vec<String> = tab
                     .scene
@@ -1001,7 +1090,7 @@ impl OpenCADStudio {
                 )
             }
             super::super::ModalKind::MLeaderStyle => {
-                use acadrust::objects::ObjectType;
+                use codec::objects::ObjectType;
                 let tab = &self.tabs[self.active_tab];
                 let styles: Vec<String> = tab
                     .scene
@@ -1028,7 +1117,7 @@ impl OpenCADStudio {
                 lt_opts.extend(doc.line_types.iter().map(|lt| lt.name.clone()));
                 let mut textstyle_opts: Vec<String> = vec!["None".to_string()];
                 textstyle_opts.extend(doc.text_styles.iter().map(|t| t.name.clone()));
-                let opt_block = |h: Option<acadrust::types::Handle>| -> String {
+                let opt_block = |h: Option<codec::types::Handle>| -> String {
                     match h {
                         Some(h) => doc
                             .block_records
@@ -1039,7 +1128,7 @@ impl OpenCADStudio {
                         None => "None".to_string(),
                     }
                 };
-                let opt_lt = |h: Option<acadrust::types::Handle>| -> String {
+                let opt_lt = |h: Option<codec::types::Handle>| -> String {
                     match h {
                         Some(h) => doc
                             .line_types
@@ -1050,7 +1139,7 @@ impl OpenCADStudio {
                         None => "ByBlock".to_string(),
                     }
                 };
-                let opt_ts = |h: Option<acadrust::types::Handle>| -> String {
+                let opt_ts = |h: Option<codec::types::Handle>| -> String {
                     match h {
                         Some(h) => doc
                             .text_styles
@@ -1297,7 +1386,7 @@ impl OpenCADStudio {
                 .get(&self.ds_dimtxsty)
                 .map(|style| style.height)
                 .filter(|height| *height > 0.0);
-            let blk_name = |h: acadrust::types::Handle| -> String {
+            let blk_name = |h: codec::types::Handle| -> String {
                 if h.is_null() {
                     "Default".to_string()
                 } else {
@@ -1308,7 +1397,7 @@ impl OpenCADStudio {
                         .unwrap_or_else(|| "Default".to_string())
                 }
             };
-            let lt_name = |h: acadrust::types::Handle| -> String {
+            let lt_name = |h: codec::types::Handle| -> String {
                 if h.is_null() {
                     "ByBlock".to_string()
                 } else {
@@ -1322,7 +1411,7 @@ impl OpenCADStudio {
             let ds_sel = doc.dim_styles.get(&self.dimstyle_selected);
             let read_only = false;
             let in_use = doc.entities().any(|entity| {
-                matches!(entity, acadrust::EntityType::Dimension(dimension)
+                matches!(entity, codec::EntityType::Dimension(dimension)
                     if dimension.base().style_name.eq_ignore_ascii_case(&self.dimstyle_selected))
             });
             let compare_opts: Vec<String> = styles
@@ -1578,9 +1667,10 @@ impl OpenCADStudio {
             }
             super::super::ModalKind::Unsaved => {
                 let tab_name = match &self.pending_close {
-                    Some(super::super::PendingClose::Tab(idx)) => self
+                    Some(super::super::PendingClose::Tab(tab_id)) => self
                         .tabs
-                        .get(*idx)
+                        .iter()
+                        .find(|t| t.id == *tab_id)
                         .map(|t| t.tab_display_name())
                         .unwrap_or_default(),
                     Some(super::super::PendingClose::Quit) => self
@@ -1668,6 +1758,7 @@ impl OpenCADStudio {
                     crate::ui::window::missing_fonts::view_window(
                         fonts,
                         &font_source,
+                        self.missing_fonts_downloading,
                         flow,
                     )
                 })
@@ -1728,11 +1819,7 @@ fn dialog_button<'a>(
     message: Message,
     style: fn(&Theme, button::Status) -> button::Style,
 ) -> Element<'a, Message> {
-    button(text(label.into()).size(13))
-        .on_press(message)
-        .style(style)
-        .padding([6, 18])
-        .into()
+    crate::ui::style::form::dialog_button_styled(label.into(), message, style).into()
 }
 
 fn dialog_body_style(theme: &Theme) -> container::Style {

@@ -69,11 +69,11 @@ pub fn enforce_allowlist(
     }
 }
 
-/// Refusal for `--mcp` and `--serve`, checked by `main` before anything else
-/// starts.
-pub fn headless_automation_refusal(mcp: bool, serve: bool) -> Option<&'static str> {
-    (mcp || serve).then_some(
-        "--mcp and --serve are not available in SecurePlan CAD: it runs no automation listener.",
+/// Refusal for `--mcp`, `--serve`, `--http` and `--sync-mcp-schemas`, checked
+/// by `main` before anything else starts.
+pub fn headless_automation_refusal(mcp: bool, serve: bool, http: bool, sync_mcp_schemas: bool) -> Option<&'static str> {
+    (mcp || serve || http || sync_mcp_schemas).then_some(
+        "--mcp, --serve, --http and --sync-mcp-schemas are not available in SecurePlan CAD: it runs no automation listener.",
     )
 }
 
@@ -235,9 +235,11 @@ mod tests {
 
     #[test]
     fn headless_automation_is_refused() {
-        assert!(headless_automation_refusal(true, false).is_some());
-        assert!(headless_automation_refusal(false, true).is_some());
-        assert!(headless_automation_refusal(false, false).is_none());
+        assert!(headless_automation_refusal(true, false, false, false).is_some());
+        assert!(headless_automation_refusal(false, true, false, false).is_some());
+        assert!(headless_automation_refusal(false, false, true, false).is_some());
+        assert!(headless_automation_refusal(false, false, false, true).is_some());
+        assert!(headless_automation_refusal(false, false, false, false).is_none());
     }
 
     /// Release builds refuse the headless drawing modes, and `export_headless`
@@ -256,10 +258,10 @@ mod tests {
         let (input, output) = (dir.join("in.dxf"), dir.join("out.dxf"));
         std::fs::write(&input, crate::app::secureplan::testutil::synthetic_dxf()).unwrap();
         // 2 is the refusal; a failed read or write would be 1.
-        assert_eq!(crate::app::export_headless(&input, &output), 2);
+        assert_eq!(crate::app::export_headless(&input, &output, None), 2);
         assert!(!output.exists());
         TEST_RELEASE_RULES.with(|rule| rule.set(false));
-        assert_eq!(crate::app::export_headless(&input, &output), 0, "the development export stopped working");
+        assert_eq!(crate::app::export_headless(&input, &output, None), 0, "the development export stopped working");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

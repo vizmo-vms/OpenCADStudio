@@ -1,4 +1,4 @@
-use acadrust::{EntityType, Handle};
+use codec::{EntityType, Handle};
 use glam::DVec3;
 
 use crate::command::{
@@ -79,12 +79,12 @@ impl HorizontalConstraintCommand {
         }
     }
 
-    fn direction(&self) -> acadrust::types::Vector3 {
+    fn direction(&self) -> codec::types::Vector3 {
         let direction = match self.kind {
             ConstraintKind::Vertical => self.plane.y.normalize_or(DVec3::Y),
             _ => self.plane.x.normalize_or(DVec3::X),
         };
-        acadrust::types::Vector3::new(direction.x, direction.y, direction.z)
+        codec::types::Vector3::new(direction.x, direction.y, direction.z)
     }
 
     fn invalid_object(&self) -> CmdResult {
@@ -112,11 +112,11 @@ impl HorizontalConstraintCommand {
         }
     }
 
-    fn distance_to_axis(point: DVec3, endpoints: [acadrust::types::Vector3; 2]) -> f64 {
-        cadkernel::space::Vec3::from(point.to_array())
+    fn distance_to_axis(point: DVec3, endpoints: [codec::types::Vector3; 2]) -> f64 {
+        kernel::space::Vec3::from(point.to_array())
             .distance_to_line(
-                cadkernel::space::Vec3::new(endpoints[0].x, endpoints[0].y, endpoints[0].z),
-                cadkernel::space::Vec3::new(endpoints[1].x, endpoints[1].y, endpoints[1].z),
+                kernel::space::Vec3::new(endpoints[0].x, endpoints[0].y, endpoints[0].z),
+                kernel::space::Vec3::new(endpoints[1].x, endpoints[1].y, endpoints[1].z),
             )
             .unwrap_or(f64::INFINITY)
     }
@@ -200,7 +200,7 @@ impl HorizontalConstraintCommand {
         if first.handle == second.handle && (first.point - second.point).length() <= 1.0e-9 {
             self.step = Step::SecondPoint(first);
             return CmdResult::ReportError(
-                "The object or point is already selected. Select a different object or constraint point."
+                "The object or point is already selected.  Select a different object or constraint point."
                     .to_string(),
             );
         }
@@ -269,6 +269,10 @@ impl CadCommand for HorizontalConstraintCommand {
         true
     }
 
+    fn typed_point_picks_entity(&self) -> bool {
+        matches!(self.step, Step::ObjectOrTwoPoints)
+    }
+
     fn entity_pick_highlights_hover(&self) -> bool {
         true
     }
@@ -301,7 +305,7 @@ impl CadCommand for HorizontalConstraintCommand {
                 }
             }
             Step::FirstPoint | Step::SecondPoint(_) => {
-                let world = acadrust::types::Vector3::new(point.x, point.y, point.z);
+                let world = codec::types::Vector3::new(point.x, point.y, point.z);
                 if !is_parametric_point_near(&entity, world) {
                     return Self::invalid_point();
                 }
@@ -348,8 +352,8 @@ impl CadCommand for HorizontalConstraintCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acadrust::entities::Line;
-    use acadrust::types::Vector3;
+    use codec::entities::Line;
+    use codec::types::Vector3;
 
     #[test]
     fn object_pick_captures_the_working_x_direction() {

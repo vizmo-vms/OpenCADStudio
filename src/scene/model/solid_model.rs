@@ -1,6 +1,6 @@
 // Kernel B-rep construction and display tessellation.
 
-use cadkernel::brep::{self, Body, Curve3, EdgeKey, FaceKey, Surface};
+use kernel::brep::{self, Body, Curve3, EdgeKey, FaceKey, Surface};
 
 use crate::scene::model::mesh_model::{MeshLodSet, MeshModel};
 use crate::scene::model::wire_model::WireModel;
@@ -12,7 +12,7 @@ fn tessellation(body: &Body) -> brep::mesh::BodyMesh {
     brep::mesh::tessellate(
         body,
         brep::mesh::TessellationTolerance::new(
-            cadkernel::tessellation::DEFAULT_ANGLE,
+            kernel::tessellation::DEFAULT_ANGLE,
             TOL,
         ),
     )
@@ -31,8 +31,8 @@ fn display_tessellation(
         1.0
     };
     let max_angle = chordal_deflection.map_or_else(
-        || cadkernel::tessellation::angle_for_resolution(resolution),
-        |_| cadkernel::tessellation::display_angle_for_resolution(resolution),
+        || kernel::tessellation::angle_for_resolution(resolution),
+        |_| kernel::tessellation::display_angle_for_resolution(resolution),
     );
     let mut tolerance = brep::mesh::TessellationTolerance::new(max_angle, TOL)
         .with_uv_isolines(isolines[0], isolines[1])
@@ -251,15 +251,15 @@ pub fn section(body: &Body, axis: usize, value: f64) -> Vec<([f64; 3], [f64; 3])
 
 // ── Edge extraction (pick geometry + wireframe overlay) ─────────────────────
 
-/// Tessellate the solid's B-rep edges into acadrust `Wire`s. Stored on the
+/// Tessellate the solid's B-rep edges into opencadcodec `Wire`s. Stored on the
 /// `Solid3D`/result entity for picking.
-pub fn edge_wires(body: &Body) -> Vec<acadrust::entities::Wire> {
-    use acadrust::types::Vector3;
+pub fn edge_wires(body: &Body) -> Vec<codec::entities::Wire> {
+    use codec::types::Vector3;
     tessellation(body)
         .edges
         .iter()
         .map(|edge| {
-            acadrust::entities::Wire::from_points(
+            codec::entities::Wire::from_points(
                 edge.positions
                     .iter()
                     .map(|p| Vector3::new(p[0], p[1], p[2]))
@@ -277,14 +277,14 @@ pub fn edge_wires(body: &Body) -> Vec<acadrust::entities::Wire> {
 /// is presented as a separate, non-pickable outline until placement.
 pub fn grip_preview_wires(
     body: &Body,
-    handle: acadrust::Handle,
+    handle: codec::Handle,
     isolines: [usize; 2],
     planar_isolines: bool,
 ) -> Vec<WireModel> {
     let tessellation = brep::mesh::tessellate(
         body,
         brep::mesh::TessellationTolerance::new(
-            cadkernel::tessellation::DEFAULT_ANGLE,
+            kernel::tessellation::DEFAULT_ANGLE,
             TOL,
         )
         .with_uv_isolines(isolines[0], isolines[1])
@@ -314,14 +314,14 @@ pub fn grip_preview_wires(
 
 /// B-rep edge nearest a world-space surface pick.
 pub fn nearest_edge(body: &Body, pick: [f64; 3]) -> Option<EdgeKey> {
-    let pick = cadkernel::space::Vec3::from(pick);
+    let pick = kernel::space::Vec3::from(pick);
     body.edge_keys()
         .filter_map(|key| {
             let edge = body.edges.get(key)?;
             let curve = body.curves.get(edge.curve)?;
             let nearest = if matches!(curve, Curve3::Line(_)) {
-                let start = cadkernel::space::Vec3::from(curve.point_at(edge.start_parameter));
-                let end = cadkernel::space::Vec3::from(curve.point_at(edge.end_parameter));
+                let start = kernel::space::Vec3::from(curve.point_at(edge.start_parameter));
+                let end = kernel::space::Vec3::from(curve.point_at(edge.end_parameter));
                 let span = end - start;
                 let length2 = span.dot(span);
                 let along = if length2 > 0.0 {
@@ -336,7 +336,7 @@ pub fn nearest_edge(body: &Body, pick: [f64; 3]) -> Option<EdgeKey> {
                     .map(|step| {
                         let t = edge.start_parameter
                             + (edge.end_parameter - edge.start_parameter) * step as f64 / 64.0;
-                        pick.distance(cadkernel::space::Vec3::from(curve.point_at(t)))
+                        pick.distance(kernel::space::Vec3::from(curve.point_at(t)))
                     })
                     .fold(f64::INFINITY, f64::min)
             };
@@ -367,7 +367,7 @@ pub fn planar_face_normal(body: &Body, face: FaceKey) -> Option<[f64; 3]> {
     let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
         return None;
     };
-    let normal = cadkernel::space::Vec3::from(plane.normal()?);
+    let normal = kernel::space::Vec3::from(plane.normal()?);
     Some(if face.forward { normal } else { -normal }.to_array())
 }
 
@@ -518,8 +518,8 @@ pub fn display_from_solid(
     chordal_deflection: Option<f64>,
     isolines: [usize; 2],
     planar_isolines: bool,
-) -> Option<(MeshLodSet, Vec<acadrust::entities::Wire>, [f64; 3])> {
-    use acadrust::types::Vector3;
+) -> Option<(MeshLodSet, Vec<codec::entities::Wire>, [f64; 3])> {
+    use codec::types::Vector3;
     let tessellation = display_tessellation(
         body,
         facet_resolution,
@@ -532,7 +532,7 @@ pub fn display_from_solid(
         .edges
         .iter()
         .map(|edge| {
-            acadrust::entities::Wire::from_points(
+            codec::entities::Wire::from_points(
                 edge.positions
                     .iter()
                     .map(|point| Vector3::new(point[0], point[1], point[2]))
@@ -541,7 +541,7 @@ pub fn display_from_solid(
         })
         .collect();
     let mut mesh = mesh_from_tessellation(tessellation, color)?;
-    if let Some(properties) = cadkernel::brep::analytic_mass_properties(body) {
+    if let Some(properties) = kernel::brep::analytic_mass_properties(body) {
         mesh.apply_mass_properties(properties);
     }
     Some((mesh, wires, center))
@@ -583,7 +583,7 @@ fn mesh_center(mesh: &brep::mesh::Mesh) -> Option<[f64; 3]> {
 /// exists to test with.
 #[cfg(test)]
 pub fn volume(body: &Body) -> f64 {
-    use cadkernel::space::Vec3;
+    use kernel::space::Vec3;
     let mesh = tessellation(body).mesh;
     let Some(middle) = centre(body) else {
         return 0.0;
@@ -638,6 +638,41 @@ mod tests {
         assert_eq!(display([1, 0], true) - boundaries, 12);
         assert_eq!(display([0, 2], true) - boundaries, 24);
         assert_eq!(display([2, 2], false), boundaries);
+    }
+
+    /// A file-sourced header `$ISOLINES` bypasses `SETVAR` entirely, so the
+    /// consumption side must clamp too: `prepare_solid_model_display` hands
+    /// the header count to the kernel for every curved face, and 32767
+    /// isolines on a cylinder is a ~100k-vertex preview rebuilt per cursor
+    /// event.
+    #[test]
+    fn header_isolines_are_clamped_before_display_tessellation() {
+        let measure = |value: i16| {
+            let mut scene = crate::scene::Scene::new();
+            scene.document.header.isolines = value;
+            let body = cylinder_solid([0.0; 3], 5.0, 12.0).unwrap();
+            scene
+                .prepare_solid_model_display(codec::Handle::new(0xDEAD), &body)
+                .expect("cylinder display")
+                .0
+                .edge_verts
+                .len()
+        };
+
+        // A hostile file-sourced header must render exactly like the
+        // largest value the Options slider can request — and a negative
+        // one exactly like zero.
+        let hostile = measure(i16::MAX);
+        assert_eq!(
+            hostile,
+            measure(crate::entities::solid3d::MAX_HEADER_ISOLINES),
+            "header.isolines must be clamped before tessellation"
+        );
+        assert_eq!(measure(-5), measure(0));
+        assert!(
+            hostile < 20_000,
+            "even the ceiling must stay a bounded preview: {hostile} vertices"
+        );
     }
 
     #[test]

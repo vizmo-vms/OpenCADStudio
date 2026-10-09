@@ -23,8 +23,8 @@
 
 use std::collections::HashSet;
 
-use acadrust::types::{Handle, Vector3};
-use acadrust::EntityType;
+use codec::types::{Handle, Vector3};
+use codec::EntityType;
 use serde_json::{json, Value};
 
 use super::publish::Mapping;
@@ -228,7 +228,7 @@ const MAX_ROUTE_PIECE_POINTS: usize = 2 * MAX_ROUTE_POINTS;
 pub fn pieces<S: std::hash::BuildHasher>(scene: &crate::scene::Scene, selected: &HashSet<Handle, S>, mapping: &Mapping) -> Pieces {
     let mut pieces = Pieces::default();
     let block = scene.current_layout_block_handle_pub();
-    let to_world = |transform: &acadrust::types::Transform, point: Vector3| {
+    let to_world = |transform: &codec::types::Transform, point: Vector3| {
         let placed = transform.apply(point);
         mapping.cad_to_world([placed.x, placed.y])
     };
@@ -645,7 +645,7 @@ fn route(pieces: &Pieces) -> Result<Candidates, Refusal> {
 /// What a conversion works on, taken on the UI thread when it starts: the
 /// drawing as it is then (an immutable copy) and the selected handles.
 pub struct Snapshot {
-    pub document: acadrust::CadDocument,
+    pub document: codec::CadDocument,
     pub annotation_scale: f32,
     pub selected: HashSet<Handle>,
     pub mapping: Mapping,
@@ -703,8 +703,8 @@ pub fn rejected_lines(candidates: &Candidates) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use acadrust::entities::{Arc, Insert, Line, LwPolyline};
-    use acadrust::types::Vector2;
+    use codec::entities::{Arc, Insert, Line, LwPolyline};
+    use codec::types::Vector2;
 
     /// 1 CAD unit = 1 mm, CAD (x, y) → world (x, 20000 − y).
     fn mapping() -> Mapping {
@@ -819,7 +819,7 @@ pub(crate) mod tests {
     /// A degree-1 spline through `count` control points in a zigzag.
     pub(crate) fn many_knots(count: usize) -> EntityType {
         let points = (0..count).map(|i| Vector3::new(i as f64 * 20.0 % 9_000_000.0, if i % 2 == 0 { 0.0 } else { 300.0 }, 0.0)).collect();
-        EntityType::Spline(acadrust::entities::Spline::from_control_points(1, points))
+        EntityType::Spline(codec::entities::Spline::from_control_points(1, points))
     }
 
     #[test]
@@ -834,7 +834,7 @@ pub(crate) mod tests {
         assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
         // One circle that would need ~700,000 chords at 1 mm: the cut stops at
         // the budget instead of producing them.
-        let mut circle = acadrust::entities::Circle::new();
+        let mut circle = codec::entities::Circle::new();
         circle.radius = 1.0e11;
         let (scene, selected) = scene_with(vec![EntityType::Circle(circle)]);
         let pieces = pieces(&scene, &selected, &mapping());
@@ -956,7 +956,7 @@ pub(crate) mod tests {
 
     #[test]
     fn text_is_skipped_and_nothing_else_is_converted() {
-        let text = EntityType::Text(acadrust::entities::Text::with_value("ROOM", Vector3::new(0.0, 0.0, 0.0)));
+        let text = EntityType::Text(codec::entities::Text::with_value("ROOM", Vector3::new(0.0, 0.0, 0.0)));
         let (scene, selected) = scene_with(vec![text, line(0.0, 0.0, 1000.0, 0.0)]);
         let found = candidates(&scene, &selected, &mapping(), Kind::Walls).unwrap();
         assert_eq!((found.walls.len(), found.skipped), (1, 1));

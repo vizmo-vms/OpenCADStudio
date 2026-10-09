@@ -288,7 +288,7 @@ mod tests {
 
     fn dialog(empty: bool, anchor: [f64; 2]) -> ApplyDialog {
         let snapshot = Arc::new(Snapshot {
-            document: acadrust::CadDocument::new(),
+            document: codec::CadDocument::new(),
             annotation_scale: 1.0,
             loaded: None,
             modified: true,

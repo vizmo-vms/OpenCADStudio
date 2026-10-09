@@ -46,11 +46,11 @@ impl std::fmt::Display for ImportError {
 /// references (MINSERT rows and columns included) and its block nesting
 /// depth, and refuse a drawing over the limits with a clear message instead
 /// of running out of memory.
-pub fn admit(document: &acadrust::CadDocument) -> Result<(), String> {
-    use acadrust::EntityType;
+pub fn admit(document: &codec::CadDocument) -> Result<(), String> {
+    use codec::EntityType;
     use std::collections::HashMap;
     // Per block record: its direct entity count and the blocks it inserts.
-    type Blocks = HashMap<acadrust::Handle, (u64, Vec<(String, u64)>)>;
+    type Blocks = HashMap<codec::Handle, (u64, Vec<(String, u64)>)>;
     let mut blocks: Blocks = HashMap::new();
     for entity in document.entities() {
         let slot = blocks.entry(entity.common().owner_handle).or_default();
@@ -60,7 +60,7 @@ pub fn admit(document: &acadrust::CadDocument) -> Result<(), String> {
             slot.1.push((insert.block_name.clone(), copies));
         }
     }
-    let by_name: HashMap<String, acadrust::Handle> =
+    let by_name: HashMap<String, codec::Handle> =
         document.block_records.iter().map(|record| (record.name.to_ascii_uppercase(), record.handle)).collect();
     let too_many = || {
         format!(
@@ -71,13 +71,13 @@ pub fn admit(document: &acadrust::CadDocument) -> Result<(), String> {
     let too_deep = || format!("The drawing nests blocks more than {MAX_BLOCK_DEPTH} deep, the most SecurePlan CAD opens.");
 
     // (expanded count, nesting depth) of each block, memoised.
-    let mut memo: HashMap<acadrust::Handle, (u64, usize)> = HashMap::new();
+    let mut memo: HashMap<codec::Handle, (u64, usize)> = HashMap::new();
     fn expand(
-        block: acadrust::Handle,
-        stack: &mut Vec<acadrust::Handle>,
+        block: codec::Handle,
+        stack: &mut Vec<codec::Handle>,
         blocks: &Blocks,
-        by_name: &HashMap<String, acadrust::Handle>,
-        memo: &mut HashMap<acadrust::Handle, (u64, usize)>,
+        by_name: &HashMap<String, codec::Handle>,
+        memo: &mut HashMap<codec::Handle, (u64, usize)>,
     ) -> Result<(u64, usize), bool> {
         if let Some(done) = memo.get(&block) {
             return Ok(*done);
@@ -162,9 +162,9 @@ impl Report {
 
 /// Warnings about content the drawing references but SecurePlan CAD does not
 /// read or draw.
-fn warnings(document: &acadrust::CadDocument) -> Vec<String> {
-    use acadrust::objects::ObjectType;
-    use acadrust::EntityType;
+fn warnings(document: &codec::CadDocument) -> Vec<String> {
+    use codec::objects::ObjectType;
+    use codec::EntityType;
     let mut out = Vec::new();
     let xrefs = document.block_records.iter().filter(|r| r.flags.is_xref || r.flags.is_xref_overlay).count();
     if xrefs > 0 {
@@ -192,7 +192,7 @@ fn warnings(document: &acadrust::CadDocument) -> Vec<String> {
 /// Parse drawing bytes the way SecurePlan CAD opens them: the format from its
 /// signature, no reference resolved, corrupt entities purged, the admission
 /// limit applied. A parser panic is a refusal, not a crash.
-pub fn load_drawing(_name: &str, bytes: Vec<u8>) -> Result<(acadrust::CadDocument, Report), ImportError> {
+pub fn load_drawing(_name: &str, bytes: Vec<u8>) -> Result<(codec::CadDocument, Report), ImportError> {
     if bytes.is_empty() {
         return Err(ImportError::new(ErrorCode::ImportFailed, "The file is empty."));
     }
@@ -215,7 +215,7 @@ pub fn load_drawing(_name: &str, bytes: Vec<u8>) -> Result<(acadrust::CadDocumen
     document.source_path = None;
     // R13 and R14 DWG layers have no plot flag (R2000 added it) and the
     // reader leaves it off, which would publish nothing: they all plot.
-    if format == Format::Dwg && document.dwg_source_version.unwrap_or(document.version) < acadrust::DxfVersion::AC1015 {
+    if format == Format::Dwg && document.dwg_source_version.unwrap_or(document.version) < codec::DxfVersion::AC1015 {
         for layer in document.layers.iter_mut() {
             layer.is_plottable = true;
         }
@@ -271,7 +271,7 @@ pub struct LoadDone {
     pub generation: u64,
     pub session: Option<super::bridge::SessionId>,
     pub drawing: Drawing,
-    pub result: super::Carry<Result<(acadrust::CadDocument, Report), ImportError>>,
+    pub result: super::Carry<Result<(codec::CadDocument, Report), ImportError>>,
 }
 
 /// Read a chosen file for import: the size is checked before reading.
@@ -636,7 +636,7 @@ pub(crate) mod tests {
     /// their content is published (and can be aligned).
     #[test]
     fn pre_r2000_dwg_layers_plot() {
-        for version in [acadrust::DxfVersion::AC1012, acadrust::DxfVersion::AC1014] {
+        for version in [codec::DxfVersion::AC1012, codec::DxfVersion::AC1014] {
             let bytes = crate::io::save_to_bytes(&testutil::synthetic_document(), "dwg", version).unwrap();
             let (document, report) = load_drawing("old.dwg", bytes).unwrap();
             assert_eq!(report.version, version.as_str());
@@ -655,7 +655,7 @@ pub(crate) mod tests {
         assert!(load_drawing("x.dwg", b"not a drawing".to_vec()).unwrap_err().message.contains("not a DWG or DXF"));
         assert!(load_drawing("x.dwg", b"AC1032 truncated".to_vec()).is_err());
         // A drawing with no entities is empty too.
-        let empty = crate::io::save_to_bytes(&acadrust::CadDocument::new(), "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let empty = crate::io::save_to_bytes(&codec::CadDocument::new(), "dxf", codec::DxfVersion::AC1032).unwrap();
         assert_eq!(load_drawing("x.dxf", empty).unwrap_err().message, "The drawing is empty.");
 
         let dir = std::env::temp_dir().join(format!("secureplan_import_{}", std::process::id()));
@@ -695,11 +695,11 @@ pub(crate) mod tests {
 
     /// A drawing whose model space holds `inserts` references to a block of
     /// `lines` lines, plus `extra` lines of its own.
-    fn blocks_drawing(lines: usize, inserts: usize, extra: usize) -> acadrust::CadDocument {
-        use acadrust::entities::{Insert, Line};
-        use acadrust::types::Vector3;
-        use acadrust::EntityType;
-        let mut doc = acadrust::CadDocument::new();
+    fn blocks_drawing(lines: usize, inserts: usize, extra: usize) -> codec::CadDocument {
+        use codec::entities::{Insert, Line};
+        use codec::types::Vector3;
+        use codec::EntityType;
+        let mut doc = codec::CadDocument::new();
         let members = (0..lines).map(|i| EntityType::Line(Line::from_points(Vector3::new(i as f64, 0.0, 0.0), Vector3::new(i as f64, 1.0, 0.0)))).collect();
         crate::app::secureplan::snap::tests::block(&mut doc, "MANY", members);
         for i in 0..inserts {
@@ -720,20 +720,20 @@ pub(crate) mod tests {
         let refused = admit(&over).unwrap_err();
         assert!(refused.contains("1200000 entities"), "{refused}");
         // Through the loader: a clear refusal, and the one at the limit opens.
-        let bytes = crate::io::save_to_bytes(&over, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let bytes = crate::io::save_to_bytes(&over, "dxf", codec::DxfVersion::AC1032).unwrap();
         let error = load_drawing("over.dxf", bytes).unwrap_err();
         assert_eq!(error.code, ErrorCode::EntityLimit);
-        let bytes = crate::io::save_to_bytes(&at_limit, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let bytes = crate::io::save_to_bytes(&at_limit, "dxf", codec::DxfVersion::AC1032).unwrap();
         assert!(load_drawing("at.dxf", bytes).is_ok());
     }
 
     /// Blocks B1 … Bn, each holding a line and an insert of the next; model
     /// space inserts B1: nesting depth n.
-    fn nested_drawing(depth: usize) -> acadrust::CadDocument {
-        use acadrust::entities::{Insert, Line};
-        use acadrust::types::Vector3;
-        use acadrust::EntityType;
-        let mut doc = acadrust::CadDocument::new();
+    fn nested_drawing(depth: usize) -> codec::CadDocument {
+        use codec::entities::{Insert, Line};
+        use codec::types::Vector3;
+        use codec::EntityType;
+        let mut doc = codec::CadDocument::new();
         for level in (1..=depth).rev() {
             let mut members = vec![EntityType::Line(Line::from_points(Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 1.0, 0.0)))];
             if level < depth {
@@ -750,9 +750,9 @@ pub(crate) mod tests {
         assert_eq!(admit(&nested_drawing(MAX_BLOCK_DEPTH)), Ok(()));
         let refused = admit(&nested_drawing(MAX_BLOCK_DEPTH + 1)).unwrap_err();
         assert!(refused.contains("32 deep"), "{refused}");
-        let bytes = crate::io::save_to_bytes(&nested_drawing(MAX_BLOCK_DEPTH + 1), "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let bytes = crate::io::save_to_bytes(&nested_drawing(MAX_BLOCK_DEPTH + 1), "dxf", codec::DxfVersion::AC1032).unwrap();
         assert!(load_drawing("deep.dxf", bytes).unwrap_err().message.contains("32 deep"));
-        let bytes = crate::io::save_to_bytes(&nested_drawing(MAX_BLOCK_DEPTH), "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let bytes = crate::io::save_to_bytes(&nested_drawing(MAX_BLOCK_DEPTH), "dxf", codec::DxfVersion::AC1032).unwrap();
         assert!(load_drawing("ok.dxf", bytes).is_ok());
     }
 

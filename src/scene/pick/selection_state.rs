@@ -59,6 +59,11 @@ pub struct SelectionState {
     pub middle_down: bool,
     pub middle_last_pos: Option<Point>,
     pub middle_last_press_time: Option<Instant>,
+    /// Which way a ZOOM Dynamic drag is currently zooming: `true` while it is
+    /// zooming out. Only the magnifier cursor reads it. The sign is latched
+    /// rather than taken from the live `dy` so that the sub-pixel jitter of a
+    /// slow drag cannot strobe the `+` / `−` glyph.
+    pub zoom_dir_out: bool,
 }
 
 /// Transient state of the open right-click context menu.

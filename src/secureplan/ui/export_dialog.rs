@@ -36,7 +36,7 @@ pub struct ExportDialog {
     pub form: Form,
     /// The applied drawing with the design added, but for the devices, which
     /// are added with the chosen symbols when it is written.
-    pub document: Arc<acadrust::CadDocument>,
+    pub document: Arc<codec::CadDocument>,
     pub composition: Arc<export::Composition>,
     /// Damaged items the reader dropped from the applied drawing.
     pub lost_entities: usize,
@@ -54,7 +54,7 @@ pub struct ExportDialog {
 impl ExportDialog {
     pub fn new(tab_id: u64, key: JobKey, request_id: String, composed: Composed) -> Self {
         let default = export::default_choice(composed.format, &composed.version);
-        let version_note = acadrust::DxfVersion::parse(&composed.version)
+        let version_note = codec::DxfVersion::parse(&composed.version)
             .filter(|&version| !export::writable(composed.format, version))
             .map(|version| {
                 let (format, nearest) = export::choice(default);
@@ -88,7 +88,7 @@ impl ExportDialog {
     }
 
     /// The chosen format and version.
-    pub fn choice(&self) -> (Format, acadrust::DxfVersion) {
+    pub fn choice(&self) -> (Format, codec::DxfVersion) {
         export::choice(self.form.selected(FORMAT))
     }
 
@@ -106,7 +106,7 @@ impl ExportDialog {
 
     /// Choose `format` (and `version`, else the newest); `false` if the
     /// writer offers no such choice.
-    pub fn select(&mut self, format: Format, version: Option<acadrust::DxfVersion>) -> bool {
+    pub fn select(&mut self, format: Format, version: Option<codec::DxfVersion>) -> bool {
         let found = (0..export::choices().len())
             .filter(|&i| export::choice(i).0 == format && version.is_none_or(|v| export::choice(i).1 == v))
             .max_by_key(|&i| export::choice(i).1);
@@ -146,7 +146,7 @@ impl ExportDialog {
     }
 
     /// The format and version to write, or why not yet.
-    pub fn plan(&self) -> Result<(Format, acadrust::DxfVersion), String> {
+    pub fn plan(&self) -> Result<(Format, codec::DxfVersion), String> {
         if self.loss.1 > 0 && self.form.selected(ACKNOWLEDGE) != 1 {
             return Err(format!("Choose Yes for \"Export without the objects listed\" to export without {} object(s).", self.loss.1));
         }
@@ -485,7 +485,7 @@ impl OpenCADStudio {
         &mut self,
         path: std::path::PathBuf,
         format: Option<Format>,
-        version: Option<acadrust::DxfVersion>,
+        version: Option<codec::DxfVersion>,
         accept_loss: bool,
     ) -> Result<Task<Message>, String> {
         self.secureplan_show_waiting_export();
@@ -557,7 +557,7 @@ mod tests {
         let mut h = exporting("export_view", "view");
         request(&mut h, &testutil::synthetic_dxf(), &full());
         let Some(Dialog::Export(dialog)) = &h.app.secureplan.dialog else { panic!("no export dialog") };
-        assert_eq!(dialog.choice(), (Format::Dxf, acadrust::DxfVersion::AC1032), "the applied drawing's format by default");
+        assert_eq!(dialog.choice(), (Format::Dxf, codec::DxfVersion::AC1032), "the applied drawing's format by default");
         assert!(dialog.lines().iter().any(|line| line.contains("may overlap")));
         assert!(dialog.lines().iter().any(|line| line.starts_with("Devices are drawn as in SecurePlan")));
         let state = h.state_where(|s| s["busy"]["operation"] == "export");
@@ -636,14 +636,14 @@ mod tests {
         let handle = document.allocate_handle();
         document.objects.insert(
             handle,
-            acadrust::objects::ObjectType::Unknown {
+            codec::objects::ObjectType::Unknown {
                 type_name: "SYNTHETIC_R13_OBJECT".into(),
                 handle,
-                owner: acadrust::Handle::NULL,
+                owner: codec::Handle::NULL,
                 raw_dxf_codes: None,
                 raw_dwg_data: Some(vec![0u8; 4]),
                 raw_dwg_handle_bits: 0,
-                raw_dwg_version: Some(acadrust::DxfVersion::AC1012),
+                raw_dwg_version: Some(codec::DxfVersion::AC1012),
             },
         );
         let composed = export::Composed {
@@ -656,7 +656,7 @@ mod tests {
         };
         let key = JobKey { session: 1, serial: 1 };
         let dialog = ExportDialog::new(1, key, "x1".into(), composed);
-        assert_eq!(dialog.choice(), (Format::Dwg, acadrust::DxfVersion::AC1014), "the nearest version the writer offers");
+        assert_eq!(dialog.choice(), (Format::Dwg, codec::DxfVersion::AC1014), "the nearest version the writer offers");
         let lines = dialog.lines();
         assert!(
             lines.iter().any(|line| line.contains("cannot write DWG R13 (AC1012)") && line.contains("defaults to DWG R14 (AC1014)")),
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(dialog.known_loss(), 0);
         assert!(!dialog.form.fields[ACKNOWLEDGE].enabled);
         // DWG 2018 cannot hold it: the loss is counted and must be acknowledged.
-        assert!(dialog.select(Format::Dwg, Some(acadrust::DxfVersion::AC1032)));
+        assert!(dialog.select(Format::Dwg, Some(codec::DxfVersion::AC1032)));
         assert_eq!(dialog.known_loss(), 1);
         assert!(dialog.lines().iter().any(|line| line.contains("1 object(s) DWG AC1032 cannot hold")), "{:?}", dialog.lines());
         let file = h.dir().join("lossy.dwg");
@@ -741,9 +741,9 @@ mod tests {
         let Some(Dialog::Export(dialog)) = h.app.secureplan.dialog.as_mut() else { panic!("no export dialog") };
         dialog.acknowledge();
         assert!(dialog.select(Format::Dxf, None));
-        assert!(dialog.select(Format::Dwg, Some(acadrust::DxfVersion::AC1032)));
+        assert!(dialog.select(Format::Dwg, Some(codec::DxfVersion::AC1032)));
         assert!(dialog.plan().is_err(), "a new choice needs its own Yes");
-        let _ = h.app.secureplan_export_to(file.clone(), Some(Format::Dwg), Some(acadrust::DxfVersion::AC1032), true).unwrap();
+        let _ = h.app.secureplan_export_to(file.clone(), Some(Format::Dwg), Some(codec::DxfVersion::AC1032), true).unwrap();
         let (result, _) = h.receive("exportResult");
         assert_eq!((result["status"].as_str(), result["format"].as_str()), (Some("written"), Some("dwg")));
         assert!(file.exists());

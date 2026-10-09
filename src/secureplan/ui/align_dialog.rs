@@ -317,6 +317,7 @@ impl OpenCADStudio {
         self.active_tab = index;
         // Measure starts as any command does: no previous point for Ortho or
         // Polar, and no snap or dynamic input left from an earlier pick.
+        self.cancel_for_new_command(index);
         self.reset_command_start_state(index);
         let length = Arc::new(Mutex::new(None));
         let command = MeasureCommand { first: None, length: length.clone() };

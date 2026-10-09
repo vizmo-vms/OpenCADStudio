@@ -223,7 +223,7 @@ pub struct LayoutPublication {
 
 /// One viewport's model content on the sheet.
 pub struct ViewLayer {
-    pub viewport: acadrust::types::Handle,
+    pub viewport: codec::types::Handle,
     /// Model units per paper unit.
     pub model_per_paper: f64,
     pub transform: LayerTransform,
@@ -236,9 +236,9 @@ pub struct ViewLayer {
 #[derive(Debug, Clone)]
 pub struct ViewContext {
     /// The block drawn: model space, or a layout's paper space.
-    pub model_block: acadrust::types::Handle,
-    pub frozen: rustc_hash::FxHashSet<acadrust::Handle>,
-    pub annotation_scale: Option<acadrust::Handle>,
+    pub model_block: codec::types::Handle,
+    pub frozen: rustc_hash::FxHashSet<codec::Handle>,
+    pub annotation_scale: Option<codec::Handle>,
     pub annotation_multiplier: f32,
     /// Annotative objects of other scales are shown (the layout's setting).
     pub all_visible: bool,
@@ -247,13 +247,13 @@ pub struct ViewContext {
 impl ViewContext {
     /// Model space through `viewport` on a layout whose "show all
     /// annotative objects" setting is `all_visible`.
-    pub fn of(scene: &crate::scene::Scene, viewport: acadrust::types::Handle, all_visible: bool) -> Self {
+    pub fn of(scene: &crate::scene::Scene, viewport: codec::types::Handle, all_visible: bool) -> Self {
         let (model_block, frozen, annotation_scale, annotation_multiplier) = scene.secureplan_viewport_context(viewport);
         Self { model_block, frozen, annotation_scale, annotation_multiplier, all_visible }
     }
 
     /// A layout's paper space, as native paper rendering draws it: at 1:1.
-    pub fn paper(scene: &crate::scene::Scene, block: acadrust::types::Handle, all_visible: bool) -> Self {
+    pub fn paper(scene: &crate::scene::Scene, block: codec::types::Handle, all_visible: bool) -> Self {
         let annotation_scale = scene.paper_annotation_scale_handle();
         Self { model_block: block, frozen: Default::default(), annotation_scale, annotation_multiplier: 1.0, all_visible }
     }
@@ -266,7 +266,7 @@ impl ViewContext {
 /// tables and leaders is skipped. `plot_only` also skips non-plotting layers.
 pub(crate) fn walk_model<F>(scene: &crate::scene::Scene, plot_only: bool, leaf: F)
 where
-    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+    F: FnMut(&codec::EntityType, &crate::scene::render_graph::InstanceContext),
 {
     walk_block(scene, scene.current_layout_block_handle_pub(), None, plot_only, leaf);
 }
@@ -274,19 +274,19 @@ where
 /// [`walk_model`] for the entities of `block` (model or a paper space), in
 /// the drawing's own annotation context or, for model space seen through a
 /// paper viewport, in that viewport's (`view`).
-pub(crate) fn walk_block<F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, plot_only: bool, leaf: F)
+pub(crate) fn walk_block<F>(scene: &crate::scene::Scene, block: codec::types::Handle, view: Option<&ViewContext>, plot_only: bool, leaf: F)
 where
-    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+    F: FnMut(&codec::EntityType, &crate::scene::render_graph::InstanceContext),
 {
     walk_block_where(scene, block, view, |entity, context| !plot_only || scene.layer_plottable_in_context(entity, context), leaf);
 }
 
 /// [`walk_block`] that descends only into what `keep` accepts (a block
 /// reference it refuses is not walked at all).
-pub(crate) fn walk_block_where<K, F>(scene: &crate::scene::Scene, block: acadrust::types::Handle, view: Option<&ViewContext>, keep: K, mut leaf: F)
+pub(crate) fn walk_block_where<K, F>(scene: &crate::scene::Scene, block: codec::types::Handle, view: Option<&ViewContext>, keep: K, mut leaf: F)
 where
-    K: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext) -> bool,
-    F: FnMut(&acadrust::EntityType, &crate::scene::render_graph::InstanceContext),
+    K: FnMut(&codec::EntityType, &crate::scene::render_graph::InstanceContext) -> bool,
+    F: FnMut(&codec::EntityType, &crate::scene::render_graph::InstanceContext),
 {
     use crate::scene::render_graph::{BlockRoot, BlockRootRole, RenderSceneGraph, SceneRoot};
     let document = &scene.document;
@@ -310,7 +310,7 @@ where
         keep,
         |entity, context| {
             let owned_content = !context.root_handle.is_null()
-                && !matches!(document.get_entity(context.root_handle), Some(acadrust::EntityType::Insert(_)));
+                && !matches!(document.get_entity(context.root_handle), Some(codec::EntityType::Insert(_)));
             if !owned_content {
                 leaf(entity, context);
             }
@@ -323,8 +323,8 @@ where
 /// projection to world XY. Tessellating with `tolerance / plan_scale` keeps
 /// every instance of a curve within `tolerance` in the plan, whatever the
 /// nesting, rotation, non-uniform scale or tilt of its block references.
-pub(crate) fn plan_scale(transform: &acadrust::types::Transform) -> f64 {
-    use acadrust::types::Vector3;
+pub(crate) fn plan_scale(transform: &codec::types::Transform) -> f64 {
+    use codec::types::Vector3;
     let columns = [Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)]
         .map(|axis| transform.apply_rotation(axis));
     // A·Aᵀ for the 2×3 plan matrix A whose columns are the images of the axes.
@@ -340,8 +340,8 @@ pub(crate) fn plan_scale(transform: &acadrust::types::Transform) -> f64 {
 
 /// Whether the drawn geometry of `entity` is curved and needs replacing by a
 /// polyline within the chord tolerance.
-fn needs_flattening(entity: &acadrust::EntityType) -> bool {
-    use acadrust::EntityType;
+fn needs_flattening(entity: &codec::EntityType) -> bool {
+    use codec::EntityType;
     match entity {
         EntityType::Circle(_) | EntityType::Arc(_) | EntityType::Ellipse(_) | EntityType::Spline(_) | EntityType::Polyline2D(_) => true,
         // Any bulge but exactly zero: the kernel reads a tiny one as a full circle.
@@ -353,8 +353,8 @@ fn needs_flattening(entity: &acadrust::EntityType) -> bool {
 
 /// Whether a hatch boundary edge is curved (an arc, ellipse, spline or
 /// bulged polyline): the fill renderer cuts those at a fixed angle.
-fn curved_edge(edge: &acadrust::entities::BoundaryEdge) -> bool {
-    use acadrust::entities::BoundaryEdge;
+fn curved_edge(edge: &codec::entities::BoundaryEdge) -> bool {
+    use codec::entities::BoundaryEdge;
     match edge {
         BoundaryEdge::Line(_) => false,
         BoundaryEdge::Polyline(polyline) => polyline.vertices.iter().any(|vertex| vertex.z != 0.0),
@@ -365,9 +365,9 @@ fn curved_edge(edge: &acadrust::entities::BoundaryEdge) -> bool {
 /// `hatch` with every curved boundary edge replaced by a straight polyline
 /// edge within `tolerance` (in its own plane), so the fill is drawn within
 /// the publication's precision from exact vertices.
-fn flatten_hatch(hatch: &acadrust::entities::Hatch, tolerance: f64) -> Result<acadrust::entities::Hatch, String> {
-    use acadrust::entities::{BoundaryEdge, PolylineEdge};
-    use acadrust::types::Vector2;
+fn flatten_hatch(hatch: &codec::entities::Hatch, tolerance: f64) -> Result<codec::entities::Hatch, String> {
+    use codec::entities::{BoundaryEdge, PolylineEdge};
+    use codec::types::Vector2;
     let mut flat = hatch.clone();
     for edge in flat.paths.iter_mut().flat_map(|path| path.edges.iter_mut()) {
         if !curved_edge(edge) {
@@ -391,7 +391,7 @@ fn flatten_hatch(hatch: &acadrust::entities::Hatch, tolerance: f64) -> Result<ac
 /// stored angles directly: the kernel normalises each angle before
 /// subtracting, which turns a sweep below the rounding of 2π into a full
 /// turn.
-fn edge_arc(arc: &acadrust::entities::CircularArcEdge) -> (f64, f64) {
+fn edge_arc(arc: &codec::entities::CircularArcEdge) -> (f64, f64) {
     let sweep = arc_sweep(arc.start_angle, arc.end_angle);
     (if arc.counter_clockwise { arc.start_angle } else { -arc.end_angle }, sweep)
 }
@@ -405,8 +405,8 @@ fn arc_sweep(start: f64, end: f64) -> f64 {
 
 /// A hatch boundary edge cut within `tolerance` ([`bounded_points`]), or
 /// `None` for an edge the fill does not draw.
-fn edge_points(edge: &acadrust::entities::BoundaryEdge, tolerance: f64) -> Option<Result<Vec<[f64; 2]>, String>> {
-    if let acadrust::entities::BoundaryEdge::CircularArc(arc) = edge {
+fn edge_points(edge: &codec::entities::BoundaryEdge, tolerance: f64) -> Option<Result<Vec<[f64; 2]>, String>> {
+    if let codec::entities::BoundaryEdge::CircularArc(arc) = edge {
         let (start, sweep) = edge_arc(arc);
         let points = arc_points((arc.center.x, arc.center.y), arc.radius, start, sweep, tolerance, MAX_CURVE_SEGMENTS);
         return Some(points.map(|points| points.into_iter().map(|(x, y)| [x, y]).collect()));
@@ -419,7 +419,7 @@ fn edge_points(edge: &acadrust::entities::BoundaryEdge, tolerance: f64) -> Optio
 /// paths: the fill model keeps them only as f32 offsets. A vertex that is
 /// not a boundary-path vertex (cut by a block clip) keeps its f32 offset.
 fn exact_fill_boundaries(fills: &mut [crate::scene::model::hatch_model::HatchModel]) {
-    use acadrust::entities::BoundaryEdge;
+    use codec::entities::BoundaryEdge;
     for fill in fills {
         let (Some(paths), Some(plane)) = (&fill.boundary_paths, &fill.fill_plane) else { continue };
         let origin = fill.world_origin;
@@ -476,8 +476,8 @@ fn exact_fill_boundaries(fills: &mut [crate::scene::model::hatch_model::HatchMod
 ///   middle.
 ///
 /// A curve that needs more than [`MAX_CURVE_SEGMENTS`] chords is refused.
-pub(crate) fn bounded_points(curve: &cadkernel::geom2d::Curve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
-    use cadkernel::geom2d::Curve;
+pub(crate) fn bounded_points(curve: &kernel::geom2d::Curve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
+    use kernel::geom2d::Curve;
     if !(tolerance.is_finite() && tolerance > 0.0) {
         return Err(TOO_LARGE.into());
     }
@@ -548,7 +548,7 @@ const MAX_NURBS_DEGREE: usize = 32;
 /// works for clamped, unclamped and periodic knot vectors alike (its
 /// denominators are at least `b − a > 0`), needs no knot insertion and no
 /// multiplicity counts, and costs O(p³) per span.
-fn nurbs_points(nurbs: &cadkernel::geom2d::NurbsCurve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
+fn nurbs_points(nurbs: &kernel::geom2d::NurbsCurve, tolerance: f64, limit: usize) -> Result<Vec<[f64; 2]>, String> {
     let p = nurbs.degree();
     let knots = nurbs.knots();
     let control: Vec<[f64; 3]> = nurbs.control_points().iter().zip(nurbs.weights()).map(|(c, w)| [c[0] * w, c[1] * w, *w]).collect();
@@ -773,8 +773,8 @@ const NOT_FINITE: &str = "A curve has a value that is not a finite number.";
 /// `transform` (its instance), shown only in the local Apply dialog. Every
 /// curve in the drawing is cut, inside the published window or not, so it
 /// has to be corrected or erased in the drawing.
-fn located(entity: &acadrust::EntityType, tolerance: f64, transform: &acadrust::types::Transform, error: String) -> String {
-    use acadrust::EntityType;
+fn located(entity: &codec::EntityType, tolerance: f64, transform: &codec::types::Transform, error: String) -> String {
+    use codec::EntityType;
     let problem = match error.as_str() {
         // Publication's budget is the most any curve may need.
         TOO_LARGE | OVER_LIMIT => "is too large to draw within the publication's precision",
@@ -796,9 +796,9 @@ fn located(entity: &acadrust::EntityType, tolerance: f64, transform: &acadrust::
 /// A point on `entity`'s curve in its block's coordinates, where it starts:
 /// for a hatch, on the first boundary edge that cannot be cut within
 /// `tolerance` (else its first edge), as the fill draws it.
-fn curve_point(entity: &acadrust::EntityType, tolerance: f64) -> acadrust::types::Vector3 {
-    use acadrust::types::Vector3;
-    use acadrust::EntityType;
+fn curve_point(entity: &codec::EntityType, tolerance: f64) -> codec::types::Vector3 {
+    use codec::types::Vector3;
+    use codec::EntityType;
     let ocs = |normal: Vector3, (x, y): (f64, f64), elevation: f64| {
         let [x, y, z] = ocs_to_wcs(normal, (x, y), elevation);
         Vector3::new(x, y, z)
@@ -816,7 +816,7 @@ fn curve_point(entity: &acadrust::EntityType, tolerance: f64) -> acadrust::types
             None => Vector3::ZERO,
         },
         EntityType::Hatch(h) => {
-            use acadrust::entities::BoundaryEdge;
+            use codec::entities::BoundaryEdge;
             let edges: Vec<&BoundaryEdge> = h.paths.iter().flat_map(|path| &path.edges).collect();
             let refused = edges.iter().find(|edge| matches!(edge_points(edge, tolerance), Some(Err(_)))).or(edges.first());
             let start = refused.and_then(|edge| match edge {
@@ -843,12 +843,12 @@ struct WideVertex {
 
 /// Tessellate a (possibly bulged, possibly tapered) OCS polyline. Widths are
 /// interpolated linearly along each segment, as they are drawn.
-fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64, limit: usize) -> Result<Vec<acadrust::entities::LwVertex>, String> {
+fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64, limit: usize) -> Result<Vec<codec::entities::LwVertex>, String> {
     if vertices.len() > limit {
         return Err(OVER_LIMIT.into());
     }
-    use acadrust::entities::LwVertex;
-    use acadrust::types::Vector2;
+    use codec::entities::LwVertex;
+    use codec::types::Vector2;
     let mut out: Vec<LwVertex> = Vec::new();
     let count = if closed { vertices.len() } else { vertices.len().saturating_sub(1) };
     let push = |out: &mut Vec<LwVertex>, x: f64, y: f64, start_width: f64, end_width: f64| {
@@ -878,7 +878,7 @@ fn tessellate_chain(vertices: &[WideVertex], closed: bool, tolerance: f64, limit
 }
 
 /// OCS → WCS for a point with the given extrusion normal.
-pub(crate) fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
+pub(crate) fn ocs_to_wcs(normal: codec::types::Vector3, (x, y): (f64, f64), elevation: f64) -> [f64; 3] {
     let (wx, wy, wz) = crate::scene::view::transform::ocs_point_to_wcs((x, y, elevation), (normal.x, normal.y, normal.z));
     [wx, wy, wz]
 }
@@ -887,19 +887,19 @@ pub(crate) fn ocs_to_wcs(normal: acadrust::types::Vector3, (x, y): (f64, f64), e
 /// (normal and elevation kept, so every enclosing transform still applies
 /// to its true 3D position), and its snap end points in block coordinates.
 /// A replacement polyline and its snap end points in block coordinates.
-pub(crate) type Flattened = (acadrust::entities::LwPolyline, Vec<[f64; 3]>);
+pub(crate) type Flattened = (codec::entities::LwPolyline, Vec<[f64; 3]>);
 
-pub(crate) fn flatten(entity: &acadrust::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
+pub(crate) fn flatten(entity: &codec::EntityType, tolerance: f64) -> Result<Option<Flattened>, String> {
     flatten_within(entity, tolerance, MAX_CURVE_SEGMENTS)
 }
 
 /// [`flatten`] with at most `limit` points: a curve that needs more is
 /// [`OVER_LIMIT`] (conversion's work budget) before it is cut any further.
-pub(crate) fn flatten_within(entity: &acadrust::EntityType, tolerance: f64, limit: usize) -> Result<Option<Flattened>, String> {
+pub(crate) fn flatten_within(entity: &codec::EntityType, tolerance: f64, limit: usize) -> Result<Option<Flattened>, String> {
     use crate::scene::model::wire_model::SnapHint;
-    use acadrust::entities::{LwPolyline, LwVertex};
-    use acadrust::types::{Vector2, Vector3};
-    use acadrust::EntityType;
+    use codec::entities::{LwPolyline, LwVertex};
+    use codec::types::{Vector2, Vector3};
+    use codec::EntityType;
     let plain = |points: Vec<(f64, f64)>| points.into_iter().map(|(x, y)| LwVertex::new(Vector2::new(x, y))).collect::<Vec<_>>();
     let (vertices, normal, elevation, keys) = match entity {
         EntityType::Circle(circle) => {
@@ -999,10 +999,10 @@ pub(crate) fn flatten_within(entity: &acadrust::EntityType, tolerance: f64, limi
 /// transform (to say where a refused curve is).
 fn curve_tolerances(
     scene: &crate::scene::Scene,
-    block: acadrust::types::Handle,
+    block: codec::types::Handle,
     view: Option<&ViewContext>,
     tolerance: f64,
-    out: &mut rustc_hash::FxHashMap<u64, (f64, acadrust::types::Transform)>,
+    out: &mut rustc_hash::FxHashMap<u64, (f64, codec::types::Transform)>,
 ) {
     walk_block(scene, block, view, false, |entity, context| {
         if needs_flattening(entity) {
@@ -1017,19 +1017,19 @@ fn curve_tolerances(
 
 /// A copy of `source`'s drawing with each listed curve replaced by its
 /// polyline within its tolerance, and the replaced curves' snap end points.
-type FlatDocument = (acadrust::CadDocument, rustc_hash::FxHashMap<u64, Vec<[f64; 3]>>);
+type FlatDocument = (codec::CadDocument, rustc_hash::FxHashMap<u64, Vec<[f64; 3]>>);
 
-fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMap<u64, (f64, acadrust::types::Transform)>) -> Result<FlatDocument, String> {
-    use acadrust::EntityType;
+fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMap<u64, (f64, codec::types::Transform)>) -> Result<FlatDocument, String> {
+    use codec::EntityType;
     let mut document = source.document.clone();
     let mut key_points = rustc_hash::FxHashMap::default();
-    let mut handles: Vec<(u64, (f64, acadrust::types::Transform))> = tolerances.into_iter().collect();
+    let mut handles: Vec<(u64, (f64, codec::types::Transform))> = tolerances.into_iter().collect();
     handles.sort_by_key(|(handle, _)| *handle);
     for (handle, (tolerance, transform)) in handles {
         if build_cancelled() {
             return Err(CANCELLED.into());
         }
-        let handle = acadrust::types::Handle::new(handle);
+        let handle = codec::types::Handle::new(handle);
         let Some(entity) = document.get_entity(handle) else { continue };
         let located = |error: String| located(entity, tolerance, &transform, error);
         if let EntityType::Hatch(hatch) = entity {
@@ -1044,7 +1044,7 @@ fn flatten_curves(source: &crate::scene::Scene, tolerances: rustc_hash::FxHashMa
     Ok((document, key_points))
 }
 
-fn scene_of(document: acadrust::CadDocument, annotation_scale: f32, layout: Option<&str>) -> crate::scene::Scene {
+fn scene_of(document: codec::CadDocument, annotation_scale: f32, layout: Option<&str>) -> crate::scene::Scene {
     let mut scene = crate::scene::Scene::new();
     scene.document = document;
     scene.annotation_scale = annotation_scale;
@@ -1101,7 +1101,7 @@ pub fn prepare_layout(source: &crate::scene::Scene, reference: &super::layout::L
 
     // Each viewport's outline on the page: its rectangle and any boundary
     // it is clipped to, cut within the tolerance and kept in f64.
-    let outline = |rect: [f64; 4], boundary: Option<acadrust::Handle>| -> Result<Vec<Vec<[f64; 2]>>, String> {
+    let outline = |rect: [f64; 4], boundary: Option<codec::Handle>| -> Result<Vec<Vec<[f64; 2]>>, String> {
         let [x0, y0, x1, y1] = rect;
         let mut clips = vec![[[x0, y0], [x1, y0], [x1, y1], [x0, y1]].iter().map(|p| page_point(&paper, *p)).collect()];
         if let Some(handle) = boundary {
@@ -1136,7 +1136,7 @@ fn page_point(transform: &PageTransform, [x, y]: [f64; 2]) -> [f64; 2] {
 
 /// A closed boundary as a polygon in its plane's XY (a viewport's clipping
 /// boundary, in paper space), within `tolerance`.
-fn boundary_polygon(entity: &acadrust::EntityType, tolerance: f64) -> Option<Vec<[f64; 2]>> {
+fn boundary_polygon(entity: &codec::EntityType, tolerance: f64) -> Option<Vec<[f64; 2]>> {
     let (polyline, _) = flatten(entity, tolerance).ok()??;
     let normal = (polyline.normal.x, polyline.normal.y, polyline.normal.z);
     let points: Vec<[f64; 2]> = polyline
@@ -1209,7 +1209,7 @@ fn model_content(scene: &crate::scene::Scene) -> (crate::io::pdf_export::PlotCon
 /// paper length whatever the viewport's scale, as native projection does.
 fn viewport_content(scene: &crate::scene::Scene, view: &ViewLayer, all_visible: bool) -> crate::io::pdf_export::PlotContent {
     let mut wires = scene.model_wires_for_viewport_arc(view.viewport, 0.0).as_ref().clone();
-    if let Some(acadrust::EntityType::Viewport(viewport)) = scene.document.get_entity(view.viewport) {
+    if let Some(codec::EntityType::Viewport(viewport)) = scene.document.get_entity(view.viewport) {
         let flags = crate::scene::view::render::render_mode_flags(viewport.render_mode);
         for wire in wires.iter_mut().filter(|wire| wire.fill_is_3d) {
             if !flags.face3d_fill && !flags.mesh_fill {
@@ -1245,7 +1245,7 @@ fn sheet_content(scene: &crate::scene::Scene) -> (crate::io::pdf_export::PlotCon
     paper_wires.retain(|wire| {
         borders
             || !crate::scene::Scene::handle_from_wire_name(&wire.name).and_then(|handle| scene.document.get_entity(handle)).is_some_and(|entity| {
-                matches!(entity, acadrust::EntityType::Viewport(viewport) if !crate::scene::Scene::is_sheet_viewport(&scene.document, viewport))
+                matches!(entity, codec::EntityType::Viewport(viewport) if !crate::scene::Scene::is_sheet_viewport(&scene.document, viewport))
             })
     });
     let omitted_images = scene.paper_plot_images().len() + scene.viewport_plot_fills().3.len();
@@ -1352,8 +1352,8 @@ pub struct ViewState {
     wires: Option<(std::sync::Arc<Vec<crate::scene::WireModel>>, bool)>,
     layout: String,
     isolation: crate::scene::ObjectIsolationState,
-    block_edit: Option<acadrust::Handle>,
-    active_viewport: Option<acadrust::Handle>,
+    block_edit: Option<codec::Handle>,
+    active_viewport: Option<codec::Handle>,
     annotation_scale: f32,
 }
 
@@ -1375,7 +1375,7 @@ impl ViewState {
 
     /// A scene of `document` in this view (nothing derived from the view is
     /// warm yet).
-    fn scene(&self, document: acadrust::CadDocument) -> crate::scene::Scene {
+    fn scene(&self, document: codec::CadDocument) -> crate::scene::Scene {
         let mut scene = crate::scene::Scene::new();
         scene.document = document;
         scene.annotation_scale = self.annotation_scale;
@@ -1436,7 +1436,7 @@ pub type DrawingCheck = (Option<[f64; 4]>, Vec<super::ui::apply_dialog::LayoutCh
 /// visible extents and, when `layouts`, its paper layouts that can be
 /// published. On a large drawing these take seconds (the fills and each
 /// layout's viewport are tessellated), so they never run in an update.
-pub fn check_drawing(document: acadrust::CadDocument, view: &ViewState, layouts: bool) -> DrawingCheck {
+pub fn check_drawing(document: codec::CadDocument, view: &ViewState, layouts: bool) -> DrawingCheck {
     let scene = view.scene(document);
     let extents = visible_extents_of(view, &scene);
     let layouts = if layouts { super::layout::references(&scene) } else { Vec::new() };
@@ -1567,7 +1567,7 @@ pub fn check_contract(plan: &ApplyPlan) -> Result<(), String> {
 /// starts; later edits never reach it.
 #[derive(Clone)]
 pub struct Snapshot {
-    pub document: acadrust::CadDocument,
+    pub document: codec::CadDocument,
     pub annotation_scale: f32,
     /// The bytes the document was loaded from, sent verbatim when unmodified.
     pub loaded: Option<super::session::Drawing>,
@@ -1719,7 +1719,7 @@ fn build_stages(snapshot: &Snapshot, plan: &ApplyPlan, control: &BuildControl) -
         (loaded, _) => {
             let (format, version, name) = match loaded {
                 Some(loaded) => (loaded.format, loaded.version(), loaded.name.expose().clone()),
-                None => (Format::Dxf, acadrust::DxfVersion::AC1032, "drawing.dxf".to_string()),
+                None => (Format::Dxf, codec::DxfVersion::AC1032, "drawing.dxf".to_string()),
             };
             // PUB-04: an edited drawing is written in its original version;
             // one the writer cannot produce (R13) stops Apply rather than
@@ -1792,9 +1792,9 @@ fn build_stages(snapshot: &Snapshot, plan: &ApplyPlan, control: &BuildControl) -
 pub(crate) mod tests {
     use super::*;
     use crate::app::secureplan::vectors;
-    use acadrust::entities::{Arc, Circle, Line, LwPolyline};
-    use acadrust::types::{Vector2, Vector3};
-    use acadrust::{CadDocument, EntityType};
+    use codec::entities::{Arc, Circle, Line, LwPolyline};
+    use codec::types::{Vector2, Vector3};
+    use codec::{CadDocument, EntityType};
     use serde_json::Value;
 
     fn pair(value: &Value) -> [f64; 2] {
@@ -1821,9 +1821,9 @@ pub(crate) mod tests {
 
     /// The cubic Bézier of the fix-round review: its midpoint-only check
     /// passed a 250 mm chord that the curve leaves by ±12 mm.
-    pub(crate) fn bulging_spline() -> (acadrust::entities::Spline, impl Fn(f64) -> [f64; 2]) {
+    pub(crate) fn bulging_spline() -> (codec::entities::Spline, impl Fn(f64) -> [f64; 2]) {
         let control = [[0.0, 0.0], [1000.0 / 3.0, 512.0 / 3.0], [2000.0 / 3.0, -5120.0 / 3.0], [1000.0, 10752.0]];
-        let spline = acadrust::entities::Spline::from_control_points(3, control.iter().map(|[x, y]| Vector3::new(*x, *y, 0.0)).collect());
+        let spline = codec::entities::Spline::from_control_points(3, control.iter().map(|[x, y]| Vector3::new(*x, *y, 0.0)).collect());
         let at = move |t: f64| {
             let u = 1.0 - t;
             let b = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
@@ -1859,7 +1859,7 @@ pub(crate) mod tests {
 
     #[test]
     fn splines_and_ellipses_of_every_kind_stay_within_the_tolerance() {
-        use acadrust::entities::{Ellipse, Spline};
+        use codec::entities::{Ellipse, Spline};
         let mut weighted = Spline::from_control_points(
             3,
             [[0.0, 0.0], [3000.0, 4000.0], [6000.0, -2000.0], [9000.0, 5000.0], [12000.0, 0.0], [15000.0, 3000.0]]
@@ -1896,8 +1896,8 @@ pub(crate) mod tests {
     }
 
     /// Unclamped and weighted periodic splines, as drawings carry them.
-    pub(crate) fn awkward_splines() -> Vec<acadrust::entities::Spline> {
-        use acadrust::entities::Spline;
+    pub(crate) fn awkward_splines() -> Vec<codec::entities::Spline> {
+        use codec::entities::Spline;
         let spline = |degree: i32, points: &[[f64; 2]], knots: Vec<f64>, weights: Vec<f64>, periodic: bool| {
             let mut spline = Spline::new();
             spline.degree = degree;
@@ -2044,7 +2044,7 @@ pub(crate) mod tests {
     /// lines, a circle, an arc, a closed room polyline and a legacy POLYLINE
     /// with a bulge.
     pub(crate) fn synthetic_dxf_scene() -> crate::scene::Scene {
-        use acadrust::entities::{Polyline2D, Vertex2D};
+        use codec::entities::{Polyline2D, Vertex2D};
         let mut doc = CadDocument::new();
         let line = |x0: f64, y0: f64, x1: f64, y1: f64| {
             EntityType::Line(Line::from_points(Vector3::new(x0, y0, 0.0), Vector3::new(x1, y1, 0.0)))
@@ -2093,7 +2093,7 @@ pub(crate) mod tests {
     }
 
     /// The images a plain (not SecurePlan) scene of `doc` decodes.
-    pub(crate) fn scene_images(doc: CadDocument) -> Vec<acadrust::Handle> {
+    pub(crate) fn scene_images(doc: CadDocument) -> Vec<codec::Handle> {
         crate::app::secureplan::snap::tests::scene_of(doc).images.keys().copied().collect()
     }
 
@@ -2109,7 +2109,7 @@ pub(crate) mod tests {
         let mut doc = scene.document.clone();
         let mut far = Line::from_points(Vector3::new(1.0e6, 1.0e6, 0.0), Vector3::new(1.0e6 + 1.0, 1.0e6, 0.0));
         far.common.layer = "HIDDEN".into();
-        let mut hidden = acadrust::tables::Layer::new("HIDDEN");
+        let mut hidden = codec::tables::Layer::new("HIDDEN");
         hidden.flags.off = true;
         doc.layers.add(hidden).unwrap();
         doc.add_entity(EntityType::Line(far)).unwrap();
@@ -2122,7 +2122,7 @@ pub(crate) mod tests {
     /// solid fill far away does not widen the default window.
     #[test]
     fn the_drawing_check_keeps_objects_hidden_in_the_view() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
         let mut doc = synthetic_dxf_scene().document.clone();
         let (x, y) = (1.0e5, 1.0e5);
         let mut path = BoundaryPath::new();
@@ -2285,7 +2285,7 @@ pub(crate) mod tests {
 
     #[test]
     fn drawing_unit_lengths_follow_a_non_default_publication_scale() {
-        use acadrust::tables::LineType;
+        use codec::tables::LineType;
         // A feet drawing at 5 mm per point: 60.96 points per drawing unit.
         let mut doc = CadDocument::new();
         doc.line_types.add(LineType::dashed()).unwrap();
@@ -2321,7 +2321,7 @@ pub(crate) mod tests {
         PageTransform { mapping, placement: place_page([0.0, 0.0, 3000.0, 3000.0], &mapping, 1.0).unwrap() }
     }
 
-    fn replaced(publication: &Publication, handle: acadrust::types::Handle) -> LwPolyline {
+    fn replaced(publication: &Publication, handle: codec::types::Handle) -> LwPolyline {
         match publication.scene.document.get_entity(handle) {
             Some(EntityType::LwPolyline(polyline)) => polyline.clone(),
             other => panic!("not replaced by a polyline: {other:?}"),
@@ -2350,7 +2350,7 @@ pub(crate) mod tests {
 
     #[test]
     fn replaced_polylines_keep_and_interpolate_their_widths() {
-        use acadrust::entities::{LwVertex, Polyline2D, Vertex2D};
+        use codec::entities::{LwVertex, Polyline2D, Vertex2D};
         let mut doc = CadDocument::new();
         // A bulged segment tapering from 10 to 30, then a straight one at 30.
         let vertex = |x: f64, y: f64, bulge: f64, start: f64, end: f64| {
@@ -2404,7 +2404,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_elevated_arc_in_a_tilted_insert_keeps_its_height_until_placed() {
-        use acadrust::entities::Insert;
+        use codec::entities::Insert;
         let mut doc = CadDocument::new();
         let mut arc = Arc::new();
         arc.center = Vector3::new(0.0, 0.0, 500.0);
@@ -2437,7 +2437,7 @@ pub(crate) mod tests {
 
     #[test]
     fn nested_non_uniform_inserts_get_the_full_stretch() {
-        use acadrust::entities::Insert;
+        use codec::entities::Insert;
         let mut doc = CadDocument::new();
         let mut circle = Circle::new();
         circle.radius = 100.0;
@@ -2475,7 +2475,7 @@ pub(crate) mod tests {
 
     #[test]
     fn curves_beyond_the_kernel_cap_still_meet_the_tolerance_or_are_refused() {
-        use acadrust::entities::Ellipse;
+        use codec::entities::Ellipse;
         let transform = square_transform();
         let tolerance = transform.placement.chord_tolerance_mm;
         // A 100 km circle whose top crosses the window needs far more than the
@@ -2579,7 +2579,7 @@ pub(crate) mod tests {
     /// is cut in order, within the tolerance.
     #[test]
     fn hatch_boundaries_with_clockwise_bulges_are_published() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
         let transform = far_transform();
         let tolerance = transform.placement.chord_tolerance_mm;
         let (x, y) = (540_000.0, -175_000.0);
@@ -2605,7 +2605,7 @@ pub(crate) mod tests {
     /// boundary is still cut within the tolerance.
     #[test]
     fn hatch_boundaries_with_near_straight_bulges_are_published() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
         let transform = far_transform();
         let tolerance = transform.placement.chord_tolerance_mm;
         let (x, y) = (520_000.0, -185_000.0);
@@ -2631,7 +2631,7 @@ pub(crate) mod tests {
     /// far-away centre).
     #[test]
     fn polyline_segments_with_near_straight_bulges_are_published() {
-        use acadrust::entities::LwVertex;
+        use codec::entities::LwVertex;
         let transform = far_transform();
         let tolerance = transform.placement.chord_tolerance_mm;
         let (x, y) = (530_000.0, -170_000.0);
@@ -2657,7 +2657,7 @@ pub(crate) mod tests {
     /// a 100 km circular edge needs far more than 16,384 chords.
     #[test]
     fn hatch_arc_edges_beyond_the_kernel_cap_meet_the_tolerance() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
         let transform = far_transform();
         let tolerance = transform.placement.chord_tolerance_mm;
         let (cx, cy, radius) = (530_000.0, -180_000.0 - 1.0e8, 1.0e8);
@@ -2687,7 +2687,7 @@ pub(crate) mod tests {
     /// (through its block reference), so the user can find it.
     #[test]
     fn a_refused_curve_is_named_with_its_drawing_position() {
-        use acadrust::entities::Insert;
+        use codec::entities::Insert;
         let transform = far_transform();
         // A 1 rad arc of a radius of 1e13 mm needs millions of chords.
         let mut arc = Arc::new();
@@ -2734,7 +2734,7 @@ pub(crate) mod tests {
     /// its chord.
     #[test]
     fn a_bulge_at_the_old_threshold_is_flattened() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LwVertex, PolylineEdge};
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, LwVertex, PolylineEdge};
         let transform = far_transform();
         let (x, y) = (520_000.0, -185_000.0);
         let corners = [[x, y, 1e-12], [x + 20_000.0, y, 0.0], [x + 20_000.0, y + 10_000.0, 0.0], [x, y + 10_000.0, 0.0]];
@@ -2771,7 +2771,7 @@ pub(crate) mod tests {
     /// infinite bulge was a half-turn arc and a NaN one gave NaN vertices.
     #[test]
     fn curves_with_non_finite_values_are_refused() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LwVertex, PolylineEdge};
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, LwVertex, PolylineEdge};
         let tolerance = far_transform().placement.chord_tolerance_mm;
         let (x, y) = (520_000.0, -185_000.0);
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -2812,7 +2812,7 @@ pub(crate) mod tests {
     /// neither.
     #[test]
     fn short_arcs_of_large_radius_are_placed_or_refused() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
         let tolerance = far_transform().placement.chord_tolerance_mm;
         let hatch_arc = |center: (f64, f64), radius: f64, start: f64, end: f64, counter_clockwise: bool| {
             let mut path = BoundaryPath::new();
@@ -2859,7 +2859,7 @@ pub(crate) mod tests {
     /// stored angles, either way round; equal angles are still a full turn.
     #[test]
     fn tiny_hatch_arcs_are_not_full_circles() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
         let tolerance = far_transform().placement.chord_tolerance_mm;
         let radius = 1e12;
         for counter_clockwise in [true, false] {
@@ -2888,7 +2888,7 @@ pub(crate) mod tests {
     /// sagging 293 units. It keeps its signed geometry (the same circle).
     #[test]
     fn negative_radii_are_cut_within_the_tolerance() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Hatch};
         let tolerance = far_transform().placement.chord_tolerance_mm;
         let center = (520_000.0, -185_000.0);
         let mut path = BoundaryPath::new();
@@ -2928,7 +2928,7 @@ pub(crate) mod tests {
     /// message.
     #[test]
     fn a_polyline_over_the_budget_is_located() {
-        use acadrust::entities::LwVertex;
+        use codec::entities::LwVertex;
         let transform = far_transform();
         // Two semicircles of radius 1e11: each fits, together they do not.
         let (x, y) = (520_000.0, -185_000.0);
@@ -2952,7 +2952,7 @@ pub(crate) mod tests {
     /// elliptic arc starts at its start parameter, not at its major axis.
     #[test]
     fn refused_hatch_arcs_and_ellipses_are_located_on_the_curve() {
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Ellipse, Hatch};
+        use codec::entities::{BoundaryEdge, BoundaryPath, CircularArcEdge, Ellipse, Hatch};
         let transform = far_transform();
         // A clockwise quarter of radius 1e13 stored from π/2 to π is drawn
         // from π to 3π/2: it starts at the centre's left.

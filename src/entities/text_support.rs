@@ -1,9 +1,23 @@
-use acadrust::types::aci_table::aci_to_rgb;
-use acadrust::CadDocument;
+use codec::types::aci_table::aci_to_rgb;
+use codec::CadDocument;
 
 use crate::scene::convert::acad_to_render::{GlyphRun, TextStroke};
 use crate::scene::text::font_face::Face;
 use crate::scene::text::lff;
+
+/// A font reference a drawing holds — a style's font file, or an inline `\f`
+/// code — turned into an installed family.
+///
+/// An embedded stroke font wins over anything installed, so `romans.shx` keeps
+/// rendering as it did even where a font of that name happens to be installed;
+/// only a name no stroke font answers to is looked up among the system faces,
+/// first by family and then by file name (see `sysfont::family_for_reference`).
+fn resolve_font_reference(reference: &str) -> Option<String> {
+    if lff::is_builtin(reference) {
+        return None;
+    }
+    crate::scene::text::sysfont::family_for_reference(reference)
+}
 
 pub struct ResolvedTextStyle {
     pub font_name: String,
@@ -21,14 +35,20 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
     });
 
     let mut font_name = if let Some(style) = style {
-        if !style.true_type_font.trim().is_empty() {
-            style.true_type_font.trim().to_string()
-        } else if !style.font_file.trim().is_empty() {
-            let file = style.font_file.trim();
+        // A style names a font *file* — `GOST2304_TypeA_italic.ttf`,
+        // `romans.shx`, sometimes with a directory; `true_type_font` carries the
+        // same thing for the styles that set it.
+        let file = if !style.true_type_font.trim().is_empty() {
+            style.true_type_font.trim()
+        } else {
+            style.font_file.trim()
+        };
+        if !file.is_empty() {
             // A .shx font that resolves on disk (as stored, or next to the
             // drawing) renders its REAL stroke glyphs — pass the absolute
-            // path through so `Face::resolve` picks the SHX face. Only an
-            // unresolvable file falls back to the stem's LFF substitute.
+            // path through so `Face::resolve` picks the SHX face. Fonts fetched
+            // from the community repository live in the per-user fonts folder,
+            // so that is searched last, after the drawing folder.
             let shx_path = file
                 .to_ascii_lowercase()
                 .ends_with(".shx")
@@ -38,10 +58,7 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
                         .as_deref()
                         .map(std::path::Path::new)
                         .and_then(|p| p.parent());
-                    crate::io::resolve_image_file(file, base)
-                        // Fonts fetched from the community repository live in
-                        // the per-user fonts folder — search it last.
-                        .or_else(|| {
+                    crate::io::resolve_image_file(file, base).or_else(|| {
                         crate::io::font_repo::local_font_file(file)
                             .map(|path| path.to_string_lossy().into_owned())
                     })
@@ -49,6 +66,11 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
                 .flatten();
             if let Some(p) = shx_path {
                 p
+            } else if let Some(family) = resolve_font_reference(file) {
+                // The file is installed, so its family is the face to draw with.
+                // Substituting a stroke font instead drops every letter that
+                // font does not have — for a Cyrillic drawing, all of them.
+                family
             } else {
                 let basename = file.rsplit(['/', '\\']).next().unwrap_or(file);
                 let stem = basename.split('.').next().unwrap_or(basename).trim();
@@ -74,6 +96,27 @@ pub fn resolve_text_style(style_name: &str, document: &CadDocument) -> ResolvedT
     if !lff::is_builtin(&font_name) {
         if let Some(canonical) = crate::scene::text::sysfont::canonical_family_name(&font_name) {
             font_name = canonical;
+        }
+    }
+
+    // A style's "Big Font" (`chineset.shx`, `hztxt.shx`, …) supplies the
+    // double-byte characters. Resolve it like the primary font (next to the
+    // drawing, then the per-user fonts folder) and pair it with the face; an
+    // unresolvable big font just leaves those characters to the fallback.
+    if let Some(big) = style
+        .map(|s| s.big_font_file.trim())
+        .filter(|big| !big.is_empty() && big.to_ascii_lowercase().ends_with(".shx"))
+    {
+        let base = document
+            .source_path
+            .as_deref()
+            .map(std::path::Path::new)
+            .and_then(|p| p.parent());
+        let big_path = crate::io::resolve_image_file(big, base).or_else(|| {
+            crate::io::font_repo::local_font_file(big).map(|p| p.to_string_lossy().into_owned())
+        });
+        if let Some(big_path) = big_path {
+            font_name = Face::with_big_font(&font_name, &big_path);
         }
     }
 
@@ -171,7 +214,7 @@ pub fn text_local_bounds(
                         max_y = max_y.max(sy);
                     }
                 }
-                cursor_x += glyph.advance + face.letter_spacing();
+                cursor_x += glyph.advance + face.spacing_after(ch);
             }
             None => {
                 cursor_x += 6.0 + face.letter_spacing();
@@ -445,24 +488,24 @@ fn font_stem(name: &str) -> String {
         .to_string()
 }
 
-/// Parse an MTEXT string into the layout's `Vec<MTextLine>`, using acadrust's
+/// Parse an MTEXT string into the layout's `Vec<MTextLine>`, using opencadcodec's
 /// structured `mtext_format::parse_mtext` — OCS keeps only the layout engine
 /// (`layout_mtext` and callers read `MTextLine`/`RunState`), not a second MTEXT
 /// inline parser.
 ///
 /// Representation notes:
-///  - DXF `%%d`/`%%p`/`%%c` arrive already resolved to Unicode from acadrust;
+///  - DXF `%%d`/`%%p`/`%%c` arrive already resolved to Unicode from opencadcodec;
 ///    the stroke tokenizer treats those as ordinary glyphs.
 ///  - Stacking (`\S`) is flattened inline to `num<sep>den` (`^` for limit, else
 ///    `/`) since the stroke path has no fraction layout.
 ///  - `\H`: a relative factor (`\Hx`) applies directly; an absolute height is
-///    divided by the entity height. See `acadrust::…::MTextScalar`.
+///    divided by the entity height. See `codec::…::MTextScalar`.
 pub fn adapt_mtext_paragraphs(
     s: &str,
     entity_height: f32,
     trim_blank_edges: bool,
 ) -> Vec<MTextLine> {
-    use acadrust::entities::mtext_format::{
+    use codec::entities::mtext_format::{
         parse_mtext, MTextColor, MTextLineAlignment, MTextLineSpacing, MTextParagraphAlignment,
         MTextScalar, ParagraphProperties, SpanProperties, StackingType,
     };
@@ -539,16 +582,23 @@ pub fn adapt_mtext_paragraphs(
         }
         let (align, indent_first, indent_left, indent_right, tab_stops) =
             if has_own_props(props) || carried.is_none() {
+                // `\pxi…,l…,r…,t…;` values are multiples of the text height,
+                // not drawing units, and the first-line indent is relative to
+                // the left indent (a numbered list's hanging indent is
+                // `i-1.5,l1.5`: number at the margin, wrapped lines 1.5 h in).
+                // Taken raw they were a fraction of a unit — no indent at all —
+                // so every wrapped list line snapped back to the margin.
+                let left = props.left_margin.unwrap_or(0.0) as f32 * entity_height;
                 let v = (
                     props.alignment.and_then(map_align),
-                    props.first_line_indent.unwrap_or(0.0) as f32,
-                    props.left_margin.unwrap_or(0.0) as f32,
-                    props.right_margin.unwrap_or(0.0) as f32,
+                    left + props.first_line_indent.unwrap_or(0.0) as f32 * entity_height,
+                    left,
+                    props.right_margin.unwrap_or(0.0) as f32 * entity_height,
                     props
                         .tab_stops
                         .iter()
                         .map(|ts| {
-                            use acadrust::entities::mtext_format::TabStop as ATab;
+                            use codec::entities::mtext_format::TabStop as ATab;
                             let kind = match ts {
                                 ATab::Left(_) => TabKind::Left,
                                 ATab::Center(_) => TabKind::Center,
@@ -556,7 +606,7 @@ pub fn adapt_mtext_paragraphs(
                                 ATab::Decimal(_) => TabKind::Decimal,
                             };
                             TabStop {
-                                position: ts.position() as f32,
+                                position: ts.position() as f32 * entity_height,
                                 kind,
                             }
                         })
@@ -669,7 +719,7 @@ pub fn adapt_mtext_paragraphs(
 // `measure_mtext_chars`, `word_wrap`) were removed when every text-bearing
 // entity switched to the run-aware pipeline below. The pipeline now owns
 // per-run width measurement and word-wrap; MTEXT inline parsing now comes from
-// acadrust via `adapt_mtext_paragraphs`. The supported surface for callers is
+// opencadcodec via `adapt_mtext_paragraphs`. The supported surface for callers is
 // `adapt_mtext_paragraphs`, `layout_mtext`, `mtext_line_count`,
 // `text_local_bounds`, and `resolve_dxf_special_chars`.
 
@@ -683,7 +733,7 @@ pub fn adapt_mtext_paragraphs(
 // it carries inline codes).
 //
 // The pipeline mirrors the MTEXT renderer:
-//   1. Parse — via `adapt_mtext_paragraphs` (acadrust `parse_mtext`).
+//   1. Parse — via `adapt_mtext_paragraphs` (opencadcodec `parse_mtext`).
 //   2. Atomise — turn each MTextLine.runs into a flat sequence of atoms
 //      (Word / Space / Tab) so the wrapper operates at break boundaries
 //      while keeping per-character formatting state.
@@ -872,11 +922,24 @@ pub fn resolve_font<'a>(state: &'a RunState, base: &'a str) -> std::borrow::Cow<
     if lff::is_builtin(font) {
         return std::borrow::Cow::Borrowed(font);
     }
-    if let Some(canonical) = crate::scene::text::sysfont::canonical_family_name(font) {
-        std::borrow::Cow::Owned(canonical)
-    } else {
-        std::borrow::Cow::Borrowed(base)
+    match resolve_font_reference(font) {
+        Some(canonical) => std::borrow::Cow::Owned(canonical),
+        None => std::borrow::Cow::Borrowed(base),
     }
+}
+
+/// Whether a line may break between `prev` and `next`. Ideographic text has
+/// no spaces, so a break is allowed on either side of a full-width character,
+/// except before a closing mark (`，。、）」…`) or after an opening one
+/// (`（「《…`) — the basic kinsoku rule.
+pub(crate) fn cjk_break_between(prev: char, next: char) -> bool {
+    use crate::scene::text::ttf_glyph::is_full_width;
+    const CLOSING: &str = "，。、；：？！）」』】〕》〉』﹚﹞．～…‥、〞”’,.;:!?)]}%";
+    const OPENING: &str = "（「『【〔《〈﹙﹝“‘([{";
+    if !(is_full_width(prev) || is_full_width(next)) {
+        return false;
+    }
+    !CLOSING.contains(next) && !OPENING.contains(prev)
 }
 
 pub fn measure_word(
@@ -901,7 +964,7 @@ pub fn measure_word(
     let mut w = 0.0_f32;
     for ch in text.chars() {
         w += match face.glyph(ch) {
-            Some(g) => (g.advance + face.letter_spacing() * state.tracking) * scale,
+            Some(g) => (g.advance + face.spacing_after(ch) * state.tracking) * scale,
             None => (6.0 + face.letter_spacing() * state.tracking) * scale,
         };
     }
@@ -1063,9 +1126,14 @@ pub fn line_total_width(
 pub fn resolve_inline_color(c: &InlineColor) -> Option<[f32; 3]> {
     match c {
         InlineColor::Aci(idx) => aci_to_rgb(*idx).map(|(r, g, b)| {
-            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+            let rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+            if *idx == 7 {
+                rgb
+            } else {
+                crate::scene::convert::tess_util::authored_rgb(rgb)
+            }
         }),
-        InlineColor::True(rgb) => Some(*rgb),
+        InlineColor::True(rgb) => Some(crate::scene::convert::tess_util::authored_rgb(*rgb)),
     }
 }
 
@@ -1368,7 +1436,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                     char_offset: word_start,
                                 });
                             }
-                            // A literal tab (acadrust keeps `^I` / `\t` as a tab
+                            // A literal tab (opencadcodec keeps `^I` / `\t` as a tab
                             // char in the span) advances to the paragraph's next
                             // tab stop, aligning the field that follows it.
                             atoms.push(LayoutAtom {
@@ -1383,6 +1451,21 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                             doc_char_offset += 1;
                             word_start = doc_char_offset;
                         } else {
+                            // CJK text carries no spaces: every ideograph is a
+                            // wrap opportunity (bar the usual "no line starts
+                            // with a closing mark / ends with an opening one"
+                            // rule), so a long Chinese sentence must not stay
+                            // one unbreakable word that overshoots its column.
+                            if let Some(prev) = word.chars().last() {
+                                if cjk_break_between(prev, ch) {
+                                    atoms.push(LayoutAtom {
+                                        kind: AtomKind::Word(std::mem::take(&mut word)),
+                                        state: run.state.clone(),
+                                        char_offset: word_start,
+                                    });
+                                    word_start = doc_char_offset;
+                                }
+                            }
                             word.push(ch);
                             doc_char_offset += 1;
                         }
@@ -2237,7 +2320,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                             for (ci, ch) in text.chars().enumerate() {
                                 let adv = match face.glyph(ch) {
                                     Some(g) => {
-                                        (g.advance + face.letter_spacing() * tracking) * scale
+                                        (g.advance + face.spacing_after(ch) * tracking) * scale
                                     }
                                     None => (6.0 + face.letter_spacing() * tracking) * scale,
                                 };
@@ -2744,7 +2827,7 @@ mod adapter_tests {
     #[test]
     fn relative_height_is_a_factor() {
         // `\H2x;` multiplies the current height → height_mul 2.0, independent of
-        // the entity height. (This is the case that needed acadrust's MTextScalar.)
+        // the entity height. (This is the case that needed opencadcodec's MTextScalar.)
         let (_, st) = first_run(&adapt_mtext_paragraphs("\\H2x;big", 2.5, true));
         assert!((st.height_mul - 2.0).abs() < 1e-4, "got {}", st.height_mul);
     }
@@ -2974,6 +3057,58 @@ mod v_anchor_tests {
         let words6 = ["שלום", " ", "«x"];
         let reordered6 = reorder_atoms(&words6, false);
         assert_eq!(reordered6, vec!["שלום", " ", "«x"]);
+    }
+
+
+    #[test]
+    fn cjk_paragraph_wraps_between_ideographs() {
+        use crate::entities::text_support::{layout_mtext, MTextRenderOpts, MTextVAnchor, ResolvedTextStyle};
+        // Breaks are allowed between ideographs but not before a closing mark
+        // or after an opening one.
+        assert!(cjk_break_between('工', '程'));
+        assert!(cjk_break_between('程', 'A'));
+        assert!(!cjk_break_between('工', '，'));
+        assert!(!cjk_break_between('（', '工'));
+        assert!(!cjk_break_between('a', 'b'));
+
+        let style = ResolvedTextStyle {
+            font_name: "Standard".to_string(),
+            width_factor: 1.0,
+            oblique_angle: 0.0,
+            is_backward: false,
+            is_upside_down: false,
+            is_vertical: false,
+        };
+        // 40 ideographs with no spaces in a column ~12 characters wide used
+        // to stay one unbreakable word: a single line overshooting the box.
+        let value = "本工程之各種平面圖均須相互配合如有不符或須更正處均按工程慣例施工至完整並請於估價前提出";
+        let opts = MTextRenderOpts {
+            columns: Default::default(),
+            value,
+            insertion: [0.0, 0.0, 0.0],
+            height: 2.5,
+            rect_w: 30.0,
+            rotation: 0.0,
+            style: &style,
+            attach_h_anchor: 0.0,
+            v_anchor: MTextVAnchor::Top,
+            line_spacing_factor: 1.0,
+            exact_line_spacing: false,
+            rectangle_height: 0.0,
+            vertical_text: false,
+            want_glyph_boxes: true,
+        };
+        let layout = layout_mtext(&opts);
+        assert!(
+            layout.line_count >= 3,
+            "a 40-ideograph paragraph in a 30-unit column must wrap (got {} line(s))",
+            layout.line_count
+        );
+        assert!(
+            layout.line_widths.iter().all(|w| *w <= 30.0 + 1e-3),
+            "no wrapped line may overshoot the column: {:?}",
+            layout.line_widths
+        );
     }
 
     #[test]

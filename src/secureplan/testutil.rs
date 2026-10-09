@@ -1,9 +1,9 @@
 //! Test utilities: synthetic drawings generated in code, never real plans.
 //! DWGs are written through the native writer.
 
-use acadrust::entities::{Arc, Circle, Line, LwPolyline, Viewport};
-use acadrust::types::{Handle, Vector2, Vector3};
-use acadrust::{CadDocument, DxfVersion, EntityType};
+use codec::entities::{Arc, Circle, Line, LwPolyline, Viewport};
+use codec::types::{Handle, Vector2, Vector3};
+use codec::{CadDocument, DxfVersion, EntityType};
 
 /// A synthetic 30 × 18 m millimetre floor plan: an outline, a room, a
 /// column (circle), a door swing (arc) and a known diagonal line.
@@ -76,7 +76,7 @@ pub fn plan_viewport(center: (f64, f64), twist_degrees: f64) -> Viewport {
 pub fn add_layout(scene: &mut crate::scene::Scene, viewports: Vec<Viewport>) -> Vec<Handle> {
     scene.document.add_layout(LAYOUT).expect("add the layout");
     for object in scene.document.objects.values_mut() {
-        if let acadrust::objects::ObjectType::Layout(layout) = object {
+        if let codec::objects::ObjectType::Layout(layout) = object {
             if layout.name == LAYOUT {
                 layout.paper_width = 841.0;
                 layout.paper_height = 594.0;

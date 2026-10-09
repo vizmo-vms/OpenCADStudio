@@ -4,11 +4,11 @@ use crate::app::Message;
 use crate::ui::properties::{lw_options, LinetypeItem, LwItem};
 use crate::ui::style::common::muted_style;
 use crate::ui::ROW_H;
-use acadrust::tables::layer::Layer as DocLayer;
-use acadrust::tables::Table;
-use acadrust::types::aci_table::aci_to_rgb;
-use acadrust::types::{Color as AcadColor, LineWeight};
-use acadrust::Handle;
+use codec::tables::layer::Layer as DocLayer;
+use codec::tables::Table;
+use codec::types::aci_table::aci_to_rgb;
+use codec::types::{Color as AcadColor, LineWeight};
+use codec::Handle;
 use iced::widget::{
     button, column, combo_box, container, mouse_area, row, scrollable, text, text_input, tooltip,
 };
@@ -206,6 +206,8 @@ impl LayerPanel {
 
         self.layers = doc_layers
             .iter()
+            // The reference's hidden system layers (`*ADSK_CONSTRAINTS`) stay out.
+            .filter(|l| !l.name.starts_with('*'))
             .map(|l| {
                 let layer_handle = l.handle;
                 let vp_frozen = vp_info

@@ -337,7 +337,7 @@ mod tests {
         h.key(crate::app::secureplan::ui::trust_dialog::DialogKey::Activate);
         assert_eq!(h.app.active_tab, index, "the keyboard cannot show the survey");
 
-        let _ = h.app.update(Message::TabClose(index));
+        let _ = h.app.update(Message::TabClose(h.app.tabs[index].id));
         assert_eq!(h.app.tabs.len(), 1);
         assert!(h.app.tabs[h.app.active_tab].is_start, "the home screen did not return");
         assert_eq!(h.app.secureplan_window_title(), APP_NAME);

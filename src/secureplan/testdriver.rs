@@ -75,7 +75,7 @@ pub enum Command {
     Select(Option<Option<String>>),
     Convert(super::convert::Kind),
     /// Answer the export dialog: save to `path`, or cancel when `None`.
-    Export { path: Option<PathBuf>, format: Option<super::session::Format>, version: Option<acadrust::DxfVersion>, accept_loss: bool },
+    Export { path: Option<PathBuf>, format: Option<super::session::Format>, version: Option<codec::DxfVersion>, accept_loss: bool },
 }
 
 struct Inbox {
@@ -202,7 +202,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 match option? {
                     ("format", "dwg") => format = Some(super::session::Format::Dwg),
                     ("format", "dxf") => format = Some(super::session::Format::Dxf),
-                    ("version", value) => version = Some(acadrust::DxfVersion::parse(value).ok_or("bad version")?),
+                    ("version", value) => version = Some(codec::DxfVersion::parse(value).ok_or("bad version")?),
                     ("loss", "accept") => accept_loss = true,
                     (other, _) => return Err(format!("unknown option {other}")),
                 }
@@ -447,8 +447,8 @@ mod tests {
     fn a_drawing_of_fills_only_applies_through_its_layout() {
         use crate::app::secureplan::session::tests::Harness;
         use crate::app::secureplan::{overlay, testutil};
-        use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
-        use acadrust::types::{Vector2, Vector3};
+        use codec::entities::{BoundaryEdge, BoundaryPath, Hatch, PolylineEdge};
+        use codec::types::{Vector2, Vector3};
         // Model space holds one solid hatch and nothing else; the layout's
         // 1:10 viewport shows it.
         let mut scene = crate::scene::Scene::new();
@@ -459,12 +459,12 @@ mod tests {
         let mut hatch = Hatch::new();
         hatch.is_solid = true;
         hatch.paths.push(path);
-        scene.add_entity(acadrust::EntityType::Hatch(hatch));
+        scene.add_entity(codec::EntityType::Hatch(hatch));
         let mut viewport = testutil::plan_viewport((420.0, 300.0), 0.0);
         viewport.view_target = Vector3::new(61000.0, 1000.0, 0.0);
         viewport.view_height = 1800.0;
         testutil::add_layout(&mut scene, vec![viewport]);
-        let bytes = crate::io::save_to_bytes(&scene.document, "dxf", acadrust::DxfVersion::AC1032).unwrap();
+        let bytes = crate::io::save_to_bytes(&scene.document, "dxf", codec::DxfVersion::AC1032).unwrap();
 
         let mut h = Harness::new("driver_fills_only");
         h.open(None, overlay::tests::overlay_bytes(&[]), "edit", serde_json::Value::Null, "none", "import");
@@ -537,7 +537,7 @@ mod tests {
             Ok(Command::Export {
                 path: Some(PathBuf::from("/tmp/my export.dwg")),
                 format: Some(crate::app::secureplan::session::Format::Dwg),
-                version: Some(acadrust::DxfVersion::AC1018),
+                version: Some(codec::DxfVersion::AC1018),
                 accept_loss: true
             })
         );
