@@ -159,21 +159,29 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_origin_pairs_without_a_prompt_and_look_alikes_do_not() {
-        use crate::app::secureplan::settings::BUILT_IN_ORIGIN;
+    fn the_built_in_origins_pair_without_a_prompt_and_look_alikes_do_not() {
+        use crate::app::secureplan::settings::BUILT_IN_ORIGINS;
         let now = Instant::now();
         let mut trust = Trust::default();
         let mut settings = Settings::default();
-        assert!(matches!(trust.on_launch(launch(BUILT_IN_ORIGIN, 1), &settings, now), Decision::Pair(_)));
-        assert!(trust.prompt().is_none(), "the built-in origin was prompted for");
-        // Removing it changes nothing.
-        assert!(!settings.revoke(BUILT_IN_ORIGIN));
-        assert!(matches!(trust.on_launch(launch(BUILT_IN_ORIGIN, 2), &settings, now), Decision::Pair(_)));
+        for origin in BUILT_IN_ORIGINS {
+            assert!(matches!(trust.on_launch(launch(origin, 1), &settings, now), Decision::Pair(_)), "{origin}");
+            assert!(trust.prompt().is_none(), "{origin} was prompted for");
+            // Removing it changes nothing.
+            assert!(!settings.revoke(origin));
+            assert!(matches!(trust.on_launch(launch(origin, 2), &settings, now), Decision::Pair(_)), "{origin}");
+        }
         // An https look-alike on another port or host still asks.
-        for (n, look_alike) in
-            ["https://secureplan.vizmo.dev:8443", "https://evil-secureplan.vizmo.dev", "https://secureplan.vizmo.dev.example"]
-                .into_iter()
-                .enumerate()
+        for (n, look_alike) in [
+            "https://secureplan.vizmo.dev:8443",
+            "https://evil-secureplan.vizmo.dev",
+            "https://secureplan.vizmo.dev.example",
+            "https://secureplan.vizmo.app:8443",
+            "https://evil-secureplan.vizmo.app",
+            "https://secureplan.vizmo.app.example",
+        ]
+        .into_iter()
+        .enumerate()
         {
             assert_eq!(trust.on_launch(launch(look_alike, 3 + n as u8), &settings, now), Decision::Prompt, "{look_alike}");
             trust.answer(false, &mut settings, now);
@@ -182,8 +190,10 @@ mod tests {
         // with the developer setting on.
         for developer in [false, true] {
             settings.developer_loopback_origins = developer;
-            assert_eq!(trust.on_launch(launch("http://secureplan.vizmo.dev", 9), &settings, now), Decision::Ignore);
-            assert!(trust.prompt().is_none());
+            for plain in ["http://secureplan.vizmo.dev", "http://secureplan.vizmo.app"] {
+                assert_eq!(trust.on_launch(launch(plain, 9), &settings, now), Decision::Ignore, "{plain}");
+                assert!(trust.prompt().is_none());
+            }
         }
     }
 
