@@ -63,7 +63,7 @@ use super::bridge::{self, Bridge, BridgeEvent};
 use super::guards::{command_verb, CommandGuard};
 use super::pairing::{self, LaunchRequest};
 use super::redact::Redacted;
-use super::settings::{self, is_built_in, Settings, BUILT_IN_ORIGIN};
+use super::settings::{self, is_built_in, Settings, BUILT_IN_ORIGINS};
 use super::trust::{Decision, PromptButton, Trust};
 use super::ui::trust_dialog::{self, DialogKey};
 use super::ui::{Action, Dialog};
@@ -1101,7 +1101,9 @@ impl OpenCADStudio {
             // home screen's button.
             "SECUREPLANTRUST" => {
                 let settings = &self.secureplan.settings;
-                let listing = std::iter::once(format!("{BUILT_IN_ORIGIN} (built in)"))
+                let listing = BUILT_IN_ORIGINS
+                    .iter()
+                    .map(|origin| format!("{origin} (built in)"))
                     .chain(settings.trusted_origins.iter().cloned())
                     .collect::<Vec<_>>();
                 let developer = if settings.developer_loopback_origins { "on" } else { "off" };
@@ -1133,7 +1135,8 @@ impl OpenCADStudio {
                 None => {
                     let origins = &self.secureplan.settings.trusted_origins;
                     if origins.is_empty() {
-                        self.command_line.push_output(&format!("No websites were added. {BUILT_IN_ORIGIN} is built in."));
+                        let built_in = BUILT_IN_ORIGINS.join(" and ");
+                        self.command_line.push_output(&format!("No websites were added. {built_in} are built in."));
                     } else {
                         self.command_line.push_output(&format!("Websites you allowed: {}", origins.join(", ")));
                         self.command_line.push_info("Type the website to remove and press Enter.");
@@ -1564,36 +1567,45 @@ mod tests {
         assert!(app.main_window.is_some(), "the editor opens with the session");
     }
 
-    /// F13: https://secureplan.vizmo.dev pairs with no prompt, even from a
-    /// link start, and cannot be removed; an https look-alike still prompts
-    /// and an http one never pairs (BRG-02).
+    /// F13: https://secureplan.vizmo.dev and https://secureplan.vizmo.app
+    /// pair with no prompt, even from a link start, and cannot be removed;
+    /// an https look-alike still prompts and an http one never pairs (BRG-02).
     #[test]
-    fn the_built_in_website_pairs_without_a_prompt_and_cannot_be_removed() {
-        let (mut app, bridge, events, _) = link_started_app(94);
-        let request = launch(BUILT_IN_ORIGIN, 94);
-        assert_eq!(cold_start(&[launch_url(&request)], &app.secureplan.settings), ColdStart::Windowless);
-        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
-        assert_eq!(app.secureplan.prompt_window, None, "the built-in website was prompted for");
-        assert!(!app.secureplan_dialog_open());
-        let _web = connect_web(bridge.port(), &request).expect("the built-in website pairs");
-        assert!(matches!(next_event(&events), BridgeEvent::Opened { .. }));
+    fn the_built_in_websites_pair_without_a_prompt_and_cannot_be_removed() {
+        for (origin, pairing) in BUILT_IN_ORIGINS.into_iter().zip([94, 97]) {
+            let (mut app, bridge, events, _) = link_started_app(pairing);
+            let request = launch(origin, pairing);
+            assert_eq!(cold_start(&[launch_url(&request)], &app.secureplan.settings), ColdStart::Windowless);
+            let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&request).into())));
+            assert_eq!(app.secureplan.prompt_window, None, "{origin} was prompted for");
+            assert!(!app.secureplan_dialog_open());
+            let _web = connect_web(bridge.port(), &request).expect("the built-in website pairs");
+            assert!(matches!(next_event(&events), BridgeEvent::Opened { .. }));
 
-        let _ = app.dispatch_command(&format!("SECUREPLANREVOKE {BUILT_IN_ORIGIN}"));
-        assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("built in")));
-        assert!(app.secureplan.settings.is_trusted(BUILT_IN_ORIGIN));
-        let _ = app.dispatch_command("SECUREPLANTRUST");
-        let Some(Dialog::Choice { title, lines, form }) = &app.secureplan.dialog else { panic!("no Allowed websites") };
-        assert_eq!(title, "Allowed websites");
-        assert!(lines.iter().any(|l| l.contains(BUILT_IN_ORIGIN) && l.contains("built in")), "{lines:?}");
-        assert!(form.buttons.iter().all(|(label, _)| label != "Remove a website"), "nothing the user added to remove");
-        app.secureplan.dialog = None;
+            let _ = app.dispatch_command(&format!("SECUREPLANREVOKE {origin}"));
+            assert!(app.command_line.last_error.as_deref().is_some_and(|e| e.contains("built in")));
+            assert!(app.secureplan.settings.is_trusted(origin));
+            let _ = app.dispatch_command("SECUREPLANTRUST");
+            let Some(Dialog::Choice { title, lines, form }) = &app.secureplan.dialog else { panic!("no Allowed websites") };
+            assert_eq!(title, "Allowed websites");
+            for built_in in BUILT_IN_ORIGINS {
+                assert!(lines.iter().any(|l| l.contains(built_in) && l.contains("built in")), "{lines:?}");
+            }
+            assert!(form.buttons.iter().all(|(label, _)| label != "Remove a website"), "nothing the user added to remove");
+            app.secureplan.dialog = None;
+        }
 
-        let (mut app, _bridge, _events, _) = link_started_app(95);
-        let look_alike = launch("https://secureplan.vizmo.dev:8443", 95);
-        let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&look_alike).into())));
-        assert!(app.secureplan.prompt_window.is_some(), "an https look-alike was not prompted for");
-        let plain = launch_url(&launch("http://secureplan.vizmo.dev", 96));
-        assert_eq!(cold_start(&[plain], &app.secureplan.settings), ColdStart::Exit, "an http look-alike may pair");
+        for (look_alike, plain, pairing) in [
+            ("https://secureplan.vizmo.dev:8443", "http://secureplan.vizmo.dev", 95),
+            ("https://secureplan.vizmo.app:8443", "http://secureplan.vizmo.app", 98),
+        ] {
+            let (mut app, _bridge, _events, _) = link_started_app(pairing);
+            let look_alike = launch(look_alike, pairing);
+            let _ = app.update(Message::SecurePlan(Msg::Launch(launch_url(&look_alike).into())));
+            assert!(app.secureplan.prompt_window.is_some(), "an https look-alike was not prompted for");
+            let plain = launch_url(&launch(plain, 96));
+            assert_eq!(cold_start(&[plain], &app.secureplan.settings), ColdStart::Exit, "an http look-alike may pair");
+        }
     }
 
     #[test]

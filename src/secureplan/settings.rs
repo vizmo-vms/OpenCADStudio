@@ -3,8 +3,8 @@
 //! origins eligible. Stored as `secureplan.json` in SecurePlan CAD's own
 //! config directory, readable by the current user only.
 //!
-//! [`BUILT_IN_ORIGIN`] is allowed in every build without being stored: it is
-//! never prompted for and cannot be removed.
+//! [`BUILT_IN_ORIGINS`] are allowed in every build without being stored: they
+//! are never prompted for and cannot be removed.
 
 use std::path::{Path, PathBuf};
 
@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use super::pairing::is_serialized_origin;
 
-/// The SecurePlan website every build allows (product-owner decision,
-/// 27 September 2026). Only this exact origin: another scheme, port or host
-/// is an ordinary origin.
-pub const BUILT_IN_ORIGIN: &str = "https://secureplan.vizmo.dev";
+/// The SecurePlan websites every build allows (product-owner decisions,
+/// 27 September 2026 and, for `secureplan.vizmo.app`, 9 October 2026). Only
+/// these exact origins: another scheme, port or host is an ordinary origin.
+pub const BUILT_IN_ORIGINS: [&str; 2] = ["https://secureplan.vizmo.dev", "https://secureplan.vizmo.app"];
 
 pub fn is_built_in(origin: &str) -> bool {
-    origin == BUILT_IN_ORIGIN
+    BUILT_IN_ORIGINS.contains(&origin)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,9 +88,9 @@ impl Settings {
         is_built_in(origin) || self.trusted_origins.iter().any(|trusted| trusted == origin)
     }
 
-    /// Every allowed origin: the built-in one, then the user's.
+    /// Every allowed origin: the built-in ones, then the user's.
     pub fn allowed_origins(&self) -> Vec<String> {
-        std::iter::once(BUILT_IN_ORIGIN.to_string()).chain(self.trusted_origins.iter().cloned()).collect()
+        BUILT_IN_ORIGINS.iter().map(|origin| origin.to_string()).chain(self.trusted_origins.iter().cloned()).collect()
     }
 
     pub fn trust(&mut self, origin: &str) {
@@ -146,31 +146,43 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_origin_is_allowed_without_being_stored_and_cannot_be_removed() {
+    fn the_built_in_origins_are_allowed_without_being_stored_and_cannot_be_removed() {
         let path = temp_file("built_in");
         let mut settings = Settings::default();
-        assert!(settings.is_trusted(BUILT_IN_ORIGIN));
-        settings.trust(BUILT_IN_ORIGIN);
-        assert!(settings.trusted_origins.is_empty(), "the built-in origin was stored");
-        assert!(!settings.revoke(BUILT_IN_ORIGIN));
-        assert!(settings.is_trusted(BUILT_IN_ORIGIN), "the built-in origin was removed");
-        assert_eq!(settings.allowed_origins(), vec![BUILT_IN_ORIGIN.to_string()]);
-        // Only the exact origin: other schemes, ports and hosts are ordinary.
+        let built_in = BUILT_IN_ORIGINS.map(String::from).to_vec();
+        for origin in BUILT_IN_ORIGINS {
+            assert!(settings.is_trusted(origin), "{origin}");
+            settings.trust(origin);
+            assert!(settings.trusted_origins.is_empty(), "{origin} was stored");
+            assert!(!settings.revoke(origin));
+            assert!(settings.is_trusted(origin), "{origin} was removed");
+        }
+        assert_eq!(settings.allowed_origins(), built_in);
+        // Only the exact origins: other schemes, ports and hosts are ordinary.
         for look_alike in [
             "http://secureplan.vizmo.dev",
             "https://secureplan.vizmo.dev:8443",
             "https://evil-secureplan.vizmo.dev",
             "https://secureplan.vizmo.dev.example",
             "https://vizmo.dev",
+            "http://secureplan.vizmo.app",
+            "https://secureplan.vizmo.app:8443",
+            "https://evil-secureplan.vizmo.app",
+            "https://secureplan.vizmo.app.example",
+            "https://vizmo.app",
         ] {
             assert!(!settings.is_trusted(look_alike), "{look_alike}");
         }
-        // A file that lists it anyway keeps only the user's own origins.
+        // A file that lists them anyway keeps only the user's own origins.
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, br#"{"trustedOrigins":["https://secureplan.vizmo.dev","https://ok.example"]}"#).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"trustedOrigins":["https://secureplan.vizmo.dev","https://secureplan.vizmo.app","https://ok.example"]}"#,
+        )
+        .unwrap();
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.trusted_origins, vec!["https://ok.example"]);
-        assert_eq!(loaded.allowed_origins(), vec![BUILT_IN_ORIGIN.to_string(), "https://ok.example".to_string()]);
+        assert_eq!(loaded.allowed_origins(), [built_in, vec!["https://ok.example".to_string()]].concat());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
