@@ -722,9 +722,13 @@ impl OpenCADStudio {
 
     fn secureplan_launch(&mut self, url: &str) -> Task<Message> {
         let windowless = self.secureplan_windowless();
-        let Ok(request) = pairing::parse_launch_url(url) else {
-            self.command_line.push_warning("SecurePlan: ignored an invalid SecurePlan CAD link.");
-            return self.secureplan_leave_if_nothing_waits();
+        let request = match pairing::parse_launch_url(url) {
+            Ok(request) => request,
+            Err(error) => {
+                self.command_line
+                    .push_warning(&format!("SecurePlan: ignored an invalid SecurePlan CAD link ({}).", error.reason()));
+                return self.secureplan_leave_if_nothing_waits();
+            }
         };
         let received = Instant::now();
         let decision = self.secureplan.trust.on_launch(request, &self.secureplan.settings, received);

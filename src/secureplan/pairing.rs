@@ -1,7 +1,8 @@
 //! Launch URLs and pending pairings (BRG-01, BRG-02).
 //!
 //! `secureplan-cad://pair?v=1&origin=…&pairing=…&token=…&survey=…&intent=…`
-//! creates a pending pairing. Pending pairings are silent, capped at
+//! creates a pending pairing. Windows can hand the link over with a `/` after
+//! `pair` (`secureplan-cad://pair/?…`); that form is the same link. Pending pairings are silent, capped at
 //! [`MAX_PENDING`] (the oldest is dropped) and expire with their token
 //! [`TOKEN_TTL`] after the launch arrived. A handshake consumes one.
 
@@ -16,7 +17,9 @@ pub const TOKEN_TTL: Duration = Duration::from_secs(120);
 /// At most this many pairings wait for a handshake at once.
 pub const MAX_PENDING: usize = 4;
 
-const PREFIX: &str = "secureplan-cad://pair?";
+/// The launch URL as the web sends it, and as Windows can pass it on: the
+/// shell adds a `/` after the host of a link with no path.
+const PREFIXES: [&str; 2] = ["secureplan-cad://pair?", "secureplan-cad://pair/?"];
 const KEYS: [&str; 6] = ["v", "origin", "pairing", "token", "survey", "intent"];
 
 /// What the web asked the desktop to do.
@@ -69,6 +72,22 @@ pub enum LaunchError {
     Intent,
 }
 
+impl LaunchError {
+    /// Why the link was ignored, for the warning. Names no URL content.
+    pub fn reason(self) -> &'static str {
+        match self {
+            LaunchError::NotAPairingUrl => "not a pairing link",
+            LaunchError::Parameters => "missing, repeated or unknown parameters",
+            LaunchError::Version => "unsupported link version",
+            LaunchError::Origin => "invalid website address",
+            LaunchError::Pairing => "invalid pairing id",
+            LaunchError::Token => "invalid token",
+            LaunchError::Survey => "invalid survey id",
+            LaunchError::Intent => "unknown intent",
+        }
+    }
+}
+
 /// Whether `origin` is an ASCII serialized origin exactly as a browser sends
 /// it: `http` or `https`, lowercase host, no default port, path, userinfo or
 /// trailing slash.
@@ -92,7 +111,7 @@ fn is_uuid_v4(value: &str) -> bool {
 
 /// Parse and validate a launch URL (BRG-01).
 pub fn parse_launch_url(url: &str) -> Result<LaunchRequest, LaunchError> {
-    let query = url.strip_prefix(PREFIX).ok_or(LaunchError::NotAPairingUrl)?;
+    let query = PREFIXES.iter().find_map(|prefix| url.strip_prefix(prefix)).ok_or(LaunchError::NotAPairingUrl)?;
     if query.contains('#') {
         return Err(LaunchError::NotAPairingUrl);
     }
@@ -238,6 +257,28 @@ pub(crate) mod tests {
         }
         for case in cases["invalid"].as_array().unwrap() {
             assert!(parse_launch_url(case["url"].as_str().unwrap()).is_err(), "{}", case["name"]);
+        }
+    }
+
+    /// Windows passes `secureplan-cad://pair?…` on as `secureplan-cad://pair/?…`:
+    /// the same link. Any other path is still refused.
+    #[test]
+    fn the_windows_form_of_a_launch_url_parses_the_same() {
+        let cases = vectors::json("launch-urls.json");
+        for case in cases["valid"].as_array().unwrap() {
+            let url = case["url"].as_str().unwrap();
+            let windows = url.replacen("secureplan-cad://pair?", "secureplan-cad://pair/?", 1);
+            assert_ne!(windows, url);
+            assert_eq!(parse_launch_url(&windows), parse_launch_url(url), "{}", case["name"]);
+        }
+        for case in cases["invalid"].as_array().unwrap() {
+            let windows = case["url"].as_str().unwrap().replacen("://pair?", "://pair/?", 1);
+            assert!(parse_launch_url(&windows).is_err(), "{}", case["name"]);
+        }
+        let url = cases["valid"][0]["url"].as_str().unwrap();
+        for other in ["secureplan-cad://pair//?", "secureplan-cad://pair/x?", "secureplan-cad://pair\\?"] {
+            let changed = url.replacen("secureplan-cad://pair?", other, 1);
+            assert_eq!(parse_launch_url(&changed), Err(LaunchError::NotAPairingUrl), "{other}");
         }
     }
 
